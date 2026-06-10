@@ -173,3 +173,42 @@ A/B on Pascal; BAR/driver behavior with 9 cards on the 580 legacy branch.
    if per-process fixed costs measure lower than expected on the rig.
 3. CUDA 12.x cross-build + rig bring-up (driver 580, Above 4G, zram) -> E1/E2/E3.
 4. kintsugi dispatcher across replicas (the candidate farm of sec 3).
+
+## 7. The exact hardware identified: Manli M-P106L9-N6G (grilling round 2)
+
+The rig is a turnkey Manli "GPU Mining System P106-090 (6GB) X9". This resolves the sec-0
+card-identity puzzle a third way: Manli shipped a NON-STANDARD P106-090 with 6 GB - the
+"P106L" (TechPowerUp lists BOTH a 3 GB (b6879) and a 6 GB (b6880) F347G entry, and the TPU
+VGA-BIOS archive holds a "manli p106-90 6 GB" BIOS dump). Confirmed card profile:
+
+- GP106, 768 CUDA cores (60% of a P106-100), boost 1531 MHz, compute capability 6.1
+- 6 GB GDDR5, 192-bit, 192.2 GB/s (SAME bandwidth as a 1060/P106-100)
+- PCIe 1.0 x1 electrical (x16 physical slots on the integrated 9-slot board), ~75 W
+- System: Celeron 3865U (2 cores, no HT, 1.8 GHz), 4 GB DDR4, 64 GB M.2 SSD, 1600 W PSU,
+  chassis-fan cooling for passive cards (designed for 24/7 load)
+
+### Revised per-card projections (pp scales with compute: 768/1280 of the P106-100's
+### measured 406.94 t/s pp512)
+- pp512 ~ 240-260 t/s -> 512-token diffusion step ~ 2.0-2.1 s
+- fast draft (threshold 0.6, ~17 steps) ~ 35-40 s/card
+- repair canvas 128-192 tokens ~ 0.6-0.9 s/step -> ~5-9 s per repair
+- tg ~ 28-30 t/s (bandwidth-bound; bandwidth is uncut)
+- VRAM: 6 GB fits Dream-7B Q4_K_M + ub 384-512 exactly as analyzed in sec 2
+- Aggregate: 9 cards ~ 2,200 t/s pp = ALMOST EXACTLY ONE RTX 5070 LAPTOP in raw pp -
+  but as 9 independent parallel engines with 54 GB total VRAM, for ~EUR 200-300 used.
+
+### System-level consequences (mostly confirming sec 6, two sharpenings)
+- Celeron 3865U (2 cores) makes the sec-6 conclusions HARDER requirements: GPU sampling is
+  non-negotiable (the CPU could not sample for one card, let alone nine), the
+  multi-replica single-process server is the only sane shape, and the dispatcher must do
+  nearly zero per-token work (detokenize is the heaviest remaining host duty).
+- PCIe 1.0 x1 per card: irrelevant at steady state (farm pattern, nothing crosses);
+  boot-time model distribution: 9 x 4.4 GB at ~250 MB/s/card (sequential or a few in
+  parallel off one SSD) ~ 3-6 min one-time. Acceptable.
+- 1600 W PSU for ~750 W actual load: ample headroom; thermals are the rig's design point
+  (passive cards + 10 chassis fans, sized for 24/7 hashing at the same 75 W/card).
+- 64 GB SSD vs sec-6's 60 GB budget: ~18 GB used; fine.
+- Above-4G decoding: the board boots 9 GPUs by construction (its only job) - the BIOS
+  concern from sec 6 dissolves on this turnkey unit; the remaining unknown is only the
+  R580-legacy-driver + CUDA 12 bring-up on its stock BIOS, which is rig-day work (E1).
+- Manli's own product page markets the X9 for "AI computing" - the manufacturer agrees.
