@@ -292,6 +292,15 @@ private:
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
 
+        // host buffers for the backend sampling outputs, allocated lazily by
+        // sampling_buffers_ensure() and strided by the actual candidate width of the
+        // attached samplers (e.g. top_k) instead of n_vocab - at 512 output rows this is
+        // ~0.3 MB of pinned memory instead of ~1.2 GB
+        ggml_backend_buffer_ptr buf;
+
+        size_t   stride = 0;  // floats/tokens per output row in probs/logits/candidates
+        uint32_t n_rows = 0;  // allocated output rows
+
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
@@ -306,6 +315,15 @@ private:
     };
 
     sampling_info sampling;
+
+    // (re)allocate the sampling host buffers for at least n_rows output rows of width
+    // stride; no-op when the current allocation suffices
+    void sampling_buffers_ensure(uint32_t n_rows, size_t stride);
+
+    // lazily allocate the (pinned) raw-logits host buffer; with backend samplers attached
+    // the raw logits are usually never copied, so the ~n_vocab x n_outputs buffer would be
+    // pure waste in every sampling-only context (e.g. one per device on a multi-GPU rig)
+    void logits_buffer_ensure();
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
@@ -353,6 +371,7 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    ggml_backend_buffer_ptr buf_logits;  // lazy raw-logits buffer (logits_buffer_ensure)
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
