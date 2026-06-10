@@ -54,6 +54,12 @@ struct diffusion_params {
 
     float   conf_threshold   = 0.0f;   // Commit all tokens with confidence >= threshold per step (0 = use the transfer schedule)
 
+    float * output_confidences = nullptr;  // [out, optional, size max_length] confidence at commit time per
+                                           // position; -1 = prompt/uncommitted/ORIGIN (records no confidence)
+
+    bool *  out_degenerate = nullptr;  // [out, optional] set when threshold decoding aborted because end
+                                       // tokens flooded the canvas while masked positions remained
+
     int32_t max_length = 0;            // Maximum sequence length
 };
 
@@ -83,6 +89,9 @@ struct diffusion_eb_params {
     diffusion_step_callback_t step_callback           = nullptr;
     void *                    step_callback_user_data = nullptr;
     bool                      visual_mode             = false;
+
+    float * output_confidences = nullptr;  // [out, optional, size max_length] final-step ENTROPY per canvas
+                                           // position (lower = more confident); -1 outside the canvas
 };
 
 void diffusion_generate_entropy_bound(llama_context *             ctx,

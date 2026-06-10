@@ -304,21 +304,194 @@ trips on PEFT module naming, fixes live in convert_lora_to_gguf.py, not C++.
 
 ---
 
+## Interface decisions after the PR #24423 merge (2026-06-10)
+
+Context: PR #24423 (DiffusionGemma, same-day draft by danielhanchen/Unsloth) was merged into
+the fork on branch `diffusiongemma-test` (merge 4c746fe14 + fix 93dd5e280 wiring --cpu-moe
+into diffusion-cli). All masked-diffusion regressions pass post-merge (14/14 sampler tests
+CPU+GPU; Dream standard/threshold/infill; DiffuCoder threshold). DiffusionGemma Q4_K_M runs
+on the 8 GB laptop at 3.9 GB VRAM via `--cpu-moe` (experts stream from RAM): 17 entropy-bound
+steps per 256-token canvas at ~2.7 s/step.
+
+DECISIONS (recorded so future work does not drift):
+
+1. The kintsugi harness MUST NOT couple to the merged CLI's output format. It is a draft
+   PR's incidental logging, already under reviewer pressure (pwilkin: debug cruft, rework
+   the server approach) - every PR revision can change it.
+2. The harness's stable contract is OUR HTTP daemon (improvement 2): a /generate endpoint
+   returning JSON we define and version. Build it before deepening any CLI integration.
+3. Until the daemon exists, CLI output parsing is allowed ONLY inside the harness's
+   ModelClient module (M0 stopgap per docs/dllm-elixir-harness.md) and is treated as
+   disposable.
+4. Do NOT adopt the PR's examples/diffusion-gemma-server: it is a model-specific
+   persistent-logits server for a Python eval driver, and it is the part of the PR that
+   reviewers explicitly want replaced by a general diffusion server. Our daemon should BE
+   that general server (serving dream/llada masked diffusion AND diffusion-gemma canvas
+   diffusion through one API).
+5. DO adopt the PR's GGUF metadata convention as the model-capability interface:
+   `diffusion.canvas_length` (canvas autodetect) and `diffusion.eb_*` (entropy-bound
+   defaults). It is model-side, likely to survive review, and both the CLI and our daemon
+   should read and expose it identically (the daemon's /health already plans to surface
+   model capabilities - add canvas_length and the eb defaults there).
+6. On this laptop the engine-model split is: Dream-7B/DiffuCoder = fast iteration
+   (245 ms/step fully on GPU); DiffusionGemma = quality option (~45 s per 256-token block,
+   expert-streaming-bound). The 3090 box likely flips this; the kintsugi benchmark
+   (compile/test pass-rate per wall-clock) makes the final call, not tok/s.
+
+## Post-merge re-baseline (verified in the merged tree, 2026-06-10)
+
+The #24423 merge changed the ground truth under several items. Verified first-hand:
+
+- ITEM 5 (prefix KV cache) - PARTIALLY DELIVERED for canvas models, via a THIRD pattern not
+  on our list: a MODEL-OWNED store. `dg_ensure_pkv_store` (src/models/diffusion-gemma.cpp:
+  629-656) lazily allocates per-layer F32 K/V tensors [head_dim, n_kv, P] in a model-held
+  ggml context (grow-only, single-device - hence the multi-GPU auto-off); the PREFILL-phase
+  graph persists prompt K/V into it in-graph (:440), DECODE reads it; phase selection via
+  `llama_diffusion_set_phase(model, ...)` (include/llama.h:574) which dynamic_casts the
+  model and mutates it. Measured working (kv_cache=on in all runs). CAVEAT for upstreaming
+  and for generalizing to Dream/LLaDA: mutable per-request state on llama_model (not
+  llama_context) via dynamic_cast is the part most likely to be reworked in review - treat
+  the MECHANICS as proven, the API SHAPE as temporary. Item 5 for masked models remains
+  open; we now have three candidate patterns (17454 real-kv_cache, 24423 model store,
+  T5-style inputs) with an in-tree working example of the second.
+- NEW CONTRIBUTION SURFACE CONFIRMED: the entropy-bound sampler is a full-vocab CPU loop -
+  `llama_get_logits` then per-position passes over all 262144 vocab entries for softmax/
+  entropy/multinomial, plus a C x n_vocab memcpy for self-conditioning
+  (examples/diffusion/diffusion.cpp:784-818). On the laptop it is hidden behind the 1.1-2.7
+  s/step expert-streaming forward; on the 3090 box (forward likely ~100-200 ms) it will
+  dominate - the exact Dream story repeating at 262k vocab (256 MB logits D2H + CPU loops
+  per step). Grafting our backend sampling onto the EB path is the high-value perf work for
+  DiffusionGemma; open question stands: is entropy over top-k a sufficient proxy for the
+  full-vocab entropy bound (validate against transformers).
+- Self-conditioning cost RESOLVED (read at diffusion-gemma.cpp:550-600): `sc_embT` is an
+  F16 [262144, 2816] soft-embedding transpose = 1.48 GB allocated on dev_layer(0)'s buffer
+  type - i.e. ON THE GPU with -ngl 99 - as a separate WEIGHTS-usage buffer, built by
+  host-dequantizing tok_embd. Corrected VRAM ledger for the laptop run: 1.58 GB non-expert
+  model + 1.48 GB sc_embT + 2.33 GB compute = ~5.4 GB (which is why --n-cpu-moe 26 OOM'd,
+  not fragmentation). Obvious optimizations: quantize sc_embT (Q8: -0.7 GB) or fold the
+  soft-embedding through the existing tok_embd instead of a materialized transpose.
+- The 2.33 GB compute buffer DECODED: it is ~95% the worst-case logits tensor
+  (2304 rows x 262144 x 4 B = 2304 MiB + ~25 MiB of other nodes). NOT an artifact of our
+  reserve change - encode() passes output_all=true and IGNORES batch logits flags (the EB
+  code even comments "encode() forces all rows to output anyway", diffusion.cpp:737), so
+  any unified-mode step and every PREFILL computes the lm_head over ALL rows including the
+  prompt, and copies n_tokens x 262144 floats to the host. Engine-level fix worth
+  pursuing: make encode() honor per-token logits flags (prefill needs NO logits; unified
+  needs canvas rows only) - saves up to ~2 GB D2H per prefill + shrinks the worst-case
+  compute reserve by ~2.1 GB. Benefits every encoder-path model, upstream-relevant.
+- DRAFT LIMITATION FOUND: PREFILL is a single un-chunked encode() bounded by the
+  `n_ubatch >= n_tokens` assert, so the maximum prompt is ~n_ubatch (2-4K on consumer
+  VRAM). The model's advertised 262144 context is UNREACHABLE in this implementation -
+  chunked prefill into the pkv store is a missing piece (and another reason the draft will
+  evolve; do not build on its internals).
+- Safety checks for our features confirmed in the merged tree:
+  LLM_ARCH_DIFFUSION_GEMMA returns nullptr from create_memory (llama-model.cpp:2017) ->
+  encode() path, same as dream/llada - our multi-row backend sampling machinery applies
+  mechanically to canvas rows; and diffusion_generate_entropy_bound never calls
+  llama_set_sampler (attachment exists only in diffusion_generate, which detaches on exit,
+  diffusion.cpp:256/394/670) -> needs_raw_logits stays true for EB runs and the CPU loop
+  always gets its logits. No cross-path contamination.
+- CUDA graphs on the MoE (6a addendum): measured ZERO delta on the laptop AC config
+  (1134.04 vs 1137.69 ms/step with GGML_CUDA_DISABLE_GRAPHS=1) - the run is expert-
+  streaming-bound, so graph eligibility under MUL_MAT_ID is currently moot here;
+  re-measure on the 3090 box where compute moves on-GPU.
+- ITEM 4 (EOT shrink) SCOPE NARROWED: canvas models already have variable-length handling
+  (trim_canvas EOG/repetition cut + adaptive stop + block budget, diffusion-cli.cpp);
+  EOT-tail shrink remains relevant ONLY for the Dream/LLaDA masked path.
+- ITEM 2 (daemon) gains canvas duties: serve BOTH model families through one API; manage
+  the canvas per-request state (`llama_diffusion_set_sc`/`set_phase` are MODEL-level
+  mutations - safe only under the daemon's single-request GPU mutex); surface
+  canvas_length + eb_* defaults in /health (decision 5).
+- diffusion-gemma-server characterization CONFIRMED from source: "output: C * n_vocab
+  float32 canvas-row logits" over a file/stdio protocol for a Python driver
+  (examples/diffusion-gemma-server/diffusion-gemma-server.cpp:10) - an eval logits dump,
+  not a generation API; decision 4 stands.
+
 ## Revised priority order (post-research, post-AC-measurement)
 
-1. Daemon (2) - unblocks the harness M1; now measured to need NO core changes (per-request
-   chain attach costs ~11 ms, not the assumed ~1 s).
-2. /tokenize + confidences (3) - tiny; multiplies harness masking precision.
-3. Degeneracy guard (6c) - 30 LOC insurance for threshold mode.
-4. EOT shrink (4) - measure-gated; the only remaining per-step compute saving that is
-   cheap to try (token ids verified: trailing 151643 run).
-5. Fast-dLLM-style prefix KV cache (5) - the big rock; now with a concrete upstream-blessed
-   blueprint (PR #17454 hybrid mode: real kv_cache + block commit). Start the Phase-0 spike
-   only after the kintsugi benchmark exists to measure quality regressions.
-6. Segmented top-k (6b) - opportunistic.
-7. LoRA smoke test (6d) - when the 3090 box enters the picture.
-8. Batched candidates (1) - DROPPED on the 5070 (measured ~5% worse than serial);
+1. Daemon (2) - unblocks the harness M1; needs NO core changes for masked models (11 ms
+   per-request attach); now also serves canvas models (single-request mutex covers the
+   model-level set_sc/set_phase state).
+2. /tokenize + confidences (3) - tiny; multiplies harness masking precision. Extend to the
+   EB path: canvas per-position entropies are the natural confidence export.
+3. Degeneracy guard (6c) - 30 LOC insurance for threshold mode (masked path; the EB path
+   already has trim_canvas repetition cuts).
+4. EB backend sampling graft (NEW, post-merge) - move the entropy-bound sampler onto the
+   backend-sampling path; becomes the dominant win the moment DiffusionGemma runs on a GPU
+   that fits the experts (3090 box). Validate entropy-over-top-k first.
+4b. encode() logits-flags fix (NEW) - make encode() honor per-token logits flags instead of
+   output_all=true: skips the lm_head over prompt rows in PREFILL, cuts up to ~2 GB D2H per
+   prefill and ~2.1 GB off the worst-case compute reserve at 262k vocab. Pairs naturally
+   with 4; benefits all encoder-path models.
+5. EOT shrink (4) - masked models only now; measure-gated.
+6. Prefix KV cache for MASKED models (5) - partially delivered for canvas models by the
+   merge (model-store pattern, mechanics proven in-tree); for Dream/LLaDA pick between the
+   three patterns after the kintsugi benchmark exists.
+7. Segmented top-k (6b) - opportunistic.
+8. LoRA smoke test (6d) - when the 3090 box enters the picture.
+9. Batched candidates (1) - DROPPED on the 5070 (measured ~5% worse than serial);
    re-evaluate only if the 3090 pp curve shows rising throughput from 512 to 2048.
+
+## Implementation log (items 1, 3, 6c - DONE, verified end-to-end 2026-06-10)
+
+### Item 3 - per-position confidence export
+- examples/diffusion/diffusion.h: `diffusion_params.output_confidences` (float*, optional,
+  caller-allocated size max_length; -1 = prompt/uncommitted/ORIGIN) and the same field on
+  `diffusion_eb_params` (final-step ENTROPY per canvas position, lower = more confident).
+- examples/diffusion/diffusion.cpp: array initialized to -1 at generate start; recorded at
+  ALL FOUR masked commit sites (threshold commits + its single-best fallback, partial_sort
+  commits, alg_temp dist commits); the EB path fills entropies after the denoise loop from
+  the surviving `entropy` vector (the natural per-position uncertainty; multi-block runs
+  report the FINAL block only - documented server-side).
+- ORIGIN records nothing by design (it computes no confidences).
+
+### Item 6c - degeneracy guard
+- diffusion.h: `diffusion_params.out_degenerate` (bool*, optional).
+- diffusion.cpp, threshold branch only: after each commit pass, scan the generation region;
+  abort when committed > 8 AND committed end-tokens (llama_vocab_is_eog || pad) > 90% of
+  committed AND masked > 20% of the region. Thresholds are named constants in code.
+- VERIFIED on the known failure config (Dream, threshold 0.8, temp 0.2, timestep): aborts at
+  step 0 with "end tokens 12/12 committed, 464/476 still masked" in 0.8 s - previously 15.4 s
+  of wasted steps producing empty output.
+
+### Item 1 - llama-diffusion-server (the general diffusion daemon)
+- examples/diffusion/diffusion-server.cpp (~430 lines) + CMake target
+  `llama-diffusion-server` (links llama-diffusion static lib + cpp-httplib; JSON via
+  `<nlohmann/json.hpp>` and httplib via `<cpp-httplib/httplib.h>` - both resolve through
+  llama-common's PUBLIC ../vendor include).
+- One process = one model loaded once; ALL llama-diffusion-cli flags work and become the
+  per-request DEFAULTS; request body fields override per call. Generation serialized by a
+  mutex (GPU serial; canvas models keep per-request state on the model - the mutex makes
+  set_sc/set_phase safe).
+- Endpoints:
+  GET /health -> {status, model, family: masked|canvas, mask_token_id, mask_piece,
+    canvas_length, n_ctx, n_ubatch, eb_defaults?{...}} (decision 5: capabilities surfaced).
+  POST /tokenize {content, add_special?=false, parse_special?=true} -> {tokens, n}
+  POST /detokenize {tokens} -> {content}
+  POST /generate {prompt, raw?, infill?, n_predict?, return_confidences?, seed?, steps?,
+    conf_threshold?, algorithm?, temp?, top_k?, top_p?, eps?, block_length?, alg_temp?,
+    cfg_scale?, add_gumbel_noise?, backend_sampling?, eb?{max_steps,t_min,t_max,
+    entropy_bound,stability,confidence,kv_cache}}
+    -> {text, family, ms_total, degenerate, n_prompt_tokens, confidences?,
+        confidence_kind?: "entropy"(canvas)}
+  Masked family runs diffusion_generate (chat template unless raw/infill; infill = canvas
+  verbatim, whole canvas returned); canvas family runs the EB block-autoregressive loop
+  (same trim_canvas EOG/repetition logic as the CLI).
+- Implementation gotchas found (reimplementation notes):
+  - `--port`/`--host` args are gated to server examples - the daemon uses common_params
+    defaults (port 8080); adding the args to LLAMA_EXAMPLE_DIFFUSION is a 2-line follow-up.
+  - `diffusion_params.infill` MUST be set alongside max_length = n_input - the engine guard
+    rejects max_length == n_input unless infill is set (first server bug, fixed).
+  - Canvas models need set_sc enabled BEFORE context creation (reserve sizing) and the
+    ubatch grown to canvas_length + headroom - both mirrored from the CLI init.
+- VERIFIED end-to-end on both families:
+  - Dream-7B: /health (mask_piece "<|mask|>"), /tokenize, /generate with threshold 0.6 +
+    confidences (481 committed positions, min 0.603 = consistent with the threshold),
+    /generate infill -> "def add(a, b), do:  a + b" with -1 confidences over fixed text and
+    real values over the hole.
+  - DiffusionGemma Q4_K_M (--cpu-moe): /health reports family=canvas, canvas_length 256,
+    eb defaults from GGUF metadata; /generate returned a 256-entropy vector with mean
+    0.0036 (consistent with the 0.005 adaptive-stop threshold) in 14.6 s.
 
 ## Verification
 

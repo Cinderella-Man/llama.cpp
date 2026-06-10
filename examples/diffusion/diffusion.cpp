@@ -187,6 +187,13 @@ void diffusion_generate(llama_context *          ctx,
     std::copy(input_tokens, input_tokens + n_input, output_tokens);
     std::fill(output_tokens + n_input, output_tokens + params.max_length, params.mask_token_id);
 
+    if (params.output_confidences) {
+        std::fill(params.output_confidences, params.output_confidences + params.max_length, -1.0f);
+    }
+    if (params.out_degenerate) {
+        *params.out_degenerate = false;
+    }
+
     std::mt19937 rng(params.seed);
 
     llama_set_causal_attn(ctx, false);
@@ -588,6 +595,9 @@ void diffusion_generate(llama_context *          ctx,
                         if (confidences[i].first >= params.conf_threshold) {
                             const int32_t mask_idx = confidences[i].second;
                             output_tokens[mask_positions[mask_idx]] = sampled_tokens[mask_idx];
+                            if (params.output_confidences) {
+                                params.output_confidences[mask_positions[mask_idx]] = confidences[i].first;
+                            }
                             n_committed++;
                         }
                     }
@@ -595,6 +605,41 @@ void diffusion_generate(llama_context *          ctx,
                     if (n_committed == 0) {
                         const int32_t mask_idx = confidences[best].second;
                         output_tokens[mask_positions[mask_idx]] = sampled_tokens[mask_idx];
+                        if (params.output_confidences) {
+                            params.output_confidences[mask_positions[mask_idx]] = confidences[best].first;
+                        }
+                    }
+
+                    // degeneracy guard: with a whole-sequence threshold the model's most confident early
+                    // predictions can be the end-of-text padding tail; if end tokens flood the committed
+                    // region while real positions are still masked, the draft is unrecoverable - abort
+                    {
+                        const llama_vocab * gvocab = llama_model_get_vocab(model);
+                        int32_t n_committed_total = 0;
+                        int32_t n_committed_eog   = 0;
+                        int32_t n_masked          = 0;
+                        for (int32_t i = n_input; i < params.max_length; i++) {
+                            if (output_tokens[i] == params.mask_token_id) {
+                                n_masked++;
+                            } else {
+                                n_committed_total++;
+                                if (llama_vocab_is_eog(gvocab, output_tokens[i]) ||
+                                    output_tokens[i] == llama_vocab_pad(gvocab)) {
+                                    n_committed_eog++;
+                                }
+                            }
+                        }
+                        const int32_t n_gen = params.max_length - n_input;
+                        if (n_committed_total > 8 &&
+                                n_committed_eog > 0.9f * n_committed_total &&
+                                n_masked        > 0.2f * n_gen) {
+                            LOG_WRN("%s: aborting degenerate draft at step %d (end tokens %d/%d committed, %d/%d still masked)\n",
+                                    __func__, global_step, n_committed_eog, n_committed_total, n_masked, n_gen);
+                            if (params.out_degenerate) {
+                                *params.out_degenerate = true;
+                            }
+                            break;
+                        }
                     }
                 } else {
                     int32_t transfer_count = calculate_transfer_count(
@@ -616,6 +661,9 @@ void diffusion_generate(llama_context *          ctx,
                                 int32_t mask_idx   = confidences[i].second;
                                 int32_t pos        = mask_positions[mask_idx];
                                 output_tokens[pos] = sampled_tokens[mask_idx];
+                                if (params.output_confidences) {
+                                    params.output_confidences[pos] = confidences[i].first;
+                                }
                             }
                         } else {
                             conf_candidates.clear();
@@ -637,6 +685,9 @@ void diffusion_generate(llama_context *          ctx,
                                 int32_t mask_idx     = selected_idx;
                                 int32_t pos          = mask_positions[mask_idx];
                                 output_tokens[pos]   = sampled_tokens[mask_idx];
+                                if (params.output_confidences) {
+                                    params.output_confidences[pos] = confidences[mask_idx].first;
+                                }
 
                                 conf_candidates[selected_idx].p = 0.0f;
                                 conf_array.selected             = -1;
@@ -858,6 +909,14 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
         if (params.step_callback &&
             !params.step_callback(step_idx, S, output_tokens, params.max_length, params.step_callback_user_data)) {
             break;
+        }
+    }
+
+    if (params.output_confidences) {
+        // final-step entropy per canvas position (lower = more confident); -1 over the prompt
+        std::fill(params.output_confidences, params.output_confidences + params.max_length, -1.0f);
+        for (int32_t pos = 0; pos < C; pos++) {
+            params.output_confidences[n_input + pos] = entropy[pos];
         }
     }
 
