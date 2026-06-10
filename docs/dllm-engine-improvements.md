@@ -506,3 +506,49 @@ The #24423 merge changed the ground truth under several items. Verified first-ha
   2122.65 +- 5 t/s - flat; this is the measurement that dropped batched candidates.
   (The earlier battery curve - 1554/1437/1777 t/s, +-25% - is kept only as a record of why
   battery measurements cannot be trusted for design decisions.)
+
+## Implementation log 2: the rig-mandatory engine work (DONE, verified 2026-06-10)
+
+Driven by docs/p106-mining-fleet.md sec 6 (9 GPUs, 4 GB host RAM). All measured on Dream-7B
+Q4_K_M unless noted; 14/14 backend-sampler tests green on CPU and GPU after each change.
+
+### k-stride sampling host buffers + lazy raw-logits buffer (src/llama-context.{h,cpp})
+- The four sampling output arrays (sampled_logits/probs/candidates/sampled) move out of
+  buf_output into a LAZY pinned buffer (sampling_buffers_ensure) strided by the WIDEST
+  candidate set the attached samplers actually produce (read off the graph tensors' ne[0]
+  at copy time, grow-only realloc with a synchronize) instead of n_vocab. A top_k=40 chain
+  at ub 512: 1.24 GB pinned -> ~0.3 MB.
+- The raw-logits host buffer also allocates lazily (logits_buffer_ensure, pinned) - with
+  backend samplers it is usually never copied (needs_raw_logits false). buf_output keeps
+  logits capacity recorded but allocates the region only on first raw-logits use.
+- Readback (_ith) and output_reorder use sampling.stride; reorder skips until allocated.
+- MEASURED: llama-diffusion-server RSS at ub 512: 1997 MB -> 783 MB.
+- HARD-WON LESSON (cost a debugging session): allocating buf_output from a PLAIN CPU
+  buffer and copying into it with ggml_backend_tensor_get_async causes deterministic
+  CUDA illegal-memory-access failures that surface later (sticky error at the next CUDA
+  call, often buffer free in ~llama_context). compute-sanitizer and CUDA_LAUNCH_BLOCKING=1
+  both mask it (serialization). Even with the copies made synchronous the fault persisted -
+  the buffer TYPE of buf_output participates in some async path we did not identify. The
+  fix that works: keep EVERY async-copy destination pinned, and get the RAM savings via
+  lazy allocation instead of pageable memory. Do not retry the pageable route.
+
+### Multi-replica diffusion server (examples/diffusion/diffusion-server.cpp)
+- --diffusion-replicas N (0 = one per GPU device): ONE process hosts N (model, context)
+  pairs, each pinned to a device via llama_model_params.devices; free-list dispatch with a
+  condition variable; /generate responses carry "replica": i; /health carries "replicas".
+- Weights are shared via mmap across replicas (same file): MEASURED Pss for 1 -> 2
+  replicas: 2728 MB -> 2780 MB, i.e. the marginal replica costs ~52 MB of real memory
+  (CUDA context + compute/KV host bits). RSS double-counts shared pages - use Pss.
+- Rig projection: base + 8 marginal replicas ~ 1.2-2 GB host RAM for 9 GPUs (vs 9.5-17.5
+  GB for 9 separate processes). The 4 GB Celeron host fits with room.
+- Verified: 2 replicas on one device (-ngl 14), two concurrent /generate requests served
+  in parallel by replica 0 and 1 (~1.76 s each, overlapping wall-clock); DiffusionGemma
+  through the rewritten server (canvas family, 15.0 s generate) unaffected.
+
+### GGML_CUDA_FORCE_GRAPHS (ggml/src/ggml-cuda/ggml-cuda.cu)
+- env flag bypasses the Ampere+ CUDA-graphs gate (a heuristic, not a hardware limit) so
+  pre-Ampere fleets can A/B graph replay; motivated by the measured 1.5x on launch-bound
+  hosts. Default behavior unchanged. Validation needs Pascal hardware (experiment E3).
+
+### --host/--port for the diffusion example (common/arg.cpp)
+- The existing server args now also apply to LLAMA_EXAMPLE_DIFFUSION (verified on :8090).

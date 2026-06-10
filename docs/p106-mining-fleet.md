@@ -329,3 +329,19 @@ FLEET (until the multi-replica server lands - sec 6):
 11. Full 9-card farm: requires engine fixes from sec 6 (k-stride host buffers +
     multi-replica server) - then one process, 9 replicas, ~2.5-3 GB host RAM.
 12. Point kintsugi's dispatcher at the replica endpoints; verify candidates/minute.
+
+## 10. Engine work DONE (2026-06-10): the sec-6 blockers are implemented
+
+Both mandatory fixes from sec 6 landed on the fork (details + measurements in
+docs/dllm-engine-improvements.md, "Implementation log 2"):
+- k-stride sampling buffers + lazy logits buffer: server RSS at ub 512 fell 1997 -> 783 MB.
+- Multi-replica server (--diffusion-replicas, 0 = one per GPU): one process, N devices;
+  marginal replica MEASURED at ~52 MB Pss (mmap-shared weights). 9 replicas project to
+  ~1.2-2 GB host RAM - the 4 GB rig fits with headroom, superseding the sec-6 verdict
+  table's "YES (tight)" with "YES (comfortable)".
+- GGML_CUDA_FORCE_GRAPHS env flag for experiment E3 (A/B CUDA graphs on Pascal).
+- --host/--port now work for llama-diffusion-server.
+Runbook updates (sec 9): step 10's "interim 4 processes" cap is obsolete - start ONE
+server with --diffusion-replicas 0 and all 9 cards serve from a single process (step 11
+is implemented). Remaining rig-day work is unchanged: CUDA 12.x build + driver 580
+bring-up + on-card validation (steps 3-9) and the kintsugi dispatcher (step 12).
