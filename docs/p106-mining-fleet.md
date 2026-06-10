@@ -212,3 +212,61 @@ VGA-BIOS archive holds a "manli p106-90 6 GB" BIOS dump). Confirmed card profile
   concern from sec 6 dissolves on this turnkey unit; the remaining unknown is only the
   R580-legacy-driver + CUDA 12 bring-up on its stock BIOS, which is rig-day work (E1).
 - Manli's own product page markets the X9 for "AI computing" - the manufacturer agrees.
+
+## 8. Normal llama-server testing + does everything work on ALL cards? (grilling round 3)
+## (every claim verified by execution on this machine or cited)
+
+### Can the rig be tested with the NORMAL llama-server?
+
+YES for ordinary (autoregressive) models - and it is the recommended E1 smoke test.
+NO for diffusion models - VERIFIED BY EXECUTION: llama-server loads Dream-7B fine but every
+completion request returns HTTP 500 "the current context does not logits computation.
+skipping" (the exact upstream issue #17249 failure; the server's slot machinery is
+AR-only). Diffusion models require our llama-diffusion-server.
+
+Three AR test modes for the rig, all with the stock llama-server:
+1. Single card: any 7B Q4 (e.g. Qwen2.5-Coder-7B, 4.7 GB) on one P106; projected
+   ~28-30 t/s generation (bandwidth-bound, the 6GB cards have the full 192 GB/s).
+   Host RAM measured for llama-server: ~0.6 GB RSS (no diffusion pinned buffers - AR
+   decodes request few output rows) -> fits the 4 GB host with room to spare.
+2. THE BIG ONE - one process, all nine cards: `llama-server -m model.gguf -ngl 99
+   -sm layer` pools 54 GB of VRAM in a SINGLE process (no 9x RAM problem). Per-token
+   cross-card traffic is one activation vector per layer boundary (~14 KB) - trivially
+   fine over PCIe 1.0 x1 for generation (prompt processing is slower but works). This
+   lets the EUR 200 mining rig serve Qwen2.5-72B-class models: 32B Q4 (~19 GB) at a
+   projected ~8-12 t/s, 70B Q4 (~40 GB) at ~4-6 t/s. Worth testing for its own sake.
+3. kintsugi-relevant: 9 separate single-card llama-servers for AR candidate farming -
+   same farm pattern as diffusion, and at ~0.6 GB/process the 4 GB host fits ~4-5 of
+   them today (all 9 after the multi-replica server work).
+
+### Does everything in this document work on modern cards too?
+
+The fork was DEVELOPED on an RTX 5070 (Blackwell) - everything was verified there first.
+Cross-card matrix (verified by: local 5070 runs + Pascal source audit + toolkit checks):
+
+| feature                          | P106 (Pascal 6.1)        | RTX 5070 / modern        |
+|----------------------------------|--------------------------|--------------------------|
+| GPU backend sampling (multi-row) | YES (audit: all ops ok)  | YES (tested, 14/14)      |
+| threshold decoding / infill /    | YES (model-level,        | YES (tested)             |
+| confidence export / guard        |  card-agnostic)          |                          |
+| llama-diffusion-server           | YES (pending E1 on-rig)  | YES (tested, both models)|
+| Dream/LLaDA/DiffuCoder 7B Q4     | YES (fits 6 GB)          | YES (tested)             |
+| DiffusionGemma 26B               | **NO - impossible**: 16 GB Q4 exceeds 6 GB VRAM and  |
+|                                  | the experts-in-RAM path needs ~20 GB host (rig has 4)| 
+|                                  |                          | YES (tested, --cpu-moe)  |
+| CUDA graphs (1.5x when           | NO (upstream Ampere+     | YES (active by default)  |
+|  launch-bound)                   |  gate; experiment E3)    |                          |
+| FlashAttention                   | scalar fallback only     | full MMA kernels         |
+| normal llama-server (AR models)  | YES (verified pattern)   | YES                      |
+| normal llama-server (dLLMs)      | NO (verified: HTTP 500)  | NO (same - by design)    |
+
+### Build matrix (verified)
+
+- This laptop's CUDA 13.3 CANNOT compile for the rig (sm_61 removed; verified locally).
+- **CUDA 12.8 is the unique one-binary option**: it added Blackwell sm_120 (RTX 5070) AND
+  still targets Pascal sm_61 (feature-frozen, removed in 13.x) - one fat binary with
+  `CMAKE_CUDA_ARCHITECTURES="61-real;120a-real"` runs on both machines. (Sources: NVIDIA
+  CUDA 12.8 Blackwell announcement; Pascal feature-freeze note; local nvcc 13.3 test.)
+- Simpler alternative: keep the laptop on 13.3 and install CUDA 12.x only for rig builds.
+- Rig driver: 580 legacy branch (last for Pascal, security fixes to ~2028); laptop driver
+  unaffected (Blackwell uses current branches).
