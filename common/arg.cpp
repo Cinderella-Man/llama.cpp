@@ -2839,14 +2839,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.hostname = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_HOST"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DIFFUSION}).set_env("LLAMA_ARG_HOST"));
     add_opt(common_arg(
         {"--port"}, "PORT",
         string_format("port to listen (default: %d)", params.port),
         [](common_params & params, int value) {
             params.port = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PORT"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DIFFUSION}).set_env("LLAMA_ARG_PORT"));
     add_opt(common_arg(
         {"--reuse-port"},
         string_format("allow multiple sockets to bind to the same port (default: %s)", params.reuse_port ? "enabled" : "disabled"),
