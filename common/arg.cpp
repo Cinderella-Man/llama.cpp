@@ -1919,9 +1919,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_sampling());
     add_opt(common_arg(
         {"-bs", "--backend-sampling"},
-        "enable backend sampling (experimental) (default: disabled)",
-        [](common_params & params) {
-            params.sampling.backend_sampling = true;
+        {"--no-backend-sampling"},
+        string_format("enable backend sampling (experimental) (default: %s)", params.sampling.backend_sampling ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.sampling.backend_sampling = value;
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
     add_opt(common_arg(
@@ -3896,6 +3897,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--diffusion-add-gumbel-noise"}, "F",
         string_format("add gumbel noise to the logits if temp > 0.0 (default: %s)", params.diffusion.add_gumbel_noise ? "true" : "false"),
         [](common_params & params, const std::string & value) { params.diffusion.add_gumbel_noise = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-infill"},
+        string_format("treat the prompt as a canvas: only the mask tokens written in it are generated (default: %s)", params.diffusion.infill ? "true" : "false"),
+        [](common_params & params) { params.diffusion.infill = true; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
         { "-lr", "--learning-rate" }, "ALPHA",

@@ -3038,13 +3038,29 @@ void llm_graph_context::build_sampling() const {
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));
 
-    std::map<llama_seq_id, int32_t> seq_to_logit_row;
+    // contiguous range of logit rows per sequence
+    // count == 0 marks a sequence whose output rows are interleaved with another
+    // sequence's - such sequences cannot be sampled on the backend and fall back
+    // to the CPU path (needs_raw_logits() then keeps the raw logits available)
+    struct seq_rows {
+        int32_t first;
+        int32_t count;
+    };
+
+    std::map<llama_seq_id, seq_rows> seq_to_logit_rows;
     int32_t logit_row_idx = 0;
 
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (ubatch.output[i]) {
             llama_seq_id seq_id = ubatch.seq_id[i][0];
-            seq_to_logit_row[seq_id] = logit_row_idx;
+            auto it = seq_to_logit_rows.find(seq_id);
+            if (it == seq_to_logit_rows.end()) {
+                seq_to_logit_rows[seq_id] = { logit_row_idx, 1 };
+            } else if (it->second.count > 0 && it->second.first + it->second.count == logit_row_idx) {
+                it->second.count++;
+            } else {
+                it->second.count = 0;
+            }
             logit_row_idx++;
         }
     }
@@ -3058,13 +3074,19 @@ void llm_graph_context::build_sampling() const {
     ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
     for (const auto & [seq_id, sampler] : samplers) {
-        const auto it = seq_to_logit_row.find(seq_id);
+        const auto it = seq_to_logit_rows.find(seq_id);
+
+        const bool active = it != seq_to_logit_rows.end() && it->second.count > 0;
 
         // inactive samplers always work on the first row
-        const auto row_idx = it != seq_to_logit_row.end() ? it->second : 0;
-        const int i_out    = it != seq_to_logit_row.end() ? 1          : 0;
+        const int32_t row_idx = active ? it->second.first : 0;
+        const int32_t n_rows  = active ? it->second.count : 1;
+        const int     i_out   = active ? 1                : 0;
 
-        ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
+        // keep the 1-row case as a 1d view so existing graphs are unchanged
+        ggml_tensor * logits_seq = n_rows == 1 ?
+            ggml_view_1d(ctx0, logits_t, logits_t->ne[0],         row_idx * logits_t->nb[1]) :
+            ggml_view_2d(ctx0, logits_t, logits_t->ne[0], n_rows, logits_t->nb[1], row_idx * logits_t->nb[1]);
         ggml_format_name(logits_seq, "logits_seq_%d", seq_id);
 
         struct llama_sampler_data data = {

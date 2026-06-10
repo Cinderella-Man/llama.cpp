@@ -45,6 +45,8 @@ struct diffusion_params {
     int32_t block_length     = 0;      // Block size (for block scheduling)
     float   alg_temp         = 0;      // algorithm temperature (0.0 = deterministic)
     bool    add_gumbel_noise = false;  // Add gumbel noise to the logits if temp > 0.0
+    bool    backend_sampling = false;  // Sample on the backend (GPU) instead of the CPU
+    bool    infill           = false;  // Input is a canvas: only the mask tokens it contains are generated
 
     int32_t max_length = 0;            // Maximum sequence length
 };

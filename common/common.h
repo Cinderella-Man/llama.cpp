@@ -390,6 +390,8 @@ struct common_params_diffusion {
 
     float   cfg_scale     = 0;        // classifier-free guidance scale
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
+
+    bool    infill        = false;    // treat the prompt as a canvas containing mask tokens to fill in
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)

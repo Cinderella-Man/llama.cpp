@@ -1338,6 +1338,180 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+// contiguous range of output rows per sequence
+// count == 0 marks a sequence whose output rows are not contiguous - no backend
+// sampling tensors exist for such sequences (see build_sampling())
+struct llama_seq_output_rows {
+    uint32_t first;
+    uint32_t count;
+};
+
+static std::map<llama_seq_id, llama_seq_output_rows> build_seq_to_output_rows(const llama_ubatch & ubatch, uint32_t row_offset) {
+    std::map<llama_seq_id, llama_seq_output_rows> seq_to_rows;
+    // how many output tokens we have seen so far for this ubatch.
+    uint32_t local = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        // skip tokens that are not output.
+        if (!ubatch.output[i]) {
+            continue;
+        }
+
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        // row_offset is the number of output tokens before this ubatch.
+        const uint32_t     row    = row_offset + local;
+
+        auto it = seq_to_rows.find(seq_id);
+        if (it == seq_to_rows.end()) {
+            seq_to_rows[seq_id] = { row, 1 };
+        } else if (it->second.count > 0 && it->second.first + it->second.count == row) {
+            it->second.count++;
+        } else {
+            it->second.count = 0;
+        }
+
+        ++local;
+    }
+    return seq_to_rows;
+}
+
+static void copy_tensor_async_ints(
+    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const buffer_view<llama_token> & sampled,
+    const std::map<llama_seq_id, llama_seq_output_rows> & seq_to_rows,
+    ggml_backend_sched_t sched) {
+    if (!sampled.has_data()) {
+        return;
+    }
+
+    for (const auto & [seq_id, tensor] : tensor_map) {
+        auto it = seq_to_rows.find(seq_id);
+        if (it == seq_to_rows.end() || it->second.count == 0) {
+            continue;
+        }
+
+        const uint32_t row    = it->second.first;
+        const uint32_t n_rows = it->second.count;
+
+        GGML_ASSERT(row + n_rows <= sampled.size);
+
+        GGML_ASSERT(ggml_is_contiguous(tensor) && "sampled tokens tensor must be contiguous for async copy");
+        GGML_ASSERT((int64_t) n_rows == ggml_nelements(tensor) && "one sampled token per output row");
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+        ggml_backend_tensor_get_async(backend, tensor, sampled.data + row, 0, ggml_nbytes(tensor));
+    }
+}
+
+static void copy_tensor_async_floats(
+    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const buffer_view<float> & dst,
+    size_t stride,
+    std::vector<uint32_t> & counts,
+    const std::map<llama_seq_id, llama_seq_output_rows> & seq_to_rows,
+    ggml_backend_sched_t sched) {
+    if (!dst.has_data()) {
+        return;
+    }
+
+    for (const auto & [seq_id, tensor] : tensor_map) {
+        auto it = seq_to_rows.find(seq_id);
+        if (it == seq_to_rows.end() || it->second.count == 0) {
+            continue;
+        }
+
+        const uint32_t row    = it->second.first;
+        const uint32_t n_rows = it->second.count;
+
+        GGML_ASSERT(row + n_rows <= counts.size());
+
+        GGML_ASSERT(ggml_is_contiguous(tensor) && "logits/probs tensor must be contiguous for async copy");
+
+        const size_t ne0 = tensor->ne[0];
+        GGML_ASSERT((int64_t) (ne0*n_rows) == ggml_nelements(tensor));
+        GGML_ASSERT(ne0 <= stride);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+
+        // host rows are strided by n_vocab while the tensor rows are packed
+        if (ne0 == stride) {
+            ggml_backend_tensor_get_async(backend, tensor, dst.data + (size_t) row * stride, 0, ggml_nbytes(tensor));
+        } else {
+            for (uint32_t r = 0; r < n_rows; ++r) {
+                float * row_ptr = dst.data + (size_t) (row + r) * stride;
+                ggml_backend_tensor_get_async(backend, tensor, row_ptr, (size_t) r * ne0 * sizeof(float), ne0 * sizeof(float));
+            }
+        }
+
+        // Update the actual number of logits/probabilities that were written for each row.
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            counts[row + r] = ne0;
+        }
+    }
+}
+
+static void copy_tensor_async_candidates(
+    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const buffer_view<llama_token> & dst,
+    size_t stride,
+    std::vector<uint32_t> & counts,
+    const std::map<llama_seq_id, llama_seq_output_rows> & seq_to_rows,
+    ggml_backend_sched_t sched) {
+    if (!dst.has_data()) {
+        return;
+    }
+
+    for (const auto & [seq_id, tensor] : tensor_map) {
+        auto it = seq_to_rows.find(seq_id);
+        if (it == seq_to_rows.end() || it->second.count == 0) {
+            continue;
+        }
+
+        const uint32_t row    = it->second.first;
+        const uint32_t n_rows = it->second.count;
+
+        GGML_ASSERT(row + n_rows <= counts.size());
+
+        GGML_ASSERT(ggml_is_contiguous(tensor) && "candidates tensor must be contiguous for async copy");
+
+        const size_t ne0 = tensor->ne[0];
+        GGML_ASSERT((int64_t) (ne0*n_rows) == ggml_nelements(tensor));
+        GGML_ASSERT(ne0 <= stride);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+
+        if (ne0 == stride) {
+            ggml_backend_tensor_get_async(backend, tensor, dst.data + (size_t) row * stride, 0, ggml_nbytes(tensor));
+        } else {
+            for (uint32_t r = 0; r < n_rows; ++r) {
+                llama_token * row_ptr = dst.data + (size_t) (row + r) * stride;
+                ggml_backend_tensor_get_async(backend, tensor, row_ptr, (size_t) r * ne0 * sizeof(llama_token), ne0 * sizeof(llama_token));
+            }
+        }
+
+        // Update the actual number of candidates that were written.
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            counts[row + r] = ne0;
+        }
+    }
+}
+
+static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+
+        // Check if the output token has at least one sequence without a backend sampler.
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (samplers.find(seq_id) == samplers.end()) {
+                return true;
+            }
+        }
+    }
+    return false; // all sequences use backend sampling
+}
+
 int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1417,7 +1591,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
 
     // extract logits
-    if (logits.data && t_logits) {
+    // skip the copy when every output token is sampled on the backend
+    if (logits.data && t_logits && needs_raw_logits(ubatch, sampling.samplers)) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
@@ -1490,6 +1665,20 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
+    // Copy backend sampling output if this batch produced any sampling tensors.
+    if (!sampling.samplers.empty() &&
+            (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty() || !res->t_candidates.empty())) {
+        const auto seq_to_rows = build_seq_to_output_rows(ubatch, 0);
+        const auto stride = (size_t) n_vocab;
+
+        // async copy the sampling data from the backend to the host
+        copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_rows, sched.get());
+
+        copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_rows, sched.get());
+        copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_rows, sched.get());
+        copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_rows, sched.get());
+    }
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -1519,128 +1708,6 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return 0;
 }
 
-static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubatch & ubatch, uint32_t row_offset) {
-    std::map<llama_seq_id, uint32_t> seq_to_row;
-    // how many output tokens we have seen so far for this ubatch.
-    uint32_t local = 0;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        // skip tokens that are not output.
-        if (!ubatch.output[i]) {
-            continue;
-        }
-
-        const llama_seq_id seq_id = ubatch.seq_id[i][0];
-        // row_offset is the number of output tokens before this ubatch.
-        seq_to_row[seq_id] = row_offset + local;
-        ++local;
-    }
-    return seq_to_row;
-}
-
-static void copy_tensor_async_ints(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
-    const buffer_view<llama_token> & sampled,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
-    ggml_backend_sched_t sched) {
-    if (!sampled.has_data()) {
-        return;
-    }
-
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
-            continue;
-        }
-
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < sampled.size);
-
-        GGML_ASSERT(ggml_is_contiguous(tensor) && "sampled tokens tensor must be contiguous for async copy");
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        ggml_backend_tensor_get_async(backend, tensor, sampled.data + row, 0, sizeof(sampled.data[row]));
-    }
-}
-
-static void copy_tensor_async_floats(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
-    const buffer_view<float> & dst,
-    size_t stride,
-    std::vector<uint32_t> & counts,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
-    ggml_backend_sched_t sched) {
-    if (!dst.has_data()) {
-        return;
-    }
-
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
-            continue;
-        }
-
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < counts.size());
-
-        GGML_ASSERT(ggml_is_contiguous(tensor) && "logits/probs tensor must be contiguous for async copy");
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        float * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
-
-        // Update the actual number of logits/probabilities that were written for this row.
-        counts[row] = ggml_nelements(tensor);
-    }
-}
-
-static void copy_tensor_async_candidates(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
-    const buffer_view<llama_token> & dst,
-    size_t stride,
-    std::vector<uint32_t> & counts,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
-    ggml_backend_sched_t sched) {
-    if (!dst.has_data()) {
-        return;
-    }
-
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
-            continue;
-        }
-
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < counts.size());
-
-        GGML_ASSERT(ggml_is_contiguous(tensor) && "candidates tensor must be contiguous for async copy");
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        llama_token * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
-
-        // Update the actual number of candidates that were written.
-        counts[row] = ggml_nelements(tensor);
-    }
-}
-
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
-    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-        if (!ubatch.output[i]) {
-            continue;
-        }
-
-        // Check if the output token has at least one sequence without a backend sampler.
-        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-            llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
-                return true;
-            }
-        }
-    }
-    return false; // all sequences use backend sampling
-}
-
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1667,30 +1734,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
-
-    // TODO: avoid this workaround in the future
-    if (has_samplers && batch_inp.logits) {
-        std::vector<int32_t> seq_output_count(n_seq_max, 0);
-
-        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
-            if (batch_inp.logits[i] == 0) {
-                continue;
-            }
-
-            const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
-
-            for (int32_t s = 0; s < ns; ++s) {
-                const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
-
-                seq_output_count[seq_id]++;
-                if (seq_output_count[seq_id] > 1) {
-                    LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence (seq_id %d had %d)\n",
-                            __func__, seq_id, seq_output_count[seq_id]);
-                    return -1;
-                }
-            }
-        }
-    }
 
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
@@ -1946,15 +1989,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
-            const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
-            const auto stride = n_vocab;
+            const auto seq_to_rows = build_seq_to_output_rows(ubatch, n_outputs_prev);
+            const auto stride = (size_t) n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
+            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_rows, sched.get());
 
-            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
-            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
-            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_rows, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_rows, sched.get());
+            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_rows, sched.get());
         }
 
         n_outputs_prev += n_outputs;
@@ -2264,13 +2307,27 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
-    // set one output token per sequence in order to activate all backend samplers
     std::vector<llama_seq_id> seq_ids(n_seqs);
     for (uint32_t i = 0; i < n_seqs; ++i) {
         seq_ids[i] = i;
-        ubatch.n_seq_id[i] = 1;
-        ubatch.seq_id[i] = &seq_ids[i];
-        ubatch.output[i] = true;
+    }
+
+    if (mctx == nullptr) {
+        // models without memory output every token (see encode()), so the sampling
+        // graph must be reserved at full width - mark the first n_outputs tokens
+        const uint32_t n_seq_tokens = n_tokens/n_seqs;
+        for (uint32_t i = 0; i < std::min(n_tokens, (uint32_t) n_outputs); ++i) {
+            ubatch.n_seq_id[i] = 1;
+            ubatch.seq_id[i]   = &seq_ids[i/n_seq_tokens];
+            ubatch.output[i]   = true;
+        }
+    } else {
+        // set one output token per sequence in order to activate all backend samplers
+        for (uint32_t i = 0; i < n_seqs; ++i) {
+            ubatch.n_seq_id[i] = 1;
+            ubatch.seq_id[i]   = &seq_ids[i];
+            ubatch.output[i]   = true;
+        }
     }
 
     auto * res = gf_res_reserve.get();

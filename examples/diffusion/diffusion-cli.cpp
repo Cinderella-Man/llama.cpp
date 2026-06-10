@@ -108,6 +108,10 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    // diffusion sampling benefits heavily from backend sampling - default it to
+    // on; use --no-backend-sampling to force the CPU sampling path
+    params.sampling.backend_sampling = true;
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_DIFFUSION)) {
         return 1;
     }
@@ -154,7 +158,10 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab            = llama_model_get_vocab(model);
 
-    std::string         formatted_prompt = format_input_text(params.prompt, params.system_prompt, params.enable_chat_template, model);
+    // an infill canvas is used verbatim - no chat template
+    const bool use_chat_template = params.enable_chat_template && !params.diffusion.infill;
+
+    std::string         formatted_prompt = format_input_text(params.prompt, params.system_prompt, use_chat_template, model);
 
     std::vector<llama_token> input_tokens = common_tokenize(vocab,
                                                             formatted_prompt,
@@ -173,6 +180,15 @@ int main(int argc, char ** argv) {
     llama_token mask_token_id = llama_vocab_mask(vocab);
 
     GGML_ASSERT(mask_token_id != LLAMA_TOKEN_NULL);
+
+    {
+        char mask_piece[64];
+        const int n = llama_token_to_piece(vocab, mask_token_id, mask_piece, sizeof(mask_piece) - 1, 0, true);
+        if (n > 0) {
+            mask_piece[n] = '\0';
+            LOG_INF("mask token: %d '%s'\n", mask_token_id, mask_piece);
+        }
+    }
 
     bool visual_mode = params.diffusion.visual_mode;
 
@@ -209,9 +225,25 @@ int main(int argc, char ** argv) {
     diff_params.top_k            = params.sampling.top_k;
     diff_params.visual_mode      = params.diffusion.visual_mode;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
+    diff_params.cfg_scale        = params.diffusion.cfg_scale;
+    diff_params.alg_temp         = params.diffusion.alg_temp;
+    diff_params.backend_sampling = params.sampling.backend_sampling;
+    diff_params.infill           = params.diffusion.infill;
+
+    if (diff_params.infill) {
+        if (n_input > params.n_ubatch) {
+            LOG_ERR("error: infill canvas (%d tokens) exceeds the batch size (%d), increase -ub\n", n_input, params.n_ubatch);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        // the canvas is the whole sequence
+        diff_params.max_length = n_input;
+    }
 
     diff_params.step_callback           = diffusion_step_callback;
-    callback_data cb_data               = { &diff_params, vocab, n_input };
+    // for infill the whole canvas is of interest, not just the part after the prompt
+    callback_data cb_data               = { &diff_params, vocab, diff_params.infill ? 0 : n_input };
     diff_params.step_callback_user_data = &cb_data;
 
     const char * alg_names[]   = {
@@ -253,7 +285,11 @@ int main(int argc, char ** argv) {
             LOG_INF("\033[2J\033[H");
         }
 
-        output_tokens.erase(output_tokens.begin(), output_tokens.begin() + n_input);
+        if (!diff_params.infill) {
+            output_tokens.erase(output_tokens.begin(), output_tokens.begin() + n_input);
+        } else {
+            output_tokens.resize(n_generated);
+        }
         std::string output_data = common_detokenize(vocab, output_tokens, false);
         LOG_INF("\n%s\n", output_data.c_str());
     } else {
