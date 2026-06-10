@@ -138,6 +138,12 @@ int main(int argc, char ** argv) {
     model_params.use_mlock          = params.use_mlock;
     model_params.check_tensors      = params.check_tensors;
 
+    // honor --cpu-moe / --n-cpu-moe / -ot (a 26B MoE only fits consumer VRAM with experts on CPU)
+    if (!params.tensor_buft_overrides.empty()) {
+        GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr && "Tensor buffer overrides not terminated with empty pattern");
+        model_params.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
     if (!model) {
         LOG_ERR("error: failed to load model '%s'\n", params.model.path.c_str());
