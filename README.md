@@ -12,6 +12,63 @@
 
 LLM inference in C/C++
 
+## About this fork: fast diffusion LLMs (dLLMs)
+
+This fork extends upstream llama.cpp to make diffusion language models (Dream, LLaDA,
+DiffuCoder, DiffusionGemma) fast and usable as a code-generation engine, particularly for
+verify-and-repair loops driven by an external harness. Everything below lives in this fork;
+upstream contains none of it (except where noted).
+
+Features added here:
+
+- **GPU (backend) sampling for diffusion models** - generalized backend sampling to multiple
+  output rows per sequence (core: `build_sampling`, `encode()` sampling read-back, all
+  backend samplers made multi-row) and switched the diffusion sampling loop to it. The
+  per-step sampling stage drops from 24-1900 ms (CPU, machine-state dependent) to a flat
+  ~2 ms; measured up to 5.3x end-to-end on battery power. Default on;
+  `--no-backend-sampling` reverts. Details: `docs/diffusion-gpu-sampling-plan.md`.
+- **Confidence-threshold parallel decoding** (`--diffusion-conf-threshold`, Fast-dLLM style) -
+  commit every token whose confidence clears the threshold each step; 128 steps -> 17-47.
+  Includes de-tempered confidence calibration so thresholds mean the same thing at any
+  `--temp`.
+- **Inpainting / infill** (`--diffusion-infill`) - write the model's mask piece (e.g.
+  `<|mask|>`) inside the prompt; only those positions are regenerated, all other text stays
+  byte-identical. The primitive for compiler-driven repair loops.
+- **Per-position confidence export and a degeneracy guard** - generation can return the
+  commit-time confidence of every produced token (canvas models: per-position entropy), and
+  threshold decoding aborts early when end-of-text tokens flood the canvas.
+- **`llama-diffusion-server`** - a general HTTP daemon (model loaded once) serving BOTH
+  diffusion families through one JSON API: `GET /health` (capabilities: family, mask piece,
+  canvas/entropy-bound defaults), `POST /tokenize`, `POST /detokenize`, `POST /generate`
+  (all CLI flags as defaults, per-request overrides, optional confidences).
+- **DiffusionGemma support** - merged the upstream draft [PR #24423](https://github.com/ggml-org/llama.cpp/pull/24423)
+  (entropy-bound canvas decoding, prefix-KV phases, conversion) and fixed `--cpu-moe`
+  handling in the diffusion CLI so the 26B MoE runs in under 6 GB of VRAM with experts in
+  system RAM.
+- Smaller fixes: `--diffusion-cfg-scale`/`--diffusion-alg-temp` were parsed but never
+  applied; `-bs/--backend-sampling` made negatable; two new multi-output backend-sampler
+  tests.
+
+Design notes, measurements and reimplementation-grade documentation:
+`docs/diffusion-gpu-sampling-plan.md`, `docs/dllm-engine-improvements.md`,
+`docs/dllm-elixir-harness.md`, `docs/diffusiongemma-support.md`.
+
+Quick start (masked diffusion, GPU sampling + fast drafts):
+
+```sh
+llama-diffusion-cli -m Dream-7B-Q4_K_M.gguf -p "..." -ub 512 -ngl 99 \
+    --diffusion-eps 0.001 --diffusion-steps 128 --diffusion-conf-threshold 0.6 \
+    --temp 0.2 --top-k 40
+
+# infill: regenerate only the masked span
+llama-diffusion-cli -m Dream-7B-Q4_K_M.gguf --diffusion-infill -ngl 99 \
+    -p 'def add(a, b), do: <|mask|><|mask|><|mask|>' --diffusion-eps 0.001 --top-k 40
+
+# daemon (default port 8080)
+llama-diffusion-server -m Dream-7B-Q4_K_M.gguf -ub 512 -ngl 99 \
+    --diffusion-eps 0.001 --diffusion-steps 128 --temp 0.2 --top-k 40
+```
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
