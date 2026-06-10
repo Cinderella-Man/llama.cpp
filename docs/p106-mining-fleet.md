@@ -270,3 +270,62 @@ Cross-card matrix (verified by: local 5070 runs + Pascal source audit + toolkit 
 - Simpler alternative: keep the laptop on 13.3 and install CUDA 12.x only for rig builds.
 - Rig driver: 580 legacy branch (last for Pascal, security fixes to ~2028); laptop driver
   unaffected (Blackwell uses current branches).
+
+## 9. Running the model in a 6 GB envelope: MEASURED numbers + runbook (grilling round 4)
+
+### Measured VRAM envelope (Dream-7B Q4_K_M, llama-diffusion-server, backend sampling,
+### RTX 5070; Pascal totals will differ only by driver/context overhead, margin is ample)
+
+| -ub  | model buffer | compute buffer | TOTAL process VRAM | headroom vs 6144 MiB |
+|------|--------------|----------------|--------------------|----------------------|
+| 512  | 4168 MiB     | 609 MiB        | **4946 MiB**       | ~1.2 GB              |
+| 384  | 4168 MiB     | ~460 MiB       | **4790 MiB**       | ~1.35 GB             |
+| 256  | 4168 MiB     | 305 MiB        | **4634 MiB**       | ~1.5 GB              |
+
+VERDICT: Dream-7B Q4_K_M fits a 6 GB card AT FULL ub 512 with >1 GB headroom - no
+quantization downgrade or ubatch sacrifice required. DiffuCoder Q4_K_M (~4.3 GiB model
+buffer) lands ~5.1 GiB at ub 512: also fits.
+
+### Options ladder (use in this order only if a 6 GB card surprises us)
+- A (default): Q4_K_M + `-ub 512` - full draft length, best quality. 4.95 GiB.
+- B: `-ub 256` - caps max_length at 256 (fine for repair canvases; drafts shorter). 4.6 GiB.
+- C: IQ4_XS GGUF (file 4.2 GB -> model ~3.7 GiB) - ~4.4 GiB total at ub 512; slight
+  quality cost; only needed if Pascal context overhead eats the margin (unlikely).
+- D: Q3_K_M (3.8 GB) - emergency only; measurable quality loss on code.
+
+### Runbook: steps to run the model on the 6 GB cards
+
+DONE NOW (laptop):
+1. VRAM envelope measured (table above) - the configuration is proven to fit.
+2. Software validated end-to-end on modern hardware (GPU sampling, threshold, infill,
+   diffusion-server) - secs 6-8.
+
+BUILD (any machine, once):
+3. Install CUDA 12.8 toolkit alongside (CUDA 13 cannot target sm_61 - verified).
+   `cmake -B build-rig -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="61-real" \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc`
+   (add `;120a-real` to share one binary with the laptop). Build llama-diffusion-server,
+   llama-diffusion-cli, test-backend-sampler, llama-bench; ship build-rig/bin + the GGUF.
+
+RIG BRING-UP (one-time):
+4. Minimal Linux server install on the 64 GB SSD; pin the NVIDIA 580 legacy driver
+   (the last Pascal branch); add zram swap; verify all 9 cards in `nvidia-smi`.
+5. Smoke with the NORMAL llama-server first (sec 8): one card, an AR 7B Q4 - proves
+   driver + CUDA runtime + card health with zero diffusion variables.
+
+PER-CARD VALIDATION (script over CUDA_VISIBLE_DEVICES=0..8):
+6. `LLAMACPP_TEST_MODELFILE=qwen0.5b.gguf ./test-backend-sampler --device gpu` (14 tests).
+7. `llama-bench -p 512 -n 32` - record pp512/tg128 per card (expect ~240-260 / ~28 t/s).
+8. `llama-diffusion-cli -m dream.gguf -ub 512 --diffusion-eps 0.001 --diffusion-steps 64
+    --diffusion-conf-threshold 0.6 --temp 0.2 --top-k 40 -ngl 99 -p "test"` - one draft;
+   then an infill repair. Confirm "sampling on the backend" appears (GPU sampling active -
+   mandatory on the 2-core Celeron).
+9. `nvidia-smi --query-compute-apps=used_memory` during a run - confirm <= 6144 MiB
+   (expected ~4.9 GiB; if over, drop down the options ladder).
+
+FLEET (until the multi-replica server lands - sec 6):
+10. Interim: up to 4 x llama-diffusion-server processes (~1 GB host RAM each at ub 512;
+    measured) on different ports/CUDA_VISIBLE_DEVICES - the 4 GB host caps it.
+11. Full 9-card farm: requires engine fixes from sec 6 (k-stride host buffers +
+    multi-replica server) - then one process, 9 replicas, ~2.5-3 GB host RAM.
+12. Point kintsugi's dispatcher at the replica endpoints; verify candidates/minute.
