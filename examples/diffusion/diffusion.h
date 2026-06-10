@@ -48,6 +48,8 @@ struct diffusion_params {
     bool    backend_sampling = false;  // Sample on the backend (GPU) instead of the CPU
     bool    infill           = false;  // Input is a canvas: only the mask tokens it contains are generated
 
+    float   conf_threshold   = 0.0f;   // Commit all tokens with confidence >= threshold per step (0 = use the transfer schedule)
+
     int32_t max_length = 0;            // Maximum sequence length
 };
 

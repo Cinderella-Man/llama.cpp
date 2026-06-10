@@ -3904,6 +3904,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.diffusion.infill = true; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-conf-threshold"}, "F",
+        string_format("commit all tokens with confidence >= this threshold each step; steps becomes an upper bound "
+                      "(0 = disabled, use the transfer schedule) (default: %.3f)", (double) params.diffusion.conf_threshold),
+        [](common_params & params, const std::string & value) { params.diffusion.conf_threshold = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         { "-lr", "--learning-rate" }, "ALPHA",
         string_format("adamw or sgd optimizer alpha (default: %.2g); note: sgd alpha recommended ~10x (no momentum)", (double) params.lr.lr0),
         [](common_params & params, const std::string & value) { params.lr.lr0 = std::stof(value); }

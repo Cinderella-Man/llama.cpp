@@ -392,6 +392,8 @@ struct common_params_diffusion {
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
 
     bool    infill        = false;    // treat the prompt as a canvas containing mask tokens to fill in
+
+    float   conf_threshold = 0.0f;    // commit all tokens with confidence >= threshold per step (0 = use the transfer schedule)
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)

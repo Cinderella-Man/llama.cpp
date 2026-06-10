@@ -229,6 +229,7 @@ int main(int argc, char ** argv) {
     diff_params.alg_temp         = params.diffusion.alg_temp;
     diff_params.backend_sampling = params.sampling.backend_sampling;
     diff_params.infill           = params.diffusion.infill;
+    diff_params.conf_threshold   = params.diffusion.conf_threshold;
 
     if (diff_params.infill) {
         if (n_input > params.n_ubatch) {

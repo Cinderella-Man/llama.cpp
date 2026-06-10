@@ -743,6 +743,55 @@ Overall diff: 9 files changed, 649 insertions(+), 255 deletions(-) across
 src/llama-graph.cpp, src/llama-context.cpp, src/llama-sampler.cpp, common/{common.h,arg.cpp},
 examples/diffusion/{diffusion.h,diffusion.cpp,diffusion-cli.cpp}, tests/test-backend-sampler.cpp.
 
+### Confidence-threshold parallel decoding (DONE, follow-up to Task 7)
+
+Implements Fast-dLLM-style parallel decoding (arXiv:2505.22618): with
+`--diffusion-conf-threshold F`, every masked position whose confidence clears F is committed
+each step (minimum one per step to guarantee progress); `--diffusion-steps` becomes an upper
+bound and the loop exits early when no masks remain.
+
+Changes:
+- common/common.h + common/arg.cpp: `--diffusion-conf-threshold` (default 0 = off).
+- examples/diffusion/diffusion.h/.cpp: `diffusion_params.conf_threshold`; the commit phase
+  branches on it (threshold filter vs the existing schedule partial_sort / alg_temp paths);
+  the timing log now reports steps ACTUALLY run.
+- CRITICAL calibration fix discovered during testing: confidences were computed from the
+  TEMPERATURE-SHARPENED distribution (the chain applies temp before dist), so at --temp 0.2 a
+  raw 0.9 probability appears as ~0.9998 and any threshold commits almost everything ->
+  garbage output. Fixed with `calculate_confidence_detempered()`: q_i ~ p_i^temp
+  (renormalized) recovers the raw-scale confidence. The map is monotonic, so schedule-mode
+  ranking is unchanged; it is applied only when conf_threshold > 0. Used by BOTH the backend
+  and CPU sampling paths (the backend confidence switch collapsed into this helper - with
+  temp_undo = 1 it reproduces the previous values exactly).
+
+Measured (Dream-7B Q4_K_M, -ngl 99, -ub 512, alg 4, steps budget 128, same prompt):
+
+| config                                            | steps | total    | quality |
+|---------------------------------------------------|-------|----------|---------|
+| schedule (baseline)                                | 128   | 31.3 s   | clean |
+| timestep, th 0.9, temp 0.2                         | 114   | 28.0 s   | ~baseline |
+| block 32, th 0.9, temp 0.01 (near-greedy)          | 47    | 11.8 s   | code block correct (one dup token), prose tail degenerates |
+| timestep, th 0.6, temp 0.2                         | 17    | 4.6 s    | mostly good code, minor mangling |
+| timestep, th 0.8, temp 0.2                         | 62    | 15.4 s   | DEGENERATE: empty output (see below) |
+
+Failure modes found and documented:
+- EOT flooding: with a whole-sequence (timestep) threshold, the model's most confident early
+  predictions are the end-of-text padding tail; at mid thresholds the EOT commits flood the
+  canvas before any text anchors -> empty output. MITIGATION: combine the threshold with the
+  BLOCK schedule (`--diffusion-block-length 32`) - blocks commit left to right, so EOT cannot
+  run ahead of the text. This matches why LLaDA/Fast-dLLM are semi-autoregressive.
+- `--top-k 1` (true greedy) destroys the confidence signal (one candidate -> confidence is
+  always 1.0 -> everything commits in 2 steps). Near-greedy done right: `--temp 0.01
+  --top-k 40` - dist is effectively argmax while the de-tempered confidence stays meaningful.
+
+Recommended recipes:
+- Quality-first speedup: `--diffusion-block-length 32 --diffusion-conf-threshold 0.9
+  --temp 0.01 --top-k 40` (~2.7x fewer steps).
+- Verifier-loop draft pass (errors caught downstream): timestep schedule,
+  `--diffusion-conf-threshold 0.6 --temp 0.2` (~7x fewer steps).
+- Threshold compares against the chosen algorithm's confidence - intended for
+  CONFIDENCE_BASED (4, default) or MARGIN_BASED (2); a warning is logged otherwise.
+
 ## 12. Status and follow-ups
 
 ALL TASKS COMPLETE (2026-06-10). The working tree contains the full implementation,
