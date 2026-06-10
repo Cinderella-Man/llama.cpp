@@ -23,17 +23,35 @@
 
 #include <atomic>
 #include <cstring>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 using json = nlohmann::ordered_json;
 
-struct server_state {
-    common_params       params;
+// one (model, context) pair pinned to a single device; the model is replicated per GPU so
+// N cards serve N independent requests from ONE process (per-process fixed costs - libs,
+// driver state, the mmap'd GGUF - are paid once, which is what lets a 9-GPU rig fit a
+// 4 GB host)
+struct server_replica {
     llama_model *       model = nullptr;
     llama_context *     ctx   = nullptr;
     const llama_vocab * vocab = nullptr;
+
+    std::mutex mu;  // one generation per replica at a time
+};
+
+struct server_state {
+    common_params params;
+
+    std::vector<std::unique_ptr<server_replica>> replicas;
+
+    // replica dispatch: acquire any free replica, block when all are busy
+    std::mutex              pool_mu;
+    std::condition_variable pool_cv;
+    std::vector<bool>       busy;
 
     llama_token mask_token_id = LLAMA_TOKEN_NULL;
     std::string mask_piece;
@@ -44,8 +62,28 @@ struct server_state {
     diffusion_eb_params eb_defaults;  // resolved from GGUF metadata + CLI overrides (canvas models)
 
     common_chat_templates_ptr chat_templates;
+    std::mutex                templates_mu;
 
-    std::mutex mutex;  // one generation at a time
+    size_t acquire_replica() {
+        std::unique_lock<std::mutex> lock(pool_mu);
+        for (;;) {
+            for (size_t i = 0; i < busy.size(); i++) {
+                if (!busy[i]) {
+                    busy[i] = true;
+                    return i;
+                }
+            }
+            pool_cv.wait(lock);
+        }
+    }
+
+    void release_replica(size_t i) {
+        {
+            std::lock_guard<std::mutex> lock(pool_mu);
+            busy[i] = false;
+        }
+        pool_cv.notify_one();
+    }
 };
 
 static std::string meta_str(const llama_model * model, const char * key) {
@@ -111,7 +149,7 @@ static diffusion_params make_masked_params(const server_state & st, const json &
 //                    "confidence"?, "kv_cache"?}}
 // response: {"text": str, "family": "masked"|"canvas", "ms_total": float, "degenerate": bool,
 //            "n_prompt_tokens": int, "confidences"?: [float per generated position]}
-static json handle_generate(server_state & st, const json & req) {
+static json handle_generate(server_state & st, server_replica & rep, const json & req) {
     const std::string prompt = req.at("prompt").get<std::string>();
     const bool        raw    = req.value("raw", false);
     const bool        infill = req.value("infill", false);
@@ -137,15 +175,18 @@ static json handle_generate(server_state & st, const json & req) {
         msg.content = prompt;
         inputs.messages.push_back(msg);
         inputs.add_generation_prompt = true;
-        formatted = common_chat_templates_apply(st.chat_templates.get(), inputs).prompt;
+        {
+            std::lock_guard<std::mutex> tl(st.templates_mu);
+            formatted = common_chat_templates_apply(st.chat_templates.get(), inputs).prompt;
+        }
     }
 
-    std::vector<llama_token> prefix = common_tokenize(st.vocab, formatted,
+    std::vector<llama_token> prefix = common_tokenize(rep.vocab, formatted,
                                                       /*add special*/ true, /*parse special*/ true);
     const int32_t n_input = (int32_t) prefix.size();
     const int32_t n_ub    = (int32_t) st.params.n_ubatch;
 
-    if (n_input >= (int32_t) llama_n_ctx(st.ctx) || (infill && n_input > n_ub)) {
+    if (n_input >= (int32_t) llama_n_ctx(rep.ctx) || (infill && n_input > n_ub)) {
         throw std::runtime_error("prompt too long for the configured context/ubatch");
     }
 
@@ -168,16 +209,16 @@ static json handle_generate(server_state & st, const json & req) {
         dp.out_degenerate = &degenerate;
 
         int32_t n_generated = 0;
-        diffusion_generate(st.ctx, prefix.data(), output_tokens.data(), n_input, dp, n_generated);
+        diffusion_generate(rep.ctx, prefix.data(), output_tokens.data(), n_input, dp, n_generated);
         if (n_generated <= (infill ? 0 : n_input)) {
             throw std::runtime_error("generation failed");
         }
 
         if (infill) {
             output_tokens.resize(n_generated);
-            res["text"] = common_detokenize(st.vocab, output_tokens, false);
+            res["text"] = common_detokenize(rep.vocab, output_tokens, false);
         } else {
-            res["text"] = common_detokenize(st.vocab,
+            res["text"] = common_detokenize(rep.vocab,
                 std::vector<llama_token>(output_tokens.begin() + n_input, output_tokens.begin() + n_generated), false);
         }
         if (want_conf) {
@@ -209,7 +250,7 @@ static json handle_generate(server_state & st, const json & req) {
         auto trim_canvas = [&](const llama_token * canvas, size_t n) -> size_t {
             size_t cut = n;
             for (size_t i = 0; i < n; i++) {
-                if (llama_vocab_is_eog(st.vocab, canvas[i])) { cut = i; break; }
+                if (llama_vocab_is_eog(rep.vocab, canvas[i])) { cut = i; break; }
             }
             for (size_t i = 0; i + 1 < cut; i++) {
                 bool loop = false;
@@ -240,7 +281,7 @@ static json handle_generate(server_state & st, const json & req) {
             }
 
             int32_t n_generated = 0;
-            diffusion_generate_entropy_bound(st.ctx, prefix.data(), output_tokens.data(), prefix_len, eb, n_generated);
+            diffusion_generate_entropy_bound(rep.ctx, prefix.data(), output_tokens.data(), prefix_len, eb, n_generated);
             if (n_generated <= prefix_len) {
                 if (b == 0) {
                     throw std::runtime_error("generation failed");
@@ -257,7 +298,7 @@ static json handle_generate(server_state & st, const json & req) {
             prefix.insert(prefix.end(), canvas, canvas + cut);
         }
 
-        res["text"]   = common_detokenize(st.vocab, response_tokens, false);
+        res["text"]   = common_detokenize(rep.vocab, response_tokens, false);
         res["family"] = "canvas";
         if (want_conf && !confidences.empty()) {
             // entropies of the FINAL block's canvas (lower = more confident)
@@ -300,75 +341,112 @@ int main(int argc, char ** argv) {
         model_params.tensor_buft_overrides = st.params.tensor_buft_overrides.data();
     }
 
-    st.model = llama_model_load_from_file(st.params.model.path.c_str(), model_params);
-    if (!st.model) {
-        LOG_ERR("error: failed to load model '%s'\n", st.params.model.path.c_str());
-        return 1;
-    }
-    if (!llama_model_is_diffusion(st.model)) {
-        LOG_ERR("error: not a diffusion model\n");
-        return 1;
-    }
-
-    st.vocab         = llama_model_get_vocab(st.model);
-    st.canvas_length = meta_i(st.model, "diffusion.canvas_length", 0);
-    st.mask_token_id = llama_vocab_mask(st.vocab);
-
-    if (st.mask_token_id != LLAMA_TOKEN_NULL) {
-        char piece[64];
-        const int n = llama_token_to_piece(st.vocab, st.mask_token_id, piece, sizeof(piece) - 1, 0, true);
-        if (n > 0) {
-            piece[n] = '\0';
-            st.mask_piece = piece;
+    // enumerate GPU devices; replicas pin one model+context per device so N cards serve
+    // N independent requests from this single process
+    std::vector<ggml_backend_dev_t> gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(dev);
         }
-    } else if (st.canvas_length <= 0) {
-        LOG_ERR("error: masked-diffusion model without a mask token\n");
-        return 1;
     }
 
-    // canvas models self-condition: enable before context creation so the reserve covers it
-    if (st.canvas_length > 0) {
-        llama_diffusion_set_sc(st.model, nullptr, 0.0f, 1.0f, true);
-    }
-
-    // size the context to fit [prompt | canvas] for canvas models (mirrors the CLI's -n logic)
-    if (st.canvas_length > 0) {
-        const int32_t needed = (int32_t) st.canvas_length + 2048;
-        st.params.n_ubatch = std::max((int32_t) st.params.n_ubatch, needed);
-        st.params.n_batch  = std::max((int32_t) st.params.n_batch,  st.params.n_ubatch);
-        st.params.n_ctx    = std::max((int32_t) st.params.n_ctx,    st.params.n_batch);
+    int n_replicas = st.params.diffusion.replicas;
+    if (n_replicas <= 0) {
+        n_replicas = std::max(1, (int) gpus.size());
     }
 
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx           = st.params.n_ctx;
-    ctx_params.n_batch         = st.params.n_batch;
-    ctx_params.n_ubatch        = st.params.n_ubatch;
-    ctx_params.flash_attn_type = st.params.flash_attn_type;
-    ctx_params.no_perf         = st.params.no_perf;
-    ctx_params.type_k          = st.params.cache_type_k;
-    ctx_params.type_v          = st.params.cache_type_v;
 
-    st.ctx = llama_init_from_model(st.model, ctx_params);
-    if (!st.ctx) {
-        LOG_ERR("error: failed to create context\n");
-        return 1;
+    for (int r = 0; r < n_replicas; r++) {
+        auto rep = std::make_unique<server_replica>();
+
+        llama_model_params mp = model_params;
+        std::vector<ggml_backend_dev_t> devs;
+        if (!gpus.empty() && n_replicas > 1) {
+            devs = { gpus[r % gpus.size()], nullptr };
+            mp.devices = devs.data();
+        }
+
+        rep->model = llama_model_load_from_file(st.params.model.path.c_str(), mp);
+        if (!rep->model) {
+            LOG_ERR("error: failed to load model '%s' (replica %d)\n", st.params.model.path.c_str(), r);
+            return 1;
+        }
+        rep->vocab = llama_model_get_vocab(rep->model);
+
+        if (r == 0) {
+            if (!llama_model_is_diffusion(rep->model)) {
+                LOG_ERR("error: not a diffusion model\n");
+                return 1;
+            }
+
+            st.canvas_length = meta_i(rep->model, "diffusion.canvas_length", 0);
+            st.mask_token_id = llama_vocab_mask(rep->vocab);
+
+            if (st.mask_token_id != LLAMA_TOKEN_NULL) {
+                char piece[64];
+                const int n = llama_token_to_piece(rep->vocab, st.mask_token_id, piece, sizeof(piece) - 1, 0, true);
+                if (n > 0) {
+                    piece[n] = '\0';
+                    st.mask_piece = piece;
+                }
+            } else if (st.canvas_length <= 0) {
+                LOG_ERR("error: masked-diffusion model without a mask token\n");
+                return 1;
+            }
+
+            // size the context to fit [prompt | canvas] for canvas models (mirrors the CLI's -n logic)
+            if (st.canvas_length > 0) {
+                const int32_t needed = (int32_t) st.canvas_length + 2048;
+                st.params.n_ubatch = std::max((int32_t) st.params.n_ubatch, needed);
+                st.params.n_batch  = std::max((int32_t) st.params.n_batch,  st.params.n_ubatch);
+                st.params.n_ctx    = std::max((int32_t) st.params.n_ctx,    st.params.n_batch);
+            }
+
+            ctx_params.n_ctx           = st.params.n_ctx;
+            ctx_params.n_batch         = st.params.n_batch;
+            ctx_params.n_ubatch        = st.params.n_ubatch;
+            ctx_params.flash_attn_type = st.params.flash_attn_type;
+            ctx_params.no_perf         = st.params.no_perf;
+            ctx_params.type_k          = st.params.cache_type_k;
+            ctx_params.type_v          = st.params.cache_type_v;
+
+            st.shift_logits = meta_str(rep->model, "diffusion.shift_logits") == "true" ||
+                              (meta_str(rep->model, "diffusion.shift_logits").empty() && st.canvas_length == 0);
+
+            if (st.canvas_length > 0) {
+                st.eb_defaults.max_denoising_steps  = meta_i(rep->model, "diffusion.eb_max_steps", 48);
+                st.eb_defaults.t_min                = meta_f(rep->model, "diffusion.eb_t_min", 0.4f);
+                st.eb_defaults.t_max                = meta_f(rep->model, "diffusion.eb_t_max", 0.8f);
+                st.eb_defaults.entropy_bound        = meta_f(rep->model, "diffusion.eb_entropy_bound", 0.1f);
+                st.eb_defaults.stability_threshold  = meta_i(rep->model, "diffusion.eb_stability_threshold", 1);
+                st.eb_defaults.confidence_threshold = meta_f(rep->model, "diffusion.eb_confidence_threshold", 0.005f);
+                st.eb_defaults.kv_cache             = st.params.diffusion.eb_kv_cache != 2;
+            }
+
+            st.chat_templates = common_chat_templates_init(rep->model, "");
+        }
+
+        // canvas models self-condition: enable before context creation so the reserve covers it
+        if (st.canvas_length > 0) {
+            llama_diffusion_set_sc(rep->model, nullptr, 0.0f, 1.0f, true);
+        }
+
+        rep->ctx = llama_init_from_model(rep->model, ctx_params);
+        if (!rep->ctx) {
+            LOG_ERR("error: failed to create context (replica %d)\n", r);
+            return 1;
+        }
+        llama_set_n_threads(rep->ctx, st.params.cpuparams.n_threads, st.params.cpuparams_batch.n_threads);
+
+        LOG_INF("diffusion-server: replica %d ready on %s\n", r,
+                (!gpus.empty() && n_replicas > 1) ? ggml_backend_dev_name(gpus[r % gpus.size()]) : "default devices");
+
+        st.replicas.push_back(std::move(rep));
     }
-    llama_set_n_threads(st.ctx, st.params.cpuparams.n_threads, st.params.cpuparams_batch.n_threads);
 
-    st.shift_logits = meta_str(st.model, "diffusion.shift_logits") == "true" ||
-                      (meta_str(st.model, "diffusion.shift_logits").empty() && st.canvas_length == 0);
-
-    if (st.canvas_length > 0) {
-        st.eb_defaults.max_denoising_steps  = meta_i(st.model, "diffusion.eb_max_steps", 48);
-        st.eb_defaults.t_min                = meta_f(st.model, "diffusion.eb_t_min", 0.4f);
-        st.eb_defaults.t_max                = meta_f(st.model, "diffusion.eb_t_max", 0.8f);
-        st.eb_defaults.entropy_bound        = meta_f(st.model, "diffusion.eb_entropy_bound", 0.1f);
-        st.eb_defaults.stability_threshold  = meta_i(st.model, "diffusion.eb_stability_threshold", 1);
-        st.eb_defaults.confidence_threshold = meta_f(st.model, "diffusion.eb_confidence_threshold", 0.005f);
-        st.eb_defaults.kv_cache             = st.params.diffusion.eb_kv_cache != 2;
-    }
-
-    st.chat_templates = common_chat_templates_init(st.model, "");
+    st.busy.assign(n_replicas, false);
 
     httplib::Server svr;
 
@@ -391,8 +469,9 @@ int main(int argc, char ** argv) {
             {"mask_token_id", st.mask_token_id},
             {"mask_piece",    st.mask_piece},
             {"canvas_length", st.canvas_length},
-            {"n_ctx",         (int) llama_n_ctx(st.ctx)},
+            {"n_ctx",         (int) llama_n_ctx(st.replicas[0]->ctx)},
             {"n_ubatch",      (int) st.params.n_ubatch},
+            {"replicas",      st.replicas.size()},
         };
         if (st.canvas_length > 0) {
             j["eb_defaults"] = {
@@ -410,7 +489,7 @@ int main(int argc, char ** argv) {
 
     svr.Post("/tokenize", [&](const httplib::Request & req, httplib::Response & res) {
         const json body = json::parse(req.body);
-        const std::vector<llama_token> tokens = common_tokenize(st.vocab,
+        const std::vector<llama_token> tokens = common_tokenize(st.replicas[0]->vocab,
             body.at("content").get<std::string>(),
             body.value("add_special", false),
             body.value("parse_special", true));
@@ -420,13 +499,27 @@ int main(int argc, char ** argv) {
     svr.Post("/detokenize", [&](const httplib::Request & req, httplib::Response & res) {
         const json body = json::parse(req.body);
         const std::vector<llama_token> tokens = body.at("tokens").get<std::vector<llama_token>>();
-        res.set_content(json{{"content", common_detokenize(st.vocab, tokens, false)}}.dump(), "application/json");
+        res.set_content(json{{"content", common_detokenize(st.replicas[0]->vocab, tokens, false)}}.dump(), "application/json");
     });
 
     svr.Post("/generate", [&](const httplib::Request & req, httplib::Response & res) {
-        std::lock_guard<std::mutex> lock(st.mutex);
         const json body = json::parse(req.body);
-        res.set_content(handle_generate(st, body).dump(), "application/json");
+
+        const size_t      ri  = st.acquire_replica();
+        server_replica &  rep = *st.replicas[ri];
+
+        json out;
+        try {
+            std::lock_guard<std::mutex> lock(rep.mu);
+            out = handle_generate(st, rep, body);
+        } catch (...) {
+            st.release_replica(ri);
+            throw;
+        }
+        st.release_replica(ri);
+
+        out["replica"] = ri;
+        res.set_content(out.dump(), "application/json");
     });
 
     const std::string host = st.params.hostname.empty() ? "127.0.0.1" : st.params.hostname;
@@ -437,8 +530,10 @@ int main(int argc, char ** argv) {
 
     svr.listen(host, port);
 
-    llama_free(st.ctx);
-    llama_model_free(st.model);
+    for (auto & rep : st.replicas) {
+        llama_free(rep->ctx);
+        llama_model_free(rep->model);
+    }
     llama_backend_free();
     return 0;
 }

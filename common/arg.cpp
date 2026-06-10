@@ -3925,6 +3925,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.diffusion.conf_threshold = std::stof(value); }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-replicas"}, "N",
+        string_format("diffusion-server: model replicas in one process, one per GPU (0 = one per GPU device) (default: %d)", params.diffusion.replicas),
+        [](common_params & params, int value) { params.diffusion.replicas = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-eb"}, "MODE",
         "entropy-bound decoder for canvas/block-diffusion models (DiffusionGemma): auto|on|off (default: auto)",
         [](common_params & params, const std::string & value) {

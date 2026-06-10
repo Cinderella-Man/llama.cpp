@@ -398,6 +398,8 @@ struct common_params_diffusion {
 
     float   conf_threshold = 0.0f;    // commit all tokens with confidence >= threshold per step (0 = use the transfer schedule)
 
+    int32_t replicas      = 1;        // diffusion-server: model replicas in one process (0 = one per GPU device)
+
     // entropy-bound decoder (DiffusionGemma canvas models); params default to GGUF metadata, then reference
     int32_t eb_mode          = 0;     // 0=auto (on for canvas models), 1=force on, 2=off
     float   eb_t_min         = -1.0f; // <0 / <=0 -> not overridden on the command line
