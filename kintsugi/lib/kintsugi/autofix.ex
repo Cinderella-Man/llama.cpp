@@ -16,7 +16,12 @@ defmodule Kintsugi.Autofix do
     |> String.replace(~r/,\s*do[ \t]*$/m, " do")
     # doubled block opener (`def f(x), do do` -> after rule 1: `do do`)
     |> String.replace(~r/\bdo[ \t]+do\b/, "do")
-    # stray markdown fences that survived extraction
-    |> String.replace(~r/^\s*```\w*[ \t]*$/m, "")
+    # `def f(x) do: expr` - block opener fused with one-liner syntax; the comma
+    # form is the only valid reading (DiffuCoder emits this)
+    |> String.replace(~r/\)[ \t]+do:[ \t]/, "), do: ")
+    # one-liner `, do: expr end` - the stray `end` is always invalid after `do:`
+    |> String.replace(~r/(,[ \t]*do:[^\n]*?)[ \t]+end[ \t]*$/m, "\\1")
+    # stray markdown fences that survived extraction (any length, any tag)
+    |> String.replace(~r/^\s*`{3,}\w*[ \t]*$/m, "")
   end
 end

@@ -331,7 +331,9 @@ defmodule Kintsugi do
 
   @doc "Extract the first fenced code block, or return the trimmed text when unfenced."
   def extract_code(text) do
-    case Regex.run(~r/```(?:elixir|ex)?\s*\n(.*?)```/s, text) do
+    # fences come in many broken shapes (DiffuCoder: SIX backticks + a truncated
+    # language tag like "elix") - accept any run of 3+ backticks and any tag
+    case Regex.run(~r/`{3,}[ \t]*\w*[ \t]*\n(.*?)`{3,}/s, text) do
       [_, code] -> String.trim_trailing(code)
       nil -> String.trim(text)
     end
