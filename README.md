@@ -40,7 +40,26 @@ Features added here:
 - **`llama-diffusion-server`** - a general HTTP daemon (model loaded once) serving BOTH
   diffusion families through one JSON API: `GET /health` (capabilities: family, mask piece,
   canvas/entropy-bound defaults), `POST /tokenize`, `POST /detokenize`, `POST /generate`
-  (all CLI flags as defaults, per-request overrides, optional confidences).
+  (all CLI flags as defaults, per-request overrides, optional confidences). Supports
+  `--host`/`--port`.
+- **Multi-replica serving for multi-GPU rigs** (`--diffusion-replicas N`, `0` = one per
+  GPU) - ONE server process hosts N independent model+context replicas, each pinned to its
+  own GPU, with free-list dispatch of `/generate` across them. Weights are shared via mmap:
+  the marginal replica costs ~52 MB of host RAM (measured), so a 9-GPU mining rig with a
+  4 GB host serves 9 parallel generation streams from a single process.
+- **~1.2 GB less host RAM per serving context** - the backend-sampling host buffers are
+  now strided by the sampler's actual candidate width (e.g. top-k 40) instead of the full
+  vocabulary, and both they and the raw-logits buffer allocate lazily. Measured server RSS
+  at `-ub 512`: 1997 -> 783 MB. Benefits every machine; mandatory for small-RAM hosts.
+- **`GGML_CUDA_FORCE_GRAPHS=1`** - enables CUDA graph replay on pre-Ampere GPUs (the
+  upstream Ampere+ gate is a heuristic, not a hardware limit). Aimed at Pascal mining
+  cards behind weak host CPUs, where per-kernel launch overhead dominates; measured 1.5x
+  from graphs on launch-bound hosts.
+- **Cheap-GPU fleet research** (`docs/p106-mining-fleet.md`) - why diffusion LLMs suit old
+  high-compute-per-dollar cards (the workload is prompt-processing-shaped, not
+  token-generation-shaped), with a verified build recipe for Pascal/P106 mining rigs
+  (CUDA 12.x, driver 580 legacy branch), measured VRAM/RAM envelopes for 6 GB cards, and a
+  zero-interconnect "candidate farm" architecture for 9-GPU miners.
 - **DiffusionGemma support** - merged the upstream draft [PR #24423](https://github.com/ggml-org/llama.cpp/pull/24423)
   (entropy-bound canvas decoding, prefix-KV phases, conversion) and fixed `--cpu-moe`
   handling in the diffusion CLI so the 26B MoE runs in under 6 GB of VRAM with experts in
@@ -51,7 +70,8 @@ Features added here:
 
 Design notes, measurements and reimplementation-grade documentation:
 `docs/diffusion-gpu-sampling-plan.md`, `docs/dllm-engine-improvements.md`,
-`docs/dllm-elixir-harness.md`, `docs/diffusiongemma-support.md`.
+`docs/dllm-elixir-harness.md`, `docs/diffusiongemma-support.md`,
+`docs/p106-mining-fleet.md`.
 
 Quick start (masked diffusion, GPU sampling + fast drafts):
 
@@ -67,6 +87,10 @@ llama-diffusion-cli -m Dream-7B-Q4_K_M.gguf --diffusion-infill -ngl 99 \
 # daemon (default port 8080)
 llama-diffusion-server -m Dream-7B-Q4_K_M.gguf -ub 512 -ngl 99 \
     --diffusion-eps 0.001 --diffusion-steps 128 --temp 0.2 --top-k 40
+
+# multi-GPU rig: one process, one replica per GPU, parallel /generate dispatch
+llama-diffusion-server -m Dream-7B-Q4_K_M.gguf -ub 512 -ngl 99 --diffusion-replicas 0 \
+    --diffusion-eps 0.001 --diffusion-steps 128 --temp 0.2 --top-k 40 --port 8080
 ```
 
 ## Recent API changes
