@@ -39,6 +39,12 @@ defmodule KintsugiIntegrationTest do
       Kintsugi.forge(eng, "a function double/1 that doubles a number", %{"seed" => 42})
 
     assert :ok = Kintsugi.verify(code, nil)
-    IO.puts("\nforge: #{stats.drafts} draft + #{stats.repairs} repairs, #{round(stats.ms_total)} ms\n#{code}")
+    assert is_integer(stats.tokens) and stats.tokens > 0
+    assert is_float(stats.tokens_per_second)
+
+    IO.puts(
+      "\nforge: #{stats.drafts} draft + #{stats.repairs} repairs, " <>
+        "#{round(stats.ms_wall)} ms wall, #{stats.tokens} tokens -> #{stats.tokens_per_second} tok/s\n#{code}"
+    )
   end
 end

@@ -86,7 +86,12 @@ parallel requests) and `--host`/`--port` to taste.
 ## API
 
 - `Kintsugi.forge(engine, instruction, opts)` - draft then repair until it
-  verifies. Returns `{:ok, code, stats}` or `{:error, reason, stats}`.
+  verifies. Returns `{:ok, code, stats}` or `{:error, reason, stats}`. On
+  success `stats` includes throughput: `tokens` (the tokenized FINAL answer
+  only - drafts that got repaired over and discarded hole-size variants spend
+  time but are never counted, so nothing is double counted), `ms_wall`
+  (wall-clock incl. compile checks; `ms_total` is engine-side generation time)
+  and `tokens_per_second = tokens / ms_wall`.
 - `Kintsugi.heal(engine, code, opts)` - repair EXISTING code (no drafting).
 - `Kintsugi.verify(code, check)` - compile + optional functional check.
 - `Kintsugi.repair(engine, code, diagnostics, opts)` - one mask+infill round.

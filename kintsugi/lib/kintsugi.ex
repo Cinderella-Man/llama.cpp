@@ -31,6 +31,7 @@ defmodule Kintsugi do
   repairs, total ms and the repair history.
   """
   def forge(%Engine{} = eng, instruction, opts \\ %{}) do
+    t0 = System.monotonic_time(:millisecond)
     opts = Map.merge(@default_opts, Map.new(opts, fn {k, v} -> {to_string(k), v} end))
     max_repairs = Map.get(opts, "max_repairs", 4)
     check = Map.get(opts, "check")
@@ -43,7 +44,8 @@ defmodule Kintsugi do
       {:ok, %{"text" => text, "ms_total" => ms}} ->
         code = extract_code(text)
         stats = %{drafts: 1, repairs: 0, ms_total: ms, history: []}
-        repair_until_ok(eng, code, opts, check, max_repairs, stats)
+
+        eng |> repair_until_ok(code, opts, check, max_repairs, stats) |> finalize(eng, t0)
 
       {:error, reason} ->
         {:error, reason, %{drafts: 0, repairs: 0, ms_total: 0, history: []}}
@@ -55,11 +57,13 @@ defmodule Kintsugi do
   mask the broken statement, let diffusion fill the hole, recompile. Same opts as forge/3.
   """
   def heal(%Engine{} = eng, code, opts \\ %{}) do
+    t0 = System.monotonic_time(:millisecond)
     opts = Map.merge(@default_opts, Map.new(opts, fn {k, v} -> {to_string(k), v} end))
     max_repairs = Map.get(opts, "max_repairs", 4)
     check = Map.get(opts, "check")
     stats = %{drafts: 0, repairs: 0, ms_total: 0, history: []}
-    repair_until_ok(eng, code, opts, check, max_repairs, stats)
+
+    eng |> repair_until_ok(code, opts, check, max_repairs, stats) |> finalize(eng, t0)
   end
 
   @doc "One verify step: compile, then optionally run the check. Returns :ok | {:error, diags}."
@@ -152,6 +156,30 @@ defmodule Kintsugi do
             {:error, reason, stats}
         end
     end
+  end
+
+  # Throughput accounting: `tokens` is the tokenized FINAL answer only - every
+  # generation along the way (draft, discarded hole-size variants, replaced spans)
+  # spends TIME but produces no counted tokens, so there is no double counting.
+  # tokens_per_second = final-answer tokens / wall-clock seconds (HTTP + compile
+  # checks included; ms_total remains the engine-side generation time alone).
+  defp finalize({verdict, code_or_reason, stats}, eng, t0) do
+    ms_wall = System.monotonic_time(:millisecond) - t0
+    stats = Map.put(stats, :ms_wall, ms_wall)
+
+    stats =
+      with :ok <- verdict,
+           {:ok, tokens} <- Engine.tokenize(eng, code_or_reason) do
+        n = length(tokens)
+
+        stats
+        |> Map.put(:tokens, n)
+        |> Map.put(:tokens_per_second, Float.round(n * 1000 / max(ms_wall, 1), 2))
+      else
+        _ -> Map.merge(stats, %{tokens: nil, tokens_per_second: nil})
+      end
+
+    {verdict, code_or_reason, stats}
   end
 
   @doc "Extract the first fenced code block, or return the trimmed text when unfenced."
