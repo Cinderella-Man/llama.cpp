@@ -76,8 +76,8 @@ parallel requests) and `--host`/`--port` to taste.
 
     iex> {:ok, eng} = Kintsugi.Engine.connect("http://127.0.0.1:8080")
 
-    # instruction -> compiling code (measured: 1.4 s on an RTX 5070 laptop)
-    iex> {:ok, code, stats} = Kintsugi.forge(eng, "a function double/1 that doubles a number")
+    # instruction -> verified code, one call (measured: 1.4 s on an RTX 5070 laptop)
+    iex> {:ok, code} = Kintsugi.generate(eng, "a function double/1 that doubles a number")
 
     # broken code -> verified code (measured: 1.5 s, 2 repair rounds)
     iex> broken = "defmodule Fib do\n  def fib(0), do: 0\n  def fib(1), do: 1\n  def fib(n), do fib(n - 1) + fib(n - 2)\nend"
@@ -85,16 +85,29 @@ parallel requests) and `--host`/`--port` to taste.
 
 ## API
 
-- `Kintsugi.forge(engine, instruction, opts)` - draft then repair until it
-  verifies. Returns `{:ok, code, stats}` or `{:error, reason, stats}`. On
-  success `stats` includes throughput: `tokens` (the tokenized FINAL answer
-  only - drafts that got repaired over and discarded hole-size variants spend
-  time but are never counted, so nothing is double counted), `ms_wall`
-  (wall-clock incl. compile checks; `ms_total` is engine-side generation time)
-  and `tokens_per_second = tokens / ms_wall`.
+THE function - everything else is plumbing it uses:
+
+- `Kintsugi.generate(engine, instruction, opts)` -> `{:ok, code} | {:error, reason}`.
+  The caller asks for code and receives VERIFIED code; drafting, compile checks,
+  masked repairs, escalation (wider holes, whole-body remask) and even fresh
+  redrafts when a draft is unhealable all happen invisibly behind this call.
+- `Kintsugi.generate_with_stats(engine, instruction, opts)` - same, returning
+  `{:ok, code, stats}`: drafts, repairs, history, `ms_wall` (wall-clock;
+  `ms_total` is engine-side generation time), and throughput - `tokens` is the
+  tokenized FINAL answer only (discarded drafts and failed fills spend time but
+  never count as tokens, so nothing is double counted) and
+  `tokens_per_second = tokens / ms_wall`.
+
+Plumbing (public for direct use, e.g. healing human-written code):
+
 - `Kintsugi.heal(engine, code, opts)` - repair EXISTING code (no drafting).
+- `Kintsugi.forge(engine, instruction, opts)` - one draft + its repair loop.
 - `Kintsugi.verify(code, check)` - compile + optional functional check.
 - `Kintsugi.repair(engine, code, diagnostics, opts)` - one mask+infill round.
+
+Compilation alone accepts semantically wrong code - pass `"check"` (assertions,
+e.g. `"9 = Mod.triple(3)"`) when correctness matters; generate/forge/heal all
+honor it.
 
 Useful opts (string keys, passed through to the server): `"seed"`, `"steps"`,
 `"conf_threshold"`, `"temp"`, `"top_k"`, `"max_repairs"` (default 4), and

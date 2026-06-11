@@ -296,3 +296,29 @@ against llama-diffusion-server + Dream-7B on the RTX 5070.
 5. Elixir diagnostics ordering: Code.with_diagnostics logged diagnostics carry the
    precise message+line while the rescued CompileError is just "cannot compile module" -
    surface the logged ones first or the masker aims at nothing.
+
+### Update (same day): single-call abstraction + repair escalation ladder
+
+- Kintsugi.generate/3 is now THE API: {:ok, code} | {:error, reason}. It hides drafting,
+  repair, and redrafting entirely (generate_with_stats/3 exposes the accounting:
+  final-answer tokens / wall seconds; discarded work costs time, never tokens).
+- New discoveries that shaped the repair ladder (all reproduced live):
+  6. Parse errors point at where the parser GAVE UP, not at the bug ("unexpected end" on
+     line 4 hinting at line 3's missing "do"). Masking only the diagnostic line can NEVER
+     fix these. Fix: window escalation - if the same line keeps failing, widen the mask
+     (line alone -> include line above -> line above..below).
+  7. NEVER mask the defmodule header: terminator-imbalance errors bubble to line 1 and
+     masking the header destroys the module skeleton (observed: 3 wasted repairs mangling
+     "defmodule" into "syntax error before: '='"). A line-1 parse error on a module means
+     the BODY is broken: remask the whole body inside the skeleton (a guided redraft) -
+     also the final escalation rung when the window ladder is exhausted.
+  8. Models frequently draft bare def functions, which cannot compile outside a module -
+     normalize drafts by wrapping them in a module before verification (normalize_draft).
+  9. Compile-only verification happily accepts semantically wrong code that compiles
+     (observed: a "triple/1" request healed into a compiling but unrelated function).
+     The "check" opt (assertions run in an isolated OS process) is what makes generate
+     mean CORRECT, not just compiling.
+- Escalation ladder as implemented in repair/4 + repair_until_ok/6: per-round seed
+  variation; hole-size sweep {n, n+2, 1.4n} sized by /tokenize of the replaced text;
+  window 0/1/2 by same-line streak; whole-body remask at streak >= 3 or line-1 module
+  errors; fresh draft (seed + 1000 per attempt, max_drafts 3) when a draft is unhealable.

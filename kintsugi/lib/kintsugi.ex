@@ -25,7 +25,76 @@ defmodule Kintsugi do
   }
 
   @doc """
-  Generate compiling Elixir code for `instruction`. Repairs up to `max_repairs` times.
+  THE entry point: turn an instruction into VERIFIED Elixir code.
+
+  Everything else in this module is plumbing for this call. Behind the scenes it drafts
+  (fast confidence-threshold decode), compiles, repairs broken spans by masked infill,
+  and - when a draft proves unhealable - quietly starts over with a fresh draft. The
+  caller never sees any of that: just `{:ok, code}` where `code` compiles (and passes
+  the optional `"check"`), or `{:error, reason}`.
+
+      {:ok, code} = Kintsugi.generate(eng, "a function double/1 that doubles a number")
+
+  Accepts the same opts as the plumbing (`"check"`, `"seed"`, `"max_repairs"`, sampling
+  knobs) plus `"max_drafts"` (default 2).
+  """
+  def generate(%Engine{} = eng, instruction, opts \\ %{}) do
+    case generate_with_stats(eng, instruction, opts) do
+      {:ok, code, _stats} -> {:ok, code}
+      {:error, reason, _stats} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  `generate/3` with the accounting visible: returns `{:ok, code, stats}` where stats
+  carries drafts, repairs, ms_wall/ms_total, history, and the throughput fields
+  (`tokens` = tokenized FINAL answer only, `tokens_per_second` = tokens / wall seconds -
+  discarded drafts and failed fills spend time but never count as tokens).
+  """
+  def generate_with_stats(%Engine{} = eng, instruction, opts \\ %{}) do
+    t0 = System.monotonic_time(:millisecond)
+    opts = Map.new(opts, fn {k, v} -> {to_string(k), v} end)
+    max_drafts = Map.get(opts, "max_drafts", 3)
+
+    attempt_drafts(eng, instruction, opts, max_drafts, 0, t0, nil)
+  end
+
+  defp attempt_drafts(eng, instruction, opts, budget, spent, t0, last_error) do
+    if budget <= 0 do
+      {reason, stats} = last_error || {:no_drafts_attempted, %{drafts: 0, repairs: 0, ms_total: 0, history: []}}
+      {:error, reason, stats}
+    else
+      # each retry drafts from a different seed, otherwise it would fail identically
+      retry_opts = Map.update(opts, "seed", spent * 1000, &(&1 + spent * 1000))
+
+      case forge(eng, instruction, retry_opts) do
+        {:ok, code, stats} ->
+          {:ok, code, restamp(stats, eng, code, spent, t0)}
+
+        {:error, reason, stats} ->
+          attempt_drafts(eng, instruction, opts, budget - 1, spent + 1, t0, {reason, stats})
+      end
+    end
+  end
+
+  # fold the wall clock of FAILED attempts into the final accounting and recompute tok/s
+  defp restamp(stats, eng, code, prior_attempts, t0) do
+    ms_wall = System.monotonic_time(:millisecond) - t0
+
+    tps =
+      case Engine.tokenize(eng, code) do
+        {:ok, tokens} -> Float.round(length(tokens) * 1000 / max(ms_wall, 1), 2)
+        _ -> stats[:tokens_per_second]
+      end
+
+    stats
+    |> Map.put(:ms_wall, ms_wall)
+    |> Map.put(:tokens_per_second, tps)
+    |> Map.update(:drafts, 1 + prior_attempts, &(&1 + prior_attempts))
+  end
+
+  @doc """
+  Plumbing: one draft + its repair loop. Prefer `generate/3`.
 
   Returns `{:ok, code, stats}` or `{:error, reason, stats}` where stats counts drafts,
   repairs, total ms and the repair history.
@@ -42,7 +111,7 @@ defmodule Kintsugi do
 
     case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check"])) do
       {:ok, %{"text" => text, "ms_total" => ms}} ->
-        code = extract_code(text)
+        code = text |> extract_code() |> normalize_draft()
         stats = %{drafts: 1, repairs: 0, ms_total: ms, history: []}
 
         eng |> repair_until_ok(code, opts, check, max_repairs, stats) |> finalize(eng, t0)
@@ -53,8 +122,9 @@ defmodule Kintsugi do
   end
 
   @doc """
-  Repair EXISTING code until it verifies (no drafting): the original kintsugi move -
-  mask the broken statement, let diffusion fill the hole, recompile. Same opts as forge/3.
+  Plumbing: repair EXISTING code until it verifies (no drafting) - mask the broken
+  statement, let diffusion fill the hole, recompile. Used by generate/3 via forge/3;
+  call directly when you already have code (e.g. human-written) to fix.
   """
   def heal(%Engine{} = eng, code, opts \\ %{}) do
     t0 = System.monotonic_time(:millisecond)
@@ -81,12 +151,31 @@ defmodule Kintsugi do
   """
   def repair(%Engine{} = eng, code, [%{line: line} | _] = _diags, opts \\ %{}) do
     lines = String.split(code, "\n")
-    bad_line = Enum.at(lines, line - 1, "")
+
+    # parse errors often point at where the parser GAVE UP, not where the bug is
+    # ("unexpected end ... may not have a matching do" points one line up). The caller
+    # escalates "window" when the same error survives a repair: 0 = the line alone,
+    # 1 = include the line above, 2+ = the line above through the line below.
+    window = Map.get(opts, "window", 0)
+    header? = match?("defmodule" <> _, String.trim_leading(Enum.at(lines, 0, "")))
+
+    # a parse error AT the module header means the structure inside is broken, not the
+    # header - and masking the header only destroys the skeleton. Same for an exhausted
+    # escalation: remask the WHOLE module body (a guided redraft inside the skeleton).
+    {from, to} =
+      if header? and length(lines) >= 4 and (line == 1 or window >= 3) do
+        {2, length(lines) - 1}
+      else
+        {max(line - min(window, 1), 1), min(line + (if window >= 2, do: 1, else: 0), length(lines))}
+      end
+
+    replaced =
+      lines |> Enum.slice((from - 1)..(to - 1)) |> Enum.join("\n") |> String.trim()
 
     n_tokens =
-      case Engine.tokenize(eng, String.trim_leading(bad_line)) do
+      case Engine.tokenize(eng, replaced) do
         {:ok, tokens} -> max(length(tokens), 4)
-        _ -> Masker.hole_size(bad_line)
+        _ -> Masker.hole_size(replaced)
       end
 
     infill_opts =
@@ -99,28 +188,28 @@ defmodule Kintsugi do
     # exact, +2 and +40% before giving the outer loop a (possibly broken) best effort
     variants = Enum.uniq([n_tokens, n_tokens + 2, round(n_tokens * 1.4)])
 
-    try_hole_variants(eng, code, line, variants, infill_opts, 0, nil)
+    try_hole_variants(eng, code, {from, to}, variants, infill_opts, 0, nil)
   end
 
-  defp try_hole_variants(_eng, _code, _line, [], _opts, ms_acc, last) do
+  defp try_hole_variants(_eng, _code, _span, [], _opts, ms_acc, last) do
     case last do
       nil -> {:error, :no_fill}
       text -> {:ok, text, ms_acc}
     end
   end
 
-  defp try_hole_variants(eng, code, line, [n | rest], opts, ms_acc, _last) do
-    canvas = Masker.mask_line(code, line, eng.mask_piece, n)
+  defp try_hole_variants(eng, code, {from, to} = span, [n | rest], opts, ms_acc, _last) do
+    canvas = Masker.mask_lines(code, from, to, eng.mask_piece, n)
 
     case Engine.infill(eng, canvas, opts) do
       {:ok, %{"text" => text, "ms_total" => ms}} ->
         case Verifier.compile(text) do
           :ok -> {:ok, text, ms_acc + ms}
-          {:error, _} -> try_hole_variants(eng, code, line, rest, opts, ms_acc + ms, text)
+          {:error, _} -> try_hole_variants(eng, code, span, rest, opts, ms_acc + ms, text)
         end
 
       {:error, reason} ->
-        if rest == [], do: {:error, reason}, else: try_hole_variants(eng, code, line, rest, opts, ms_acc, nil)
+        if rest == [], do: {:error, reason}, else: try_hole_variants(eng, code, span, rest, opts, ms_acc, nil)
     end
   end
 
@@ -139,7 +228,16 @@ defmodule Kintsugi do
         {:ok, code, stats}
 
       {:error, diags} ->
-        round_opts = Map.update(opts, "seed", stats.repairs + 1, &(&1 + stats.repairs + 1))
+        same_line_streak =
+          stats.history
+          |> Enum.reverse()
+          |> Enum.take_while(fn {:repair, l, _} -> l == hd(diags).line end)
+          |> length()
+
+        round_opts =
+          opts
+          |> Map.update("seed", stats.repairs + 1, &(&1 + stats.repairs + 1))
+          |> Map.put("window", same_line_streak)
 
         case repair(eng, code, diags, round_opts) do
           {:ok, new_code, ms} ->
@@ -180,6 +278,17 @@ defmodule Kintsugi do
       end
 
     {verdict, code_or_reason, stats}
+  end
+
+  # models frequently draft bare `def ...` functions, which cannot compile outside a
+  # module - wrap them so the verifier (and the repair loop) get a fair target
+  defp normalize_draft(code) do
+    if code =~ ~r/^\s*defmodule\s/m or not (code =~ ~r/^\s*defp?\s/m) do
+      code
+    else
+      body = code |> String.split("\n") |> Enum.map_join("\n", &("  " <> &1))
+      "defmodule KintsugiGen do\n" <> body <> "\nend"
+    end
   end
 
   @doc "Extract the first fenced code block, or return the trimmed text when unfenced."

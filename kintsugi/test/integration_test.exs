@@ -34,6 +34,11 @@ defmodule KintsugiIntegrationTest do
     refute text =~ eng.mask_piece
   end
 
+  test "generate hides the whole pipeline behind one call", %{eng: eng} do
+    {:ok, code} = Kintsugi.generate(eng, "a function triple/1 that triples a number", %{"seed" => 11})
+    assert :ok = Kintsugi.verify(code, nil)
+  end
+
   test "forge produces compiling code", %{eng: eng} do
     {:ok, code, stats} =
       Kintsugi.forge(eng, "a function double/1 that doubles a number", %{"seed" => 42})
