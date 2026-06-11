@@ -353,3 +353,26 @@ Honest residue: forge_long (3-function Stack with semantic checks) still fails -
 repairs cannot buy capability Dream-7B lacks for multi-function Elixir specs. That is a
 MODEL boundary; try DiffuCoder-7B for code-heavy work, and the bench is the instrument
 to measure it with.
+
+### Model comparison on the bench (2026-06-11, same fixed seeds, same settings)
+
+| case         | Dream-7B Q4_K_M     | DiffuCoder-7B-cpGRPO Q4_K_M |
+|--------------|---------------------|------------------------------|
+| forge_short  | ok, 20.2 tok/s      | ok, 26.5 tok/s (0 repairs)   |
+| forge_medium | ok, 34.2 tok/s      | ok, 37.8 tok/s               |
+| forge_long   | FAIL                | FAIL                         |
+| heal_fib     | ok, 35.8 tok/s      | ok, **114.1 tok/s**          |
+| aggregate    | **21.3 tok/s**      | 15.7 tok/s                   |
+
+Reading: DiffuCoder is FASTER per passing task everywhere (3.2x on heal - the coder
+model commits code tokens with high confidence, so threshold decoding finishes in very
+few steps) but its forge_long failure burns more wall time, dragging the aggregate below
+Dream's. Both models fail the multi-function Stack spec: the boundary is 7B-class Elixir
+capability, not the harness. For the repair-heavy kintsugi workload (the real use case),
+DiffuCoder is the better engine; for instruction-following drafts, Dream.
+
+DiffuCoder needed two new DETERMINISTIC rules (now in Autofix/extract_code, harmless for
+other models): fences arrive as SIX backticks with truncated language tags ("``````elix"),
+and one-liners come fused ("def f(x) do: expr end" - missing comma, stray end). The
+model-quirk table is exactly where harness effort pays: each rule converts a permanent
+failure class into zero-cost successes.
