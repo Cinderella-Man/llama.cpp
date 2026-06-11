@@ -376,3 +376,31 @@ other models): fences arrive as SIX backticks with truncated language tags ("```
 and one-liners come fused ("def f(x) do: expr end" - missing comma, stray end). The
 model-quirk table is exactly where harness effort pays: each rule converts a permanent
 failure class into zero-cost successes.
+
+### Credence integration (2026-06-11): the deterministic stage, as designed
+
+The design (sec 1) always specified Credence v0.7.1 (~/projects/credence, 117 rules) as
+the fix-deterministically-THEN-infill stage; the first kintsugi implementation shipped a
+5-regex stand-in instead. Now corrected:
+
+- kintsugi depends on credence (path dep); Credence.fix runs as REPAIR ROUND 0 - on the
+  first verify failure, once, consuming no repair budget. The hole-variant loop uses the
+  cheap syntax phase only (Credence.Syntax.fix_with_trace; the full pass compiles
+  internally, ~400 ms). kintsugi's Autofix shrank to fence cleanup (extraction artifact).
+- The model-quirk regexes moved INTO Credence as a proper syntax rule
+  (Credence.Syntax.FixDoBlockFusion): ', do' EOL, ', do expr' midline, 'do do',
+  ') do:' fusion, stray 'end' after 'do:'. Rules cascade - ORDER MATTERS (the double-do
+  collapse must precede the comma-do rules).
+- Three crashes fixed in Credence itself: Elixir parse errors carry {opening, hint}
+  TUPLE messages for do/end guidance and three interpolation sites raised
+  Protocol.UndefinedError on them (credence commit 03683da).
+
+Measured impact (same fixed-seed bench):
+- heal_fib: 2 GPU repairs -> 0, 35.8 -> 136.5 tok/s (Dream), 114 -> 130 (DiffuCoder).
+  The broken fib is now fixed entirely by rules; the only remaining cost is the
+  functional check subprocess.
+- Draft-heavy aggregate DIPPED (Dream 21.3 -> 16.8): a draft whose brokenness is
+  semantic (not rule-coverable) pays the ~400 ms full-Credence pass without payoff.
+  This is the right trade for the real workload - kintsugi exists for repair loops,
+  and every rule added to Credence converts a GPU repair class into a free fix.
+  Future: profile Credence's semantic phase; run it in the runner VM (design sec 3).
