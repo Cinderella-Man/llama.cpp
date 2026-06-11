@@ -119,10 +119,10 @@ defmodule Kintsugi do
 
     case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check"])) do
       {:ok, %{"text" => text, "ms_total" => ms}} ->
-        code = text |> extract_code() |> normalize_draft() |> Autofix.run()
-        stats = %{drafts: 1, repairs: 0, ms_total: ms, history: []}
+        code =
+          text |> extract_code() |> Autofix.run() |> normalize_draft() |> align_module_name(check)
 
-        code = align_module_name(code, check)
+        stats = %{drafts: 1, repairs: 0, ms_total: ms, credence_fixes: 0, history: []}
 
         # an (almost) empty draft COMPILES - reject anything without a function
         # definition outright so the caller redrafts instead of "succeeding" with junk
@@ -133,7 +133,7 @@ defmodule Kintsugi do
         end
 
       {:error, reason} ->
-        {:error, reason, %{drafts: 0, repairs: 0, ms_total: 0, history: []}}
+        {:error, reason, %{drafts: 0, repairs: 0, ms_total: 0, credence_fixes: 0, history: []}}
     end
   end
 
@@ -147,9 +147,10 @@ defmodule Kintsugi do
     opts = Map.merge(@default_opts, Map.new(opts, fn {k, v} -> {to_string(k), v} end))
     max_repairs = Map.get(opts, "max_repairs", 4)
     check = Map.get(opts, "check")
-    stats = %{drafts: 0, repairs: 0, ms_total: 0, history: []}
+    code = Autofix.run(code)
+    stats = %{drafts: 0, repairs: 0, ms_total: 0, credence_fixes: 0, history: []}
 
-    eng |> repair_until_ok(Autofix.run(code), opts, check, max_repairs, stats) |> finalize(eng, t0)
+    eng |> repair_until_ok(code, opts, check, max_repairs, stats) |> finalize(eng, t0)
   end
 
   @doc "One verify step: compile, then optionally run the check. Returns :ok | {:error, diags}."
@@ -222,7 +223,9 @@ defmodule Kintsugi do
 
     case Engine.infill(eng, canvas, opts) do
       {:ok, %{"text" => raw, "ms_total" => ms}} ->
-        text = Autofix.run(raw)
+        # variants are tried in quick succession - only the cheap regex-based syntax
+        # phase here; the full (compiling) Credence pass runs once at draft/heal entry
+        {text, _trace} = raw |> Autofix.run() |> Credence.Syntax.fix_with_trace([])
 
         case Verifier.compile(text) do
           :ok -> {:ok, text, ms_acc + ms}
@@ -249,6 +252,27 @@ defmodule Kintsugi do
         {:ok, code, stats}
 
       {:error, diags} ->
+        # round 0: the deterministic fixer (Credence, 117 rules). Runs ONCE, on the
+        # first failure, consuming no repair budget - everything a rule can fix is
+        # free; only what remains costs forward passes.
+        if Map.get(stats, :credence_fixes, 0) == 0 and not Map.get(stats, :credenced, false) do
+          {fixed, n} = deterministic_fix(code)
+          stats = stats |> Map.put(:credenced, true) |> Map.put(:credence_fixes, n)
+
+          if fixed != code do
+            throw({:credenced, fixed, stats})
+          else
+            repair_after_diags(eng, code, diags, opts, check, budget, stats)
+          end
+        else
+          repair_after_diags(eng, code, diags, opts, check, budget, stats)
+        end
+    end
+  catch
+    {:credenced, fixed, stats} -> repair_until_ok(eng, fixed, opts, check, budget, stats)
+  end
+
+  defp repair_after_diags(eng, code, diags, opts, check, budget, stats) do
         same_line_streak =
           stats.history
           |> Enum.reverse()
@@ -274,7 +298,6 @@ defmodule Kintsugi do
           {:error, reason} ->
             {:error, reason, stats}
         end
-    end
   end
 
   # Throughput accounting: `tokens` is the tokenized FINAL answer only - every
@@ -299,6 +322,24 @@ defmodule Kintsugi do
       end
 
     {verdict, code_or_reason, stats}
+  end
+
+  # THE deterministic stage (the point of the whole exercise): Credence's three-phase
+  # rule engine fixes everything rules can fix; only what remains costs forward passes.
+  # Credence.fix compiles internally (~hundreds of ms), so it runs ONLY when the code is
+  # actually broken - healthy code skips straight through on a cheap compile probe.
+  defp deterministic_fix(code) do
+    case Verifier.compile(code) do
+      :ok ->
+        {code, 0}
+
+      {:error, _} ->
+        %{code: fixed, applied_rules: applied} = Credence.fix(code)
+        {fixed, length(applied)}
+    end
+  rescue
+    # never let the fixer kill the loop - fall back to the unfixed code
+    _ -> {code, 0}
   end
 
   # when the check expects a specific module (e.g. "4 = Doubler.double(2)") but the

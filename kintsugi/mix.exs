@@ -22,6 +22,9 @@ defmodule Kintsugi.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      # the deterministic auto-corrector (117 rules, three phases, compile-gated):
+      # Credence fixes what rules can fix; the diffusion engine only fills the rest
+      {:credence, path: "../../credence"},
       # {:dep_from_hexpm, "~> 0.3.0"},
       # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
     ]
