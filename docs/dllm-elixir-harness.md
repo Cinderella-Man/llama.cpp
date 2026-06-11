@@ -250,3 +250,49 @@ kintsugi/
 
 - None blocking. To decide during M0: exact code-fence extraction rules for multi-block
   responses; whether warnings-as-errors should gate (start: yes, config flag).
+
+## Implementation log (2026-06-11): kintsugi/ exists and works
+
+The harness now lives IN-TREE at kintsugi/ (deliberately: the engine and harness grow
+together; no upstream-merge ambition for this directory). Built and verified end-to-end
+against llama-diffusion-server + Dream-7B on the RTX 5070.
+
+### What was built (all zero-dependency: :httpc + Elixir >= 1.18 builtin JSON)
+- Kintsugi.Engine - HTTP client: connect/1 (reads /health incl. mask_piece + replicas),
+  generate/3, infill/3, tokenize/2. One Engine = one server = possibly a whole rig
+  (the server's --diffusion-replicas does the GPU dispatch, so the harness needs no pool
+  for a single host - a pool is only needed across HOSTS).
+- Kintsugi.Masker - mask_line/4, mask_lines/5 (indentation-preserving, byte-identical
+  elsewhere), hole_size/3 char-heuristic fallback.
+- Kintsugi.Verifier - compile/1 via Code.string_to_quoted + Code.with_diagnostics
+  (line-accurate diagnostics; candidate modules purged after), run/3 executes a check
+  string in a SEPARATE OS process with timeout (generated code never runs in the harness
+  VM).
+- Kintsugi.forge/3 (instruction -> draft -> repair loop), heal/3 (existing code ->
+  repair loop), repair/4, verify/2.
+- 13 tests: 10 offline + 3 live (tagged :engine, KINTSUGI_ENGINE=... mix test --include
+  engine).
+
+### Measured results (Dream-7B Q4_K_M, threshold 0.6, temp 0.2, top-k 40)
+- forge("a function double/1...") -> compiling code in 1431 ms, 0 repairs needed.
+- heal(broken fibonacci with a syntax error, check "2 = Fib.fib(3)") -> HEALED in
+  1502 ms total across 2 repair rounds, functionally verified.
+
+### Discoveries (the reimplementation-grade details)
+1. THE infill failure mode is hole sizing, not model quality. Masked diffusion fills
+   EXACTLY n positions; an undershot hole TRUNCATES otherwise-perfect code (observed
+   verbatim: 18-token hole produced "def fib(n), do: fib(n-1) + fib(n - 2" - correct
+   except the missing ")" that did not fit). Naive chars/3 sizing caused 4 consecutive
+   failed repairs. Fix: tokenize the replaced text via /tokenize for the TRUE length,
+   then sweep {n, n+2, round(1.4n)} and take the first fill that COMPILES (compile is
+   ~free vs a 400 ms infill). After the fix the same case heals in 2 rounds.
+2. Fills can be MULTI-LINE: mask positions can become newline tokens (the healed fib
+   came back as an if/do block spanning 3 lines inside a 1-line hole). Do not assume
+   line-shaped fills when re-locating diagnostics.
+3. Vary the seed per repair round (we use seed + round): identical canvas + identical
+   seed re-produces the identical failed fill.
+4. Tokenization detail: a fill that begins with a space-prefixed token after preserved
+   indentation renders with one extra space (cosmetic in Elixir).
+5. Elixir diagnostics ordering: Code.with_diagnostics logged diagnostics carry the
+   precise message+line while the rescued CompileError is just "cannot compile module" -
+   surface the logged ones first or the masker aims at nothing.

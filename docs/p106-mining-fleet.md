@@ -345,3 +345,16 @@ Runbook updates (sec 9): step 10's "interim 4 processes" cap is obsolete - start
 server with --diffusion-replicas 0 and all 9 cards serve from a single process (step 11
 is implemented). Remaining rig-day work is unchanged: CUDA 12.x build + driver 580
 bring-up + on-card validation (steps 3-9) and the kintsugi dispatcher (step 12).
+
+## 11. Harness implemented (2026-06-11): kintsugi/ in-tree
+
+The sec-3 candidate-farm consumer now exists: kintsugi/ (Elixir, zero-dependency,
+docs/dllm-elixir-harness.md implementation log has details + measured numbers). Key
+architectural consequence of the multi-replica server for THIS plan: kintsugi talks to
+ONE endpoint per host - the server's --diffusion-replicas already dispatches across the
+9 GPUs, so the harness-side "pool dispatcher" of sec 3 reduces to a list of host URLs
+(laptop + rig), not per-GPU bookkeeping. Verified on the laptop: instruction ->
+compiling Elixir in 1.4 s; broken code -> functionally-verified fix in 1.5 s (2 repair
+rounds). Per the sec-7 projections (~6x slower per card), the same calls on one P106
+land at roughly 8-9 s per draft and ~3-5 s per repair round - and the rig runs nine
+of them concurrently.
