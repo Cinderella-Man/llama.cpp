@@ -122,6 +122,8 @@ defmodule Kintsugi do
         code = text |> extract_code() |> normalize_draft() |> Autofix.run()
         stats = %{drafts: 1, repairs: 0, ms_total: ms, history: []}
 
+        code = align_module_name(code, check)
+
         # an (almost) empty draft COMPILES - reject anything without a function
         # definition outright so the caller redrafts instead of "succeeding" with junk
         if code =~ ~r/^\s*defp?\s/m do
@@ -175,11 +177,14 @@ defmodule Kintsugi do
 
     # a parse error AT the module header means the structure inside is broken, not the
     # header - and masking the header only destroys the skeleton. Same for an exhausted
-    # escalation: remask the WHOLE module body (a guided redraft inside the skeleton).
+    # escalation, and for FUNCTIONAL check failures (their line numbers point into the
+    # appended check script, past the code - no single line is to blame): remask the
+    # WHOLE module body (a guided redraft inside the skeleton).
     {from, to} =
-      if header? and length(lines) >= 4 and (line == 1 or window >= 3) do
+      if header? and length(lines) >= 4 and (line == 1 or line > length(lines) or window >= 3) do
         {2, length(lines) - 1}
       else
+        line = min(line, length(lines))
         {max(line - min(window, 1), 1), min(line + (if window >= 2, do: 1, else: 0), length(lines))}
       end
 
@@ -295,6 +300,23 @@ defmodule Kintsugi do
 
     {verdict, code_or_reason, stats}
   end
+
+  # when the check expects a specific module (e.g. "4 = Doubler.double(2)") but the
+  # model named its module something else, rename it deterministically - a free fix
+  # that previously cost a full redraft cycle
+  defp align_module_name(code, check) when is_binary(check) do
+    with [_, wanted] <- Regex.run(~r/\b([A-Z]\w*(?:\.[A-Z]\w*)*)\./, check),
+         [[_, actual]] <- Regex.scan(~r/defmodule\s+([A-Z][\w.]*)/, code),
+         false <- actual == wanted do
+      code
+      |> String.replace(~r/defmodule\s+#{Regex.escape(actual)}\b/, "defmodule #{wanted}")
+      |> String.replace(~r/\b#{Regex.escape(actual)}\./, wanted <> ".")
+    else
+      _ -> code
+    end
+  end
+
+  defp align_module_name(code, _), do: code
 
   # models frequently draft bare `def ...` functions, which cannot compile outside a
   # module - wrap them so the verifier (and the repair loop) get a fair target
