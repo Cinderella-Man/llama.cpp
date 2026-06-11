@@ -322,3 +322,34 @@ against llama-diffusion-server + Dream-7B on the RTX 5070.
   variation; hole-size sweep {n, n+2, 1.4n} sized by /tokenize of the replaced text;
   window 0/1/2 by same-line streak; whole-body remask at streak >= 3 or line-1 module
   errors; fresh draft (seed + 1000 per attempt, max_drafts 3) when a draft is unhealable.
+
+### Performance loop (2026-06-11): 4.94 -> 21.3 tok/s end-to-end (4.3x)
+
+Method: a fixed-seed bench (kintsugi/bench/bench.exs) of 4 tasks WITH functional checks
+(compile-only verification accepts junk - the honest metric needs checks), measuring
+final-answer tokens / wall ms in aggregate. Each idea was A/B'd against it; winners
+committed, null results documented.
+
+| change                                            | aggregate tok/s | note |
+|---------------------------------------------------|-----------------|------|
+| baseline (512 canvas, no autofix)                 | 4.94 (2 fails)  |      |
+| 1. n_gen right-sized canvases (server + harness)  | +77% on pre-check bench | every step pays for the full canvas; 192 default, x2 per redraft |
+| 2. deterministic Autofix + function-less draft gate| fixed a whole failure class | ",do" line endings appear in ~every long Dream draft |
+| 3. flash attention                                 | none            | auto already resolves to ON for diffusion (verified 237 vs 237 ms/step) |
+| 4. EOT-tail shrink (engine)                       | 9.33 (1 fail)   | steps stop feeding the committed EOT tail; forge_medium 6.7s-FAIL -> 1.2s-pass |
+| 5. module-name alignment (regex rename)           | 21.3 (1 fail)   | check expects Doubler., model wrote Math -> rename beats redrafting (8.9s -> 1.7s) |
+| 6. body remask on check failures                  | ~same, better targeting | check-failure line numbers point past the code into the appended script |
+| temp 0.1 vs 0.2                                   | none (9.35 vs 9.33) | reverted |
+
+Engine bugs found by the loop (both fixed + committed):
+- EOT-shrink heap overflow on infill: n_input == max_length there, and a n_input+1 floor
+  grew batch.n_tokens past the llama_batch allocation -> silent server death, sometimes
+  delayed (heap corruption). Clamp into [.., max_length].
+- Degeneracy guard false positive: a SHRUNK canvas commits its legitimate EOT tail early,
+  which looked like an EOT flood. The guard now excludes the contiguous tail and only
+  counts scattered end tokens in the non-tail region.
+
+Honest residue: forge_long (3-function Stack with semantic checks) still fails - cheap
+repairs cannot buy capability Dream-7B lacks for multi-function Elixir specs. That is a
+MODEL boundary; try DiffuCoder-7B for code-heavy work, and the bench is the instrument
+to measure it with.
