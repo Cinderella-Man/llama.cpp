@@ -14,14 +14,17 @@ defmodule Kintsugi do
   gold-filled cracks give the project its name.
   """
 
-  alias Kintsugi.{Engine, Masker, Verifier}
+  alias Kintsugi.{Autofix, Engine, Masker, Verifier}
 
   @default_opts %{
     "steps" => 128,
     "conf_threshold" => 0.6,
     "temp" => 0.2,
     "top_k" => 40,
-    "eps" => 0.001
+    "eps" => 0.001,
+    # generation canvas: every denoising step pays for the full canvas, so size it to
+    # the answer, not the server max; redraft attempts double it (see attempt_drafts)
+    "n_gen" => 192
   }
 
   @doc """
@@ -64,8 +67,13 @@ defmodule Kintsugi do
       {reason, stats} = last_error || {:no_drafts_attempted, %{drafts: 0, repairs: 0, ms_total: 0, history: []}}
       {:error, reason, stats}
     else
-      # each retry drafts from a different seed, otherwise it would fail identically
-      retry_opts = Map.update(opts, "seed", spent * 1000, &(&1 + spent * 1000))
+      # each retry drafts from a different seed (identical canvases fail identically)
+      # and on a DOUBLED canvas - a too-small canvas truncates the draft mid-expression,
+      # which no amount of repair can fix
+      retry_opts =
+        opts
+        |> Map.update("seed", spent * 1000, &(&1 + spent * 1000))
+        |> Map.update("n_gen", 192 * round(:math.pow(2, spent)), &(&1 * round(:math.pow(2, spent))))
 
       case forge(eng, instruction, retry_opts) do
         {:ok, code, stats} ->
@@ -111,10 +119,16 @@ defmodule Kintsugi do
 
     case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check"])) do
       {:ok, %{"text" => text, "ms_total" => ms}} ->
-        code = text |> extract_code() |> normalize_draft()
+        code = text |> extract_code() |> normalize_draft() |> Autofix.run()
         stats = %{drafts: 1, repairs: 0, ms_total: ms, history: []}
 
-        eng |> repair_until_ok(code, opts, check, max_repairs, stats) |> finalize(eng, t0)
+        # an (almost) empty draft COMPILES - reject anything without a function
+        # definition outright so the caller redrafts instead of "succeeding" with junk
+        if code =~ ~r/^\s*defp?\s/m do
+          eng |> repair_until_ok(code, opts, check, max_repairs, stats) |> finalize(eng, t0)
+        else
+          {:error, :empty_draft, Map.put(stats, :ms_wall, System.monotonic_time(:millisecond) - t0)}
+        end
 
       {:error, reason} ->
         {:error, reason, %{drafts: 0, repairs: 0, ms_total: 0, history: []}}
@@ -133,7 +147,7 @@ defmodule Kintsugi do
     check = Map.get(opts, "check")
     stats = %{drafts: 0, repairs: 0, ms_total: 0, history: []}
 
-    eng |> repair_until_ok(code, opts, check, max_repairs, stats) |> finalize(eng, t0)
+    eng |> repair_until_ok(Autofix.run(code), opts, check, max_repairs, stats) |> finalize(eng, t0)
   end
 
   @doc "One verify step: compile, then optionally run the check. Returns :ok | {:error, diags}."
@@ -202,7 +216,9 @@ defmodule Kintsugi do
     canvas = Masker.mask_lines(code, from, to, eng.mask_piece, n)
 
     case Engine.infill(eng, canvas, opts) do
-      {:ok, %{"text" => text, "ms_total" => ms}} ->
+      {:ok, %{"text" => raw, "ms_total" => ms}} ->
+        text = Autofix.run(raw)
+
         case Verifier.compile(text) do
           :ok -> {:ok, text, ms_acc + ms}
           {:error, _} -> try_hole_variants(eng, code, span, rest, opts, ms_acc + ms, text)

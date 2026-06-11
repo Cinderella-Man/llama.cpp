@@ -273,6 +273,12 @@ void diffusion_generate(llama_context *          ctx,
     llama_batch batch = llama_batch_init(params.max_length, 0, 1);
     batch.n_tokens    = params.max_length;
 
+    // EOT-tail shrink (threshold mode): once the canvas ends in a committed run of end
+    // tokens, later steps stop feeding that tail through the model - the per-step
+    // forward cost tracks the ANSWER length instead of the canvas length. A short EOT
+    // anchor is kept visible so remaining positions still see "the end".
+    int32_t cur_length = params.max_length;
+
     // Self-conditioning (DiffusionGemma): cache each step's canvas-row logits and feed them into the next
     // step (canvas = [n_input, max_length)); set_sc is a no-op for other models.
     llama_model *      sc_model = const_cast<llama_model *>(llama_get_model(ctx));
@@ -340,7 +346,8 @@ void diffusion_generate(llama_context *          ctx,
             }
 
             // Setup batch
-            for (int32_t i = 0; i < params.max_length; i++) {
+            batch.n_tokens = cur_length;
+            for (int32_t i = 0; i < cur_length; i++) {
                 batch.token[i]     = output_tokens[i];
                 batch.pos[i]       = i;
                 batch.n_seq_id[i]  = 1;
@@ -441,7 +448,7 @@ void diffusion_generate(llama_context *          ctx,
             int64_t time_start_sampling = ggml_time_us();
 
             mask_positions.clear();
-            for (int32_t i = 0; i < params.max_length; i++) {
+            for (int32_t i = 0; i < cur_length; i++) {
                 if (output_tokens[i] == params.mask_token_id) {
                     // For block-based, only consider current block
                     if (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || (i >= block_start && i < block_end)) {
@@ -615,10 +622,25 @@ void diffusion_generate(llama_context *          ctx,
                     // region while real positions are still masked, the draft is unrecoverable - abort
                     {
                         const llama_vocab * gvocab = llama_model_get_vocab(model);
+
+                        // a contiguous committed-EOT SUFFIX is the normal end of a short
+                        // answer - only end tokens scattered through the non-tail region
+                        // signal degeneracy
+                        int32_t tail_start = params.max_length;
+                        while (tail_start > n_input) {
+                            const llama_token t = output_tokens[tail_start - 1];
+                            if (t != params.mask_token_id &&
+                                (llama_vocab_is_eog(gvocab, t) || t == llama_vocab_pad(gvocab))) {
+                                tail_start--;
+                            } else {
+                                break;
+                            }
+                        }
+
                         int32_t n_committed_total = 0;
                         int32_t n_committed_eog   = 0;
                         int32_t n_masked          = 0;
-                        for (int32_t i = n_input; i < params.max_length; i++) {
+                        for (int32_t i = n_input; i < tail_start; i++) {
                             if (output_tokens[i] == params.mask_token_id) {
                                 n_masked++;
                             } else {
@@ -629,7 +651,7 @@ void diffusion_generate(llama_context *          ctx,
                                 }
                             }
                         }
-                        const int32_t n_gen = params.max_length - n_input;
+                        const int32_t n_gen = tail_start - n_input;
                         if (n_committed_total > 8 &&
                                 n_committed_eog > 0.9f * n_committed_total &&
                                 n_masked        > 0.2f * n_gen) {
@@ -639,6 +661,26 @@ void diffusion_generate(llama_context *          ctx,
                                 *params.out_degenerate = true;
                             }
                             break;
+                        }
+
+                        // EOT-tail shrink (see cur_length above); positions >= tail are
+                        // committed end tokens, so no mask can be beyond the new bound
+                        if (params.cfg_scale <= 0.0f) {
+                            int32_t tail = cur_length;
+                            while (tail > n_input) {
+                                const llama_token t = output_tokens[tail - 1];
+                                const bool committed_eot = t != params.mask_token_id &&
+                                    (llama_vocab_is_eog(gvocab, t) || t == llama_vocab_pad(gvocab));
+                                if (!committed_eot) {
+                                    break;
+                                }
+                                tail--;
+                            }
+                            // clamp INTO [.., params.max_length]: for infill n_input ==
+                            // max_length and an unclamped n_input+1 floor would grow the
+                            // batch past its allocation (heap overflow, crashed the server)
+                            cur_length = std::min(params.max_length,
+                                                  std::max(n_input + 1, std::min(cur_length, tail + 4)));
                         }
                     }
                 } else {

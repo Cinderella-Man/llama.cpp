@@ -140,6 +140,7 @@ static diffusion_params make_masked_params(const server_state & st, const json &
 // request:  {"prompt": str (required),
 //            "raw"?: bool (skip the chat template; default false),
 //            "infill"?: bool (prompt is a canvas with mask-piece markers; masked models only),
+//            "n_gen"?: int (masked, non-infill: generation canvas length; default n_ubatch),
 //            "n_predict"?: int (canvas models: drives the block count),
 //            "return_confidences"?: bool,
 //            "seed"?, "steps"?, "conf_threshold"?, "algorithm"?, "temp"?, "top_k"?, "top_p"?,
@@ -202,6 +203,13 @@ static json handle_generate(server_state & st, server_replica & rep, const json 
         diffusion_params dp = make_masked_params(st, req);
         dp.infill     = infill;
         dp.max_length = infill ? n_input : n_ub;
+        // "n_gen": generation-canvas length; every denoising step runs the FULL
+        // [prompt|canvas] through the model, so a right-sized canvas cuts the per-step
+        // forward cost roughly linearly (a 512-canvas one-liner wastes ~95% of each step)
+        if (!infill && req.contains("n_gen")) {
+            const int32_t n_gen = std::max<int32_t>(8, req["n_gen"].get<int32_t>());
+            dp.max_length = std::min(n_input + n_gen, n_ub);
+        }
         if (want_conf) {
             confidences.assign(dp.max_length, -1.0f);
             dp.output_confidences = confidences.data();
