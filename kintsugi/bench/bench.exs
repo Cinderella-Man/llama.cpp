@@ -1,13 +1,17 @@
 # Bench v2 runner. Usage:
 #
-#   mix run bench/bench.exs [url] [label] [profile] [--allow-battery]
+#   mix run bench/bench.exs [url] [label] [profile] [draft_url] [--allow-battery]
 #
-#   url      engine endpoint            (default http://127.0.0.1:8080)
-#   label    free-form run name         (default the profile name)
-#   profile  baseline | kvpfx32         (request-parameter overlays; one server
+#   url       engine endpoint           (default http://127.0.0.1:8080)
+#   label     free-form run name        (default the profile name)
+#   profile   baseline | kvpfx32        (request-parameter overlays; one server
 #                                        process serves ALL profiles - same-process
 #                                        A/B is required for tight wall comparisons,
 #                                        see the measuring-updates doc, finding L/M)
+#   draft_url D4 hybrid (06_d4_hybrid.md): a second engine that DRAFTS; `url`
+#             becomes the repair/escalation engine. Forge cases route through
+#             Kintsugi.generate_hybrid; heal/infill stay on the repair engine
+#             (block-AR drafters cannot infill).
 #
 # Output: bench/results/<utc-timestamp>-<label>.jsonl
 #   line 1: {"type":"header", ...environment + profile...}
@@ -37,7 +41,10 @@ defmodule Kintsugi.Bench.Runner do
     "winroute" => %{"win_route" => true},
     # Fast-dLLM v2 (block-AR): the commit threshold is the model's own scale -
     # 0.6 (Dream-tuned) floods adjacent commits into duplicate-token corruption
-    "fastdllm" => %{"conf_threshold" => 0.9}
+    "fastdllm" => %{"conf_threshold" => 0.9},
+    # D4 hybrid: per-engine thresholds live INSIDE generate_hybrid (draft 0.9,
+    # repair engine on its own defaults) - the profile stays empty on purpose
+    "d4" => %{}
   }
 
   # full request params for infill cases - NO reliance on server defaults
@@ -45,12 +52,13 @@ defmodule Kintsugi.Bench.Runner do
 
   def main(argv) do
     {flags, args} = Enum.split_with(argv, &String.starts_with?(&1, "--"))
-    [url, label, profile_name] =
+    [url, label, profile_name, draft_url] =
       case args do
-        [] -> ["http://127.0.0.1:8080", "baseline", "baseline"]
-        [u] -> [u, "baseline", "baseline"]
-        [u, l] -> [u, l, "baseline"]
-        [u, l, p] -> [u, l, p]
+        [] -> ["http://127.0.0.1:8080", "baseline", "baseline", nil]
+        [u] -> [u, "baseline", "baseline", nil]
+        [u, l] -> [u, l, "baseline", nil]
+        [u, l, p] -> [u, l, p, nil]
+        [u, l, p, d] -> [u, l, p, d]
       end
 
     profile = Map.fetch!(@profiles, profile_name)
@@ -62,15 +70,26 @@ defmodule Kintsugi.Bench.Runner do
     # warmup: first request pays sampler attach + graph capture (~85 ms measured)
     Kintsugi.Engine.generate(eng, "hi", %{"steps" => 4, "n_gen" => 32, "seed" => 1})
 
+    draft_eng =
+      case draft_url do
+        nil ->
+          nil
+
+        d ->
+          {:ok, de} = Kintsugi.Engine.connect(d)
+          Kintsugi.Engine.generate(de, "hi", %{"n_gen" => 32, "seed" => 1})
+          de
+      end
+
     out = results_path(label)
     File.mkdir_p!(Path.dirname(out))
     io = File.open!(out, [:write, :utf8])
 
-    IO.write(io, JSON.encode!(header(url, eng, label, profile_name, profile)) <> "\n")
+    IO.write(io, JSON.encode!(header(url, eng, label, profile_name, profile, draft_url, draft_eng)) <> "\n")
 
     rows =
       for c <- Kintsugi.Bench.Cases.all(), seed <- c.seeds do
-        row = run_case(eng, c, seed, profile)
+        row = run_case({eng, draft_eng}, c, seed, profile)
         IO.write(io, JSON.encode!(row) <> "\n")
         row
       end
@@ -93,7 +112,7 @@ defmodule Kintsugi.Bench.Runner do
     end
   end
 
-  defp header(url, eng, label, profile_name, profile) do
+  defp header(url, eng, label, profile_name, profile, draft_url \\ nil, draft_eng \\ nil) do
     git = fn args ->
       case System.cmd("git", args, stderr_to_stdout: true) do
         {out, 0} -> String.trim(out)
@@ -117,6 +136,8 @@ defmodule Kintsugi.Bench.Runner do
       timestamp: DateTime.utc_now() |> DateTime.to_iso8601(),
       url: url,
       engine: Map.from_struct(eng),
+      draft_url: draft_url,
+      draft_engine: draft_eng && Map.from_struct(draft_eng),
       git_rev: git.(["rev-parse", "--short", "HEAD"]),
       # the deterministic-fix layer is part of the measured system - a Credence change
       # invalidated an afternoon of verdicts before this field existed
@@ -141,9 +162,9 @@ defmodule Kintsugi.Bench.Runner do
     }
   end
 
-  defp run_case(eng, c, seed, profile) do
+  defp run_case(engs, c, seed, profile) do
     t0 = System.monotonic_time(:millisecond)
-    {ok, reported} = dispatch(eng, c, seed, profile)
+    {ok, reported} = dispatch(engs, c, seed, profile)
     wall = System.monotonic_time(:millisecond) - t0
 
     %{
@@ -158,7 +179,7 @@ defmodule Kintsugi.Bench.Runner do
     }
   end
 
-  defp dispatch(eng, %{kind: :forge} = c, seed, profile) do
+  defp dispatch({eng, nil}, %{kind: :forge} = c, seed, profile) do
     opts = Map.merge(%{"seed" => seed, "check" => c.check}, profile)
 
     case Kintsugi.generate_with_stats(eng, c.instruction, opts) do
@@ -167,7 +188,18 @@ defmodule Kintsugi.Bench.Runner do
     end
   end
 
-  defp dispatch(eng, %{kind: :heal} = c, seed, profile) do
+  # D4 hybrid: forge cases run the two-engine ladder; everything else stays on
+  # the repair engine via the heads below
+  defp dispatch({eng, draft_eng}, %{kind: :forge} = c, seed, profile) do
+    opts = Map.merge(%{"seed" => seed, "check" => c.check}, profile)
+
+    case Kintsugi.generate_hybrid(draft_eng, eng, c.instruction, opts) do
+      {:ok, _, st} -> {true, slim(st)}
+      {:error, _, st} -> {false, slim(st)}
+    end
+  end
+
+  defp dispatch({eng, _draft_eng}, %{kind: :heal} = c, seed, profile) do
     opts = Map.merge(%{"seed" => seed, "check" => c.check}, profile)
 
     case Kintsugi.heal(eng, c.code, opts) do
@@ -176,7 +208,7 @@ defmodule Kintsugi.Bench.Runner do
     end
   end
 
-  defp dispatch(eng, %{kind: :infill} = c, seed, profile) do
+  defp dispatch({eng, _draft_eng}, %{kind: :infill} = c, seed, profile) do
     canvas = Kintsugi.Bench.Cases.materialize_canvas(c.canvas, eng.mask_piece)
     params = @infill_params |> Map.merge(profile) |> Map.put("seed", seed)
 
@@ -196,7 +228,7 @@ defmodule Kintsugi.Bench.Runner do
   defp wrap_for_compile(text), do: "defmodule InfillCheck do\n#{text}\nend"
 
   defp slim(st) do
-    Map.take(st, [:ms_wall, :ms_total, :drafts, :repairs, :credence_fixes, :tokens, :tokens_per_second])
+    Map.take(st, [:ms_wall, :ms_total, :drafts, :repairs, :credence_fixes, :tokens, :tokens_per_second, :rung])
   end
 
   defp results_path(label) do

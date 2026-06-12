@@ -62,6 +62,97 @@ defmodule Kintsugi do
     attempt_drafts(eng, instruction, opts, max_drafts, 0, t0, nil)
   end
 
+  @doc """
+  D4 hybrid (06_d4_hybrid.md): a cheap block-AR DRAFT engine + a masked-diffusion
+  REPAIR engine, both resident. Ladder, every rung hard-capped (a logically flawed
+  draft cannot be fixed by inpainting - bounded repairs keep hopeless drafts cheap):
+
+      draft_eng draft + 1 reseeded retry (no model repairs - block-AR cannot
+      infill; the Credence round is free)
+        -> 2 repair_eng cross-repairs on the last failed draft (text-level infill;
+           the draft's provenance is irrelevant to the repairer)
+        -> full repair_eng redraft with its own capped ladder (the proven system =
+           the score floor)
+
+  Returns `{:ok, code, stats}` / `{:error, reason, stats}`; stats carries `:rung`
+  (:draft | :cross_repair | :escalation | :exhausted) and bills the WHOLE ladder's
+  wall. Draft-side commit threshold defaults to 0.9 (the block-AR model's own
+  scale - 05_layer_e.md de-temper lesson); override with `"draft_conf_threshold"`.
+  """
+  def generate_hybrid(%Engine{} = draft_eng, %Engine{} = repair_eng, instruction, opts \\ %{}) do
+    t0 = System.monotonic_time(:millisecond)
+    opts = Map.new(opts, fn {k, v} -> {to_string(k), v} end)
+
+    draft_opts =
+      opts
+      |> Map.merge(%{
+        "conf_threshold" => Map.get(opts, "draft_conf_threshold", 0.9),
+        "max_repairs" => 0,
+        "max_drafts" => 2
+      })
+      |> Map.delete("draft_conf_threshold")
+
+    # the repair engine runs on ITS own scale: @default_opts thresholds, not the
+    # draft model's - drop anything draft-specific the caller passed
+    repair_opts = Map.drop(opts, ["draft_conf_threshold", "conf_threshold", "max_drafts", "max_repairs"])
+
+    case generate_with_stats(draft_eng, instruction, draft_opts) do
+      {:ok, code, st} ->
+        {:ok, code, hybrid_stats(:draft, [st], code, draft_eng, t0)}
+
+      {:error, _reason, draft_st} ->
+        case cross_repair(repair_eng, draft_st[:last_code], repair_opts) do
+          {:ok, code, st} ->
+            {:ok, code, hybrid_stats(:cross_repair, [draft_st, st], code, repair_eng, t0)}
+
+          {:error, _reason, cross_st} ->
+            case generate_with_stats(repair_eng, instruction, Map.put(repair_opts, "max_drafts", 2)) do
+              {:ok, code, st} ->
+                {:ok, code, hybrid_stats(:escalation, [draft_st, cross_st, st], code, repair_eng, t0)}
+
+              {:error, reason, st} ->
+                {:error, reason, hybrid_stats(:exhausted, [draft_st, cross_st, st], nil, repair_eng, t0)}
+            end
+        end
+    end
+  end
+
+  defp cross_repair(_eng, nil, _opts) do
+    # the draft engine produced nothing repairable (e.g. empty drafts)
+    {:error, :no_draft_code, %{drafts: 0, repairs: 0, ms_total: 0, credence_fixes: 0, history: []}}
+  end
+
+  defp cross_repair(eng, code, opts), do: heal(eng, code, Map.put(opts, "max_repairs", 2))
+
+  defp hybrid_stats(rung, stat_list, final_code, tokenizer_eng, t0) do
+    ms_wall = System.monotonic_time(:millisecond) - t0
+
+    stats =
+      Enum.reduce(stat_list, %{drafts: 0, repairs: 0, ms_total: 0, credence_fixes: 0, history: []}, fn st, acc ->
+        %{
+          acc
+          | drafts: acc.drafts + (st[:drafts] || 0),
+            repairs: acc.repairs + (st[:repairs] || 0),
+            ms_total: acc.ms_total + (st[:ms_total] || 0),
+            credence_fixes: acc.credence_fixes + (st[:credence_fixes] || 0),
+            history: acc.history ++ (st[:history] || [])
+        }
+      end)
+      |> Map.put(:rung, rung)
+      |> Map.put(:ms_wall, ms_wall)
+
+    with true <- is_binary(final_code),
+         {:ok, tokens} <- Engine.tokenize(tokenizer_eng, final_code) do
+      n = length(tokens)
+
+      stats
+      |> Map.put(:tokens, n)
+      |> Map.put(:tokens_per_second, Float.round(n * 1000 / max(ms_wall, 1), 2))
+    else
+      _ -> Map.merge(stats, %{tokens: nil, tokens_per_second: nil})
+    end
+  end
+
   defp attempt_drafts(eng, instruction, opts, budget, spent, t0, last_error) do
     if budget <= 0 do
       {reason, stats} = last_error || {:no_drafts_attempted, %{drafts: 0, repairs: 0, ms_total: 0, history: []}}
@@ -347,8 +438,25 @@ defmodule Kintsugi do
 
   defp repair_until_ok(_eng, code, _opts, check, 0 = _budget, stats) do
     case verify(code, check) do
-      :ok -> {:ok, code, stats}
-      {:error, diags} -> {:error, {:still_broken, diags}, stats}
+      :ok ->
+        {:ok, code, stats}
+
+      {:error, _diags} ->
+        # zero-budget callers (hybrid draft rungs: block-AR models cannot infill)
+        # still get the free deterministic round - Credence costs no forward passes
+        {fixed, stats} =
+          if Map.get(stats, :credenced, false) do
+            {code, stats}
+          else
+            {fixed, n} = deterministic_fix(code)
+            {fixed, stats |> Map.put(:credenced, true) |> Map.put(:credence_fixes, n)}
+          end
+
+        case verify(fixed, check) do
+          :ok -> {:ok, fixed, stats}
+          # :last_code lets a second engine cross-repair this draft (06_d4_hybrid.md)
+          {:error, diags} -> {:error, {:still_broken, diags}, Map.put(stats, :last_code, fixed)}
+        end
     end
   end
 
@@ -431,7 +539,7 @@ defmodule Kintsugi do
             repair_until_ok(eng, new_code, opts, check, budget - 1, stats)
 
           {:error, reason} ->
-            {:error, reason, stats}
+            {:error, reason, Map.put(stats, :last_code, code)}
         end
   end
 
