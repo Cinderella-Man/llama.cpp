@@ -231,3 +231,52 @@ B-1 implemented (block-scoped, floored, off); B-2 implemented (off; repair-path
 candidate); B-3 span-sizing and B-4 tail anchor remain to implement with the same
 gates; B-5 remask unchanged. The instrument survived two self-inflicted wounds and is
 sharper for it: exit-code builds, dependency revs in headers, repeat-compile tests.
+
+
+## EMPIRICAL GRILLING ROUND 3 (2026-06-12): adoption, B-3 verdict, the long-form limit
+
+### Prophet-on-repairs: SHIPPED and gated
+kintsugi's repair infill calls now pass early_commit 0.5 (lib/kintsugi.ex repair/4);
+drafts keep it off. Full bench: 33/45, VERDICT OK, aggregate deliverable throughput
+8.03 -> 9.02 tok/s (+12%) - round 2's discovery converted into a real harness win.
+
+### B-3 SlowFast span sizing: implemented, measured, REJECTED as default
+--diffusion-kv-span F (dynamic kv-block size = contiguous confident span at warm steps,
+clamped [8,64]). Code KPI, 3 seeds, same session: fixed blk32 = 27.2 s, span 0.3 =
+28.3 s, span 0.5 = 28.0 s. No win - our threshold commits + warm-step machinery already
+capture what SlowFast's exploration phase buys; their published gains are vs quota
+baselines. Flag stays (other models/shapes may differ); default 0.
+Environment note: blk32-fixed measured 27.2 s here vs 24.9 s hours earlier - ~9%
+inter-session drift (thermals). The same-session-comparisons rule holds for CLI
+matrices, not just the bench.
+
+### B-4 tail anchor: design constraint discovered by analysis (implementation deferred)
+Anchor rows in BLOCK mode conflict with the store write (the graph writes batch rows
+into store[s..s+n_tokens) contiguously - appended anchor rows would land at wrong
+offsets). Anchor is therefore PREFIX-mode-only (no store write of batch rows) unless
+the block write learns row indirection. Recorded for the implementer; the windowed
+configs it would rescue were marginal anyway (Layer A 14.3).
+
+### The long-form bench gap: probed, and the honest answer is a MODEL limit
+Candidates at 3 seeds: two-trivial-functions 0/3 (the multi-function hole is absolute -
+even c_to_f + f_to_c together fail); guarded sign/1 0/3; single-function-with-docs
+(sum_to + @doc + @spec, ~58 tokens) 2/3 - the ONLY long-ish candidate Dream sometimes
+passes. Added to the suite as m_sumdoc (tier :m, boundary; additive change - compare.exs
+pairs by id, old baselines remain valid; self-test 14/14). Conclusion: Dream-7B has no
+reliably-passing long-form tier; full long-form quality gating awaits DiffuCoder
+baselines for tier m/c or a better model. Until then code-targeted schedule flags are
+gated by m_sumdoc + C-tier movement + manual review.
+
+### Layer B exhaustion status after three rounds
+- B-1 adaptive tau: implemented (block-scoped + floor), default off; -14% long code,
+  small-canvas regression; content-gated use only.
+- B-2 Prophet: implemented, default off; ADOPTED on kintsugi repair path (+12%
+  aggregate); regresses drafts.
+- B-3 span sizing: implemented, measured, no win, default off.
+- B-4 tail anchor: deferred with a recorded design constraint.
+- B-5 remask: not implemented (quality play; prerequisites verified; next candidate).
+- B-6 EB port: deferred.
+Layer B's honest yield: the schedule layer was largely ALREADY CAPTURED by our existing
+threshold machinery; the real wins were Prophet-for-repairs (+12% aggregate) and the
+instrument hardening that the hunt forced (exit-code builds, dep-rev headers,
+repeat-compile guard, boundary tier).

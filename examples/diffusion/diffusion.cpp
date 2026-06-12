@@ -350,6 +350,7 @@ void diffusion_generate(llama_context *          ctx,
     const int32_t kv_rewarm = params.kv_rewarm > 0 ? params.kv_rewarm : 1000000000;
     int32_t kv_steps_since_warm   = 0;
     int32_t kv_commits_since_warm = 0;
+    int32_t kv_span_hint          = 0;  // B3: next block size detected at the last warm
 
     for (int block_num = 0; block_num < num_blocks; block_num++) {
         int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
@@ -390,10 +391,12 @@ void diffusion_generate(llama_context *          ctx,
                     }
                     return true;
                 };
-                kv_e = std::min(kv_s + kv_blk_sz, cur_length);
+                const int32_t kv_blk_eff = (params.kv_span > 0.0f && kv_span_hint > 0)
+                                               ? kv_span_hint : kv_blk_sz;
+                kv_e = std::min(kv_s + kv_blk_eff, cur_length);
                 while (kv_s < cur_length && block_clean(kv_s, kv_e)) {
                     kv_s           = kv_e;
-                    kv_e           = std::min(kv_s + kv_blk_sz, cur_length);
+                    kv_e           = std::min(kv_s + kv_blk_eff, cur_length);
                     kv_warm_needed = true;
                 }
                 if (kv_steps_since_warm >= kv_rewarm) {
@@ -766,6 +769,29 @@ void diffusion_generate(llama_context *          ctx,
                             // instead of idling until the next scheduled re-warm
                             kv_warm_needed = true;
                         }
+                    }
+
+                    // Layer B3 (SlowFast span detection): at warm steps, measure the
+                    // contiguous confident span from the block start - it becomes the
+                    // NEXT block's size (dynamic block sizing; clamp keeps warms amortized)
+                    if (kv_on && params.kv_span > 0.0f && kv_steps_since_warm == 0) {
+                        std::vector<float> conf_of_mask(mask_positions.size(), -1.0f);
+                        for (const auto & c : confidences) {
+                            conf_of_mask[c.second] = c.first;
+                        }
+                        int32_t span  = 0;
+                        size_t  m_idx = 0;
+                        for (int32_t pos = kv_s; pos < cur_length; pos++) {
+                            while (m_idx < mask_positions.size() && mask_positions[m_idx] < pos) {
+                                m_idx++;
+                            }
+                            const bool is_masked = m_idx < mask_positions.size() && mask_positions[m_idx] == pos;
+                            if (is_masked && conf_of_mask[m_idx] < params.kv_span) {
+                                break;  // first unconfident masked position ends the span
+                            }
+                            span++;
+                        }
+                        kv_span_hint = std::max(8, std::min(64, span));
                     }
 
                     // Layer B2 (Prophet, arXiv:2508.19982): when every remaining masked

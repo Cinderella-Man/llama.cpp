@@ -76,6 +76,21 @@ defmodule Kintsugi.Bench.Cases do
         reference: "defmodule Pairs do\n  def swap({a, b}), do: {b, a}\nend"
       },
 
+      # ---- M: boundary tier (added r3: the long-form gap probe found exactly one
+      # candidate Dream can SOMETIMES pass - 58-token single-function-with-docs; 2/3
+      # at probe time; this is the flip-prone middle that detects quality movement) ----
+      %{
+        id: "m_sumdoc",
+        tier: :m,
+        kind: :forge,
+        seeds: [44, 144, 244],
+        instruction:
+          "a module Acc with sum_to/1 that computes the sum 1+2+...+n recursively, including a @doc comment and a @spec",
+        check: "6 = Acc.sum_to(3); 0 = Acc.sum_to(0)",
+        reference:
+          "defmodule Acc do\n  @doc \"Sums 1..n.\"\n  @spec sum_to(non_neg_integer) :: non_neg_integer\n  def sum_to(0), do: 0\n  def sum_to(n), do: n + sum_to(n - 1)\nend"
+      },
+
       # ---- C: ceiling tier -----------------------------------------------------------
       %{
         id: "c_vowels",

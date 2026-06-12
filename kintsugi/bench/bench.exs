@@ -195,7 +195,7 @@ defmodule Kintsugi.Bench.Runner do
     IO.puts("\n#{label}  (#{out})")
     IO.puts("tier  pass   median_wall  worst_wall  notes")
 
-    for tier <- [:p, :c, :h, :a, :i] do
+    for tier <- [:p, :m, :c, :h, :a, :i] do
       runs = Enum.filter(rows, &(&1.tier == tier))
       npass = Enum.count(runs, & &1.ok)
       walls = Enum.map(runs, & &1.wall_ms) |> Enum.sort()

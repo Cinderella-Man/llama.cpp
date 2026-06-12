@@ -280,6 +280,7 @@ int main(int argc, char ** argv) {
     diff_params.tau_alpha        = params.diffusion.tau_alpha;
     diff_params.tau_floor        = params.diffusion.tau_floor;
     diff_params.early_commit     = params.diffusion.early_commit;
+    diff_params.kv_span          = params.diffusion.kv_span;
 
     callback_data cb_data               = { &diff_params, vocab, 0, params.diffusion.visual_progress,
                                             std::max(1, params.diffusion.visual_interval), 0, 0, 24, 80, 0 };

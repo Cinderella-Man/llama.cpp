@@ -69,6 +69,10 @@ struct diffusion_params {
                                        // tau_eff = conf_threshold * (1 - alpha*(1 - r_mask_window)).
                                        // Global decay was refuted by bench (13/45). 0 = fixed.
     float   tau_floor        = 0.0f;   // absolute lower bound for the decayed tau (0 = none)
+    float   kv_span          = 0.0f;   // Layer B3 (SlowFast): dynamic kv-block sizing - at warm
+                                       // steps, the next block extends over the contiguous
+                                       // confident span (confidence >= kv_span) from the block
+                                       // start, clamped to [8, 64]. Requires kv_block. 0 = fixed.
     float   early_commit     = 0.0f;   // Layer B2 (Prophet): when EVERY remaining masked position has
                                        // top1-top2 prob gap >= this, commit all and finish. Only fires
                                        // on exact (uncached/warm) steps. 0 = off.

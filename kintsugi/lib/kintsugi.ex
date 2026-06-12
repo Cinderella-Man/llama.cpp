@@ -209,7 +209,14 @@ defmodule Kintsugi do
 
     infill_opts =
       Map.merge(
-        %{"steps" => 16, "conf_threshold" => Map.get(opts, "conf_threshold", 0.6)},
+        %{
+          "steps" => 16,
+          "conf_threshold" => Map.get(opts, "conf_threshold", 0.6),
+          # Prophet early-commit (Layer B2): repairs are short, hole-bounded and
+          # verified afterwards - bench-measured -35% infill wall, quality-neutral
+          # (02_layer_b.md round 2). Drafts keep it OFF (it regresses them).
+          "early_commit" => 0.5
+        },
         Map.take(opts, ["temp", "top_k", "eps", "seed"])
       )
 
