@@ -318,6 +318,27 @@ void diffusion_generate(llama_context *          ctx,
     // with conf_threshold the schedule finishes early - count the steps actually run
     int32_t n_steps_done = 0;
 
+    // Layer A cached decoding (docs/dllms/throughput-plans/01_layer_a.md): per kv-block, one
+    // full WARM forward snapshots prefix (or full-canvas) K/V, then steps decode only the
+    // suffix (prefix cache) or the block (dual cache) against the store.
+    const int32_t kv_blk_sz = params.kv_block > 0 ? params.kv_block : params.kv_prefix;
+    const bool    kv_dual   = params.kv_block > 0;
+    const bool    kv_on     = kv_blk_sz > 0 && params.conf_threshold > 0.0f && !params.infill &&
+                              params.schedule == DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED &&
+                              params.cfg_scale <= 0.0f && !params.self_conditioning;
+    if (kv_blk_sz > 0 && !kv_on) {
+        LOG_WRN("%s: kv_prefix/kv_block requested but unsupported here (needs conf_threshold>0, "
+                "timestep schedule, no infill/cfg/self-conditioning) - running uncached\n", __func__);
+    }
+    int32_t kv_s = n_input;        // current kv block start
+    int32_t kv_e = 0;              // current kv block end
+    bool    kv_warm_needed = true; // next forward must be a full WARM
+    // cached K/V drift as the canvas fills (cosine similarity is only high between
+    // ADJACENT steps - reusing a step-0 snapshot for many steps compounds the error and
+    // measurably degrades output: the model EOT-floods). Re-warm every few cached steps.
+    const int32_t kv_rewarm = 12;
+    int32_t kv_steps_since_warm = 0;
+
     for (int block_num = 0; block_num < num_blocks; block_num++) {
         int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
         int32_t block_end   = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ?
@@ -345,11 +366,52 @@ void diffusion_generate(llama_context *          ctx,
                 }
             }
 
+            // Layer A: pick phase + batch window for this step
+            int32_t batch_first = 0;
+            int32_t batch_last  = cur_length;
+            if (kv_on) {
+                auto block_clean = [&](int32_t s, int32_t e) {
+                    for (int32_t i = s; i < e; i++) {
+                        if (output_tokens[i] == params.mask_token_id) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                kv_e = std::min(kv_s + kv_blk_sz, cur_length);
+                while (kv_s < cur_length && block_clean(kv_s, kv_e)) {
+                    kv_s           = kv_e;
+                    kv_e           = std::min(kv_s + kv_blk_sz, cur_length);
+                    kv_warm_needed = true;
+                }
+                if (kv_steps_since_warm >= kv_rewarm) {
+                    kv_warm_needed = true;
+                }
+                if (kv_s >= cur_length) {
+                    break;  // every position committed
+                }
+
+                // Dream shift_logits: include one extra leading row so position kv_s gets the
+                // logits of kv_s-1 exactly (kv_s >= n_input >= 1, so kv_s-1 always exists)
+                const int32_t b0 = params.shift_logits ? kv_s - 1 : kv_s;
+                if (kv_warm_needed) {
+                    llama_diffusion_set_phase(sc_model, /*WARM*/1, kv_dual ? cur_length : b0);
+                } else if (!kv_dual) {
+                    llama_diffusion_set_phase(sc_model, /*DECODE*/2, b0);
+                    batch_first = b0;
+                } else {
+                    llama_diffusion_set_block(sc_model, b0, cur_length);
+                    llama_diffusion_set_phase(sc_model, /*BLOCK*/3, 0);
+                    batch_first = b0;
+                    batch_last  = kv_e;
+                }
+            }
+
             // Setup batch
-            batch.n_tokens = cur_length;
-            for (int32_t i = 0; i < cur_length; i++) {
-                batch.token[i]     = output_tokens[i];
-                batch.pos[i]       = i;
+            batch.n_tokens = batch_last - batch_first;
+            for (int32_t i = 0; i < batch.n_tokens; i++) {
+                batch.token[i]     = output_tokens[batch_first + i];
+                batch.pos[i]       = batch_first + i;
                 batch.n_seq_id[i]  = 1;
                 batch.seq_id[i][0] = 0;
                 batch.logits[i]    = 1;
@@ -428,27 +490,39 @@ void diffusion_generate(llama_context *          ctx,
 
             n_steps_done++;
 
+            if (kv_on) {
+                if (kv_warm_needed) {
+                    kv_warm_needed      = false;  // the store is fresh
+                    kv_steps_since_warm = 0;
+                } else {
+                    kv_steps_since_warm++;
+                }
+            }
+
             if (params.self_conditioning) {
                 std::memcpy(sc_buffer.data(), logits + (size_t) n_input * n_vocab,
                             (size_t) sc_canvas * n_vocab * sizeof(float));
             }
 
-            auto get_logits_for_pos = [&](int32_t pos) -> const float * {
-                if (params.shift_logits) {
-                    return pos == 0 ? logits : logits + (pos - 1) * n_vocab;
-                }
-                return logits + pos * n_vocab;
+            // batch index whose output row predicts the token at pos (batch_first > 0 in
+            // Layer A cached phases; the batch then starts at that absolute position)
+            auto get_row_for_pos = [&](int32_t pos) -> int32_t {
+                return (params.shift_logits ? std::max(pos - 1, 0) : pos) - batch_first;
             };
 
-            // batch index whose output row predicts the token at pos
-            auto get_row_for_pos = [&](int32_t pos) -> int32_t {
-                return params.shift_logits ? std::max(pos - 1, 0) : pos;
+            auto get_logits_for_pos = [&](int32_t pos) -> const float * {
+                return logits + (size_t) get_row_for_pos(pos) * n_vocab;
             };
 
             int64_t time_start_sampling = ggml_time_us();
 
             mask_positions.clear();
-            for (int32_t i = 0; i < cur_length; i++) {
+            // prefix mode decodes the WHOLE suffix - commit anywhere in it (restricting
+            // commits to the block inflated 15-step runs to the 128-step cap); dual mode
+            // only has logits for the block rows
+            const int32_t scan_lo = kv_on ? kv_s : 0;
+            const int32_t scan_hi = (kv_on && kv_dual) ? kv_e : cur_length;
+            for (int32_t i = scan_lo; i < scan_hi; i++) {
                 if (output_tokens[i] == params.mask_token_id) {
                     // For block-based, only consider current block
                     if (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || (i >= block_start && i < block_end)) {
@@ -595,12 +669,27 @@ void diffusion_generate(llama_context *          ctx,
                     size_t  best        = 0;
                     int32_t n_committed = 0;
 
+                    // Layer A EOG quarantine: stale cached K/V systematically INFLATE
+                    // end-token confidence (low-information context -> EOT pathology) -
+                    // observed as truncated outputs. Cached steps may commit text freely
+                    // but never EOG; warm steps (exact full forwards, every kv_rewarm
+                    // steps) confirm the real end. Text speed kept, endings exact.
+                    const llama_vocab * cvocab = llama_model_get_vocab(model);
+                    const bool kv_eog_allowed  = !kv_on || kv_steps_since_warm == 0;
+                    auto eog_blocked = [&](llama_token t) {
+                        return !kv_eog_allowed &&
+                               (llama_vocab_is_eog(cvocab, t) || t == llama_vocab_pad(cvocab));
+                    };
+
                     for (size_t i = 0; i < confidences.size(); i++) {
                         if (confidences[i].first > confidences[best].first) {
                             best = i;
                         }
                         if (confidences[i].first >= params.conf_threshold) {
                             const int32_t mask_idx = confidences[i].second;
+                            if (eog_blocked(sampled_tokens[mask_idx])) {
+                                continue;
+                            }
                             output_tokens[mask_positions[mask_idx]] = sampled_tokens[mask_idx];
                             if (params.output_confidences) {
                                 params.output_confidences[mask_positions[mask_idx]] = confidences[i].first;
@@ -611,9 +700,16 @@ void diffusion_generate(llama_context *          ctx,
 
                     if (n_committed == 0) {
                         const int32_t mask_idx = confidences[best].second;
-                        output_tokens[mask_positions[mask_idx]] = sampled_tokens[mask_idx];
-                        if (params.output_confidences) {
-                            params.output_confidences[mask_positions[mask_idx]] = confidences[best].first;
+                        if (!eog_blocked(sampled_tokens[mask_idx])) {
+                            output_tokens[mask_positions[mask_idx]] = sampled_tokens[mask_idx];
+                            if (params.output_confidences) {
+                                params.output_confidences[mask_positions[mask_idx]] = confidences[best].first;
+                            }
+                        } else {
+                            // a cached step wants to commit ONLY end tokens: the answer is
+                            // likely complete - verify with an exact warm forward NOW
+                            // instead of idling until the next scheduled re-warm
+                            kv_warm_needed = true;
                         }
                     }
 
@@ -626,7 +722,10 @@ void diffusion_generate(llama_context *          ctx,
                         // a contiguous committed-EOT SUFFIX is the normal end of a short
                         // answer - only end tokens scattered through the non-tail region
                         // signal degeneracy
-                        int32_t tail_start = params.max_length;
+                        // in Layer A block mode positions beyond kv_e are masked BY DESIGN -
+                        // the guard must only judge the decoded region [n_input, kv_e)
+                        const int32_t guard_end = kv_on ? kv_e : params.max_length;
+                        int32_t tail_start = guard_end;
                         while (tail_start > n_input) {
                             const llama_token t = output_tokens[tail_start - 1];
                             if (t != params.mask_token_id &&
@@ -664,8 +763,21 @@ void diffusion_generate(llama_context *          ctx,
                         }
 
                         // EOT-tail shrink (see cur_length above); positions >= tail are
-                        // committed end tokens, so no mask can be beyond the new bound
-                        if (params.cfg_scale <= 0.0f) {
+                        // committed end tokens, so no mask can be beyond the new bound.
+                        // Layer A composition: prefix mode shrinks freely (the cached prefix
+                        // [0..P) is untouched by a suffix-end change; the graph just rebuilds
+                        // once); dual mode shrinks only when the block is clean (the next step
+                        // re-warms, refreshing the store at the new geometry)
+                        bool kv_allow_shrink = true;
+                        if (kv_on && kv_dual) {
+                            for (int32_t i = kv_s; i < kv_e; i++) {
+                                if (output_tokens[i] == params.mask_token_id) {
+                                    kv_allow_shrink = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (params.cfg_scale <= 0.0f && kv_allow_shrink) {
                             int32_t tail = cur_length;
                             while (tail > n_input) {
                                 const llama_token t = output_tokens[tail - 1];
@@ -681,6 +793,40 @@ void diffusion_generate(llama_context *          ctx,
                             // batch past its allocation (heap overflow, crashed the server)
                             cur_length = std::min(params.max_length,
                                                   std::max(n_input + 1, std::min(cur_length, tail + 4)));
+                        }
+
+                        // Layer A EOS early-exit (catalog C2, REQUIRED for block mode): a fully
+                        // committed block ending in an EOG run means the answer is complete -
+                        // filling the remaining blocks deterministically saves one warm forward
+                        // PER REMAINING BLOCK (a short answer on a long canvas would otherwise
+                        // EOT-fill block by block)
+                        if (kv_on) {
+                            bool block_done = true;
+                            for (int32_t i = kv_s; i < kv_e; i++) {
+                                if (output_tokens[i] == params.mask_token_id) {
+                                    block_done = false;
+                                    break;
+                                }
+                            }
+                            if (block_done && kv_e < cur_length) {
+                                int32_t     run = 0;
+                                llama_token eog_tok = LLAMA_TOKEN_NULL;
+                                for (int32_t i = kv_e - 1; i >= kv_s; i--) {
+                                    const llama_token t = output_tokens[i];
+                                    if (llama_vocab_is_eog(gvocab, t) || t == llama_vocab_pad(gvocab)) {
+                                        run++;
+                                        eog_tok = t;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if (run >= 2) {
+                                    for (int32_t i = kv_e; i < params.max_length; i++) {
+                                        output_tokens[i] = eog_tok;
+                                    }
+                                    break;  // generation complete
+                                }
+                            }
                         }
                     }
                 } else {
@@ -742,6 +888,10 @@ void diffusion_generate(llama_context *          ctx,
             int64_t time_end_sampling = ggml_time_us();
             total_sampling_time += time_end_sampling - time_start_sampling;
         }
+    }
+
+    if (kv_on) {
+        llama_diffusion_set_phase(sc_model, /*UNIFIED*/0, 0);  // restore for later requests
     }
 
     int64_t time_end = ggml_time_us();

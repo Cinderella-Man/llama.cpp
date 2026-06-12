@@ -121,6 +121,8 @@ static diffusion_params make_masked_params(const server_state & st, const json &
     dp.cfg_scale        = req.value("cfg_scale",      p.diffusion.cfg_scale);
     dp.alg_temp         = req.value("alg_temp",       p.diffusion.alg_temp);
     dp.conf_threshold   = req.value("conf_threshold", p.diffusion.conf_threshold);
+    dp.kv_prefix        = req.value("kv_prefix",      p.diffusion.kv_prefix);
+    dp.kv_block         = req.value("kv_block",       p.diffusion.kv_block);
     dp.backend_sampling = req.value("backend_sampling", p.sampling.backend_sampling);
 
     const float   eps          = req.value("eps",          p.diffusion.eps);

@@ -54,6 +54,12 @@ struct diffusion_params {
 
     float   conf_threshold   = 0.0f;   // Commit all tokens with confidence >= threshold per step (0 = use the transfer schedule)
 
+    int32_t kv_prefix        = 0;      // Layer A prefix cache: block size (0 = off). Per block: one full
+                                       // warm forward, then suffix-only steps vs the cached prefix.
+    int32_t kv_block         = 0;      // Layer A dual cache: block size (0 = off). Per block: one full
+                                       // warm forward, then block-only steps vs the frozen full canvas.
+                                       // Requires conf_threshold > 0, timestep schedule, no infill/cfg/sc.
+
     float * output_confidences = nullptr;  // [out, optional, size max_length] confidence at commit time per
                                            // position; -1 = prompt/uncommitted/ORIGIN (records no confidence)
 

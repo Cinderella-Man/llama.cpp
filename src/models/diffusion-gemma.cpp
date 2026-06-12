@@ -1,4 +1,5 @@
 #include "models.h"
+#include "diffusion-common.h"
 #include "gemma4-common.h"
 
 #include <algorithm>
@@ -105,62 +106,6 @@ public:
     const float * src;
     int64_t       n_vocab;
     int64_t       C;
-};
-
-// Decode-phase mask (prompt-KV caching): canvas queries over [cached prompt (first P) | fresh canvas
-// (last C)], rectangular [P+C, C]. Global sees all prompt; sliding the last (n_swa-1) prompt.
-class llm_graph_input_attn_diffusion_decode : public llm_graph_input_attn_no_cache {
-public:
-    llm_graph_input_attn_diffusion_decode(const llama_hparams & hparams, const llama_cparams & cparams,
-                                          int64_t n_prompt, int64_t n_canvas) :
-        llm_graph_input_attn_no_cache(hparams, cparams), n_prompt(n_prompt), n_canvas(n_canvas) {}
-    ~llm_graph_input_attn_diffusion_decode() = default;
-
-    void set_input(const llama_ubatch * /*ubatch*/) override {
-        const int64_t P    = n_prompt;
-        const int64_t C    = n_canvas;
-        const int64_t n_kv = P + C;
-        const int64_t canvas_prompt_lo = P - (int64_t) hparams.n_swa + 1;
-
-        const auto fill = [&](auto * data, bool swa) {
-            using T = std::remove_reference_t<decltype(*data)>;
-            std::fill(data, data + n_kv * C, llama_cast<T>(-INFINITY));
-            for (int64_t q = 0; q < C; ++q) {            // canvas query (position P+q)
-                const uint64_t row = q * n_kv;
-                for (int64_t k = 0; k < n_kv; ++k) {     // key: k<P prompt (pos k), else canvas
-                    bool allow;
-                    if (k < P) {
-                        allow = swa ? (k >= canvas_prompt_lo) : true;
-                    } else {
-                        allow = true;                     // bidirectional over the canvas
-                    }
-                    if (allow) {
-                        data[row + k] = llama_cast<T>(0.0f);
-                    }
-                }
-            }
-        };
-
-        GGML_ASSERT(self_kq_mask && ggml_backend_buffer_is_host(self_kq_mask->buffer));
-        if (self_kq_mask->type == GGML_TYPE_F16) {
-            fill((ggml_fp16_t *) self_kq_mask->data, false);
-        } else {
-            fill((float *) self_kq_mask->data, false);
-        }
-        if (self_kq_mask_swa) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
-            if (self_kq_mask_swa->type == GGML_TYPE_F16) {
-                fill((ggml_fp16_t *) self_kq_mask_swa->data, true);
-            } else {
-                fill((float *) self_kq_mask_swa->data, true);
-            }
-        }
-    }
-
-    bool can_reuse(const llm_graph_params & /*params*/) override { return false; }
-
-    int64_t n_prompt;
-    int64_t n_canvas;
 };
 
 void llama_model_diffusion_gemma::load_arch_hparams(llama_model_loader & ml) {
@@ -669,14 +614,50 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
 // Public API: select the prompt-KV-caching phase for the next llama_decode (no-op otherwise). UNIFIED =
 // no-cache forward; PREFILL writes the prompt K,V store (P = prompt length); DECODE reads it.
 void llama_diffusion_set_phase(struct llama_model * model, int phase, int32_t P) {
-    auto * dm = dynamic_cast<llama_model_diffusion_gemma *>(model);
-    if (!dm) {
+    if (auto * dm = dynamic_cast<llama_model_diffusion_gemma *>(model)) {
+        dm->pkv_phase = (llama_model_diffusion_gemma::pkv_phase_t) phase;
+        dm->pkv_P     = P;
+        if (phase != llama_model_diffusion_gemma::PKV_UNIFIED && P > 0) {
+            dg_ensure_pkv_store(*dm, P);
+        }
         return;
     }
-    dm->pkv_phase = (llama_model_diffusion_gemma::pkv_phase_t) phase;
-    dm->pkv_P     = P;
-    if (phase != llama_model_diffusion_gemma::PKV_UNIFIED && P > 0) {
-        dg_ensure_pkv_store(*dm, P);
+    // masked dLLMs (Layer A): shared pkv state; the store must cover max(P, L)
+    llama_diffusion_pkv * pkv = nullptr;
+    const llama_model_base * base = nullptr;
+    if (auto * dr = dynamic_cast<llama_model_dream *>(model)) {
+        pkv = &dr->pkv; base = dr;
+    } else if (auto * ll = dynamic_cast<llama_model_llada *>(model)) {
+        pkv = &ll->pkv; base = ll;
+    }
+    if (!pkv) {
+        return;
+    }
+    pkv->phase = phase;
+    pkv->P     = P;
+    const int64_t need = std::max<int64_t>(P, pkv->L);
+    if (phase != llama_diffusion_pkv::UNIFIED && need > 0) {
+        llama_diffusion_pkv_ensure_store(*base, *pkv, need);
+    }
+}
+
+// Layer A BLOCK phase geometry: s = block start row, L = full canvas length (store rows).
+// No-op for models without the shared pkv state (DiffusionGemma uses set_phase only).
+void llama_diffusion_set_block(struct llama_model * model, int32_t s, int32_t L) {
+    llama_diffusion_pkv * pkv = nullptr;
+    const llama_model_base * base = nullptr;
+    if (auto * dr = dynamic_cast<llama_model_dream *>(model)) {
+        pkv = &dr->pkv; base = dr;
+    } else if (auto * ll = dynamic_cast<llama_model_llada *>(model)) {
+        pkv = &ll->pkv; base = ll;
+    }
+    if (!pkv) {
+        return;
+    }
+    pkv->s = s;
+    pkv->L = L;
+    if (L > 0) {
+        llama_diffusion_pkv_ensure_store(*base, *pkv, L);
     }
 }
 

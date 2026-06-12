@@ -3925,6 +3925,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.diffusion.conf_threshold = std::stof(value); }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-kv-prefix"}, "N",
+        string_format("masked-dLLM prefix KV cache block size (0 = off) (default: %d)", params.diffusion.kv_prefix),
+        [](common_params & params, int value) { params.diffusion.kv_prefix = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-kv-block"}, "N",
+        string_format("masked-dLLM dual KV cache block size (0 = off; subsumes kv-prefix) (default: %d)", params.diffusion.kv_block),
+        [](common_params & params, int value) { params.diffusion.kv_block = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-replicas"}, "N",
         string_format("diffusion-server: model replicas in one process, one per GPU (0 = one per GPU device) (default: %d)", params.diffusion.replicas),
         [](common_params & params, int value) { params.diffusion.replicas = value; }

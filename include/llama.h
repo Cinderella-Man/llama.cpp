@@ -576,6 +576,15 @@ extern "C" {
                            int   phase,
                        int32_t   P);
 
+    // Masked-dLLM cached decoding (Dream/LLaDA, docs/dllms/throughput-plans/01_layer_a.md):
+    // set the BLOCK-phase geometry for the next llama_decode (s = block start row, L = full
+    // canvas length). Phases via llama_diffusion_set_phase: 0=UNIFIED 1=WARM 2=DECODE 3=BLOCK.
+    // No-op for other models.
+    LLAMA_API void llama_diffusion_set_block(
+            struct llama_model * model,
+                       int32_t   s,
+                       int32_t   L);
+
     // DiffusionGemma debug-only (DG_DUMP_KV_LAYER): read back a layer's captured prompt Kcur/Vcur. dims
     // returns the [n_embd_head, n_head_kv, P] shape (zeros if none); get copies the F32 K and V out.
     LLAMA_API void llama_diffusion_dbg_kv_dims(const struct llama_model * model,

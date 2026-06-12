@@ -272,6 +272,8 @@ int main(int argc, char ** argv) {
     diff_params.backend_sampling = params.sampling.backend_sampling;
     diff_params.infill           = params.diffusion.infill;
     diff_params.conf_threshold   = params.diffusion.conf_threshold;
+    diff_params.kv_prefix        = params.diffusion.kv_prefix;
+    diff_params.kv_block         = params.diffusion.kv_block;
 
     callback_data cb_data               = { &diff_params, vocab, 0, params.diffusion.visual_progress,
                                             std::max(1, params.diffusion.visual_interval), 0, 0, 24, 80, 0 };

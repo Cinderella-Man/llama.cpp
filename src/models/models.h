@@ -450,10 +450,35 @@ struct llama_model_qwen2 : public llama_model_base {
 };
 
 
+// Cached diffusion decoding state for masked dLLMs (docs/dllms/throughput-plans/01_layer_a.md):
+// a model-owned per-layer K/V store written/read by phase-dependent graphs. Set via
+// llama_diffusion_set_phase / llama_diffusion_set_block before llama_decode. Phases:
+//   0 UNIFIED - no cache, square attention over the whole batch (default; today's behavior)
+//   1 WARM    - full-canvas forward that ALSO writes the first P rows of K/V into the store
+//               (P == n_tokens reproduces DiffusionGemma's PREFILL)
+//   2 DECODE  - batch is the canvas/suffix; attention over [store(0..P) | fresh batch K/V]
+//   3 BLOCK   - batch is one block at row offset s of an L-row canvas; attention over the
+//               3-way concat [store(0..s) | fresh batch | store(s+C..L)]; the batch rows are
+//               also written into the store for the next step (dual cache)
+struct llama_diffusion_pkv {
+    enum phase_t { UNIFIED = 0, WARM = 1, DECODE = 2, BLOCK = 3 };
+    mutable int     phase = UNIFIED;
+    mutable int64_t P     = 0;   // cached prefix length (WARM: rows to store)
+    mutable int64_t L     = 0;   // full canvas length (BLOCK)
+    mutable int64_t s     = 0;   // block start row (BLOCK)
+    mutable int64_t cap   = 0;   // allocated store capacity (grow-only)
+    mutable std::vector<ggml_tensor *> k;  // per layer [n_embd_head_k(il), n_head_kv(il), cap]
+    mutable std::vector<ggml_tensor *> v;
+    mutable ggml_context        * ctx = nullptr;
+    mutable ggml_backend_buffer_t buf = nullptr;
+};
+
 struct llama_model_dream : public llama_model_base {
     llama_model_dream(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    mutable llama_diffusion_pkv pkv;  // cached diffusion decoding (Layer A)
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -467,6 +492,8 @@ struct llama_model_llada : public llama_model_base {
     llama_model_llada(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    mutable llama_diffusion_pkv pkv;  // cached diffusion decoding (Layer A)
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
