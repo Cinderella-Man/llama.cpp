@@ -49,7 +49,8 @@ default:
 
 Fast-dLLM v2 (block-AR family, e.g. the 1.5B at 986 MB Q4_K_M) is also served -
 it out-drafts Dream-7B on code at ~3x the speed (add `--diffusion-block-kv` for
-flat ~10 ms steps), BUT block-causal attention cannot see text after a hole:
+flat ~10 ms steps; GPU sampling is on by default and takes them to ~8.4 ms /
+191 tok/s raw), BUT block-causal attention cannot see text after a hole:
 infill/`heal` is structurally unsupported, so recovery is whole-draft retry only.
 Use `conf_threshold` 0.9 with it (0.6 is Dream's scale and corrupts block-AR
 output - thresholds are model-scale-specific).
@@ -150,7 +151,8 @@ through it. Design + empirical calibration: ../docs/dllms/dllm-elixir-harness-me
 
 Profiles (see `@profiles` in bench/bench.exs for the full, current set): `baseline`,
 `kvpfx32`, `ec05`, `remask03`, `win64`, `grow`, `big384`, `mh2`, `winroute`,
-`fastdllm` (block-AR, threshold 0.9), `d4` (two-engine hybrid; pass the draft
+`fastdllm` (block-AR, threshold 0.9), `e3kv`/`e4bs`/`e5*` (block-AR kv + GPU-sampling
+A/B family, see 05_layer_e.md), `d4` (two-engine hybrid; pass the draft
 server as DRAFT_URL). The C5 slim/mid profiles were removed from the runnable set -
 read 03_layer_c.md before considering re-adding them.
 

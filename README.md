@@ -90,10 +90,26 @@ Features added here:
   growing uncached): 2.2-3.9x wall, 132-156 tok/s raw engine throughput. Logit-equivalence
   verified against the square path (within the model's own batch-shape numerics envelope;
   `PROBE_KV=1 llama-diffusion-batch-probe` re-runs the proof).
+- **Backend (GPU) sampling for block-AR decode** (default on; `--no-backend-sampling`) -
+  a `top_k -> dist` chain (no temp/top_p samplers) delivers PLAIN softmax probs over the
+  top-K candidates per row; the host replicates the reference nucleus sampling over those
+  K, so the commit confidence is the plain prob by construction and the per-step
+  full-vocab logits D2H disappears. Temp-0 outputs byte-identical to CPU sampling;
+  10.2 -> 8.4 ms/step, 191 tok/s raw, +~40% bench deliverable
+  (`docs/dllms/throughput-plans/05_layer_e.md` E4). Commit-rate levers beyond this
+  (sub-block width, threshold, entropy-budget committer `block_eb`) are measured and
+  documented as NOT adopted - 1.85 commits/step is the model's honest rate (E5).
 - **`llama-diffusion-batch-probe`** - a seven-probe measurement tool for speculative/batched
   decode economics (cross-sequence isolation, batch-shape numerics envelopes, kv row
   scaling, commit-rate and chain-acceptance statistics). The data behind parking the
   speculative-decoding layer: `docs/dllms/throughput-plans/04_layer_d.md`.
+- **`llama-oracle-probe` / `llama-dflash`** - DFlash-style pairing measurement tools
+  (FastDLLM-1.5B drafts, Qwen2.5-7B-Instruct greedily verifies; shared tokenizer, drafts
+  cross as tokens). The oracle probe scores per-block acceptance of saved drafts;
+  llama-dflash runs the real closed-loop speculative pairing with a same-process AR
+  baseline. Verdict (`07_layer_f.md`): closed-loop acceptance is 5.7 tokens/round -
+  off-the-shelf pairing loses to plain AR (54.8 tok/s) on this hardware; parked pending
+  a trained drafter.
 - Smaller fixes: `--diffusion-cfg-scale`/`--diffusion-alg-temp` were parsed but never
   applied; `-bs/--backend-sampling` made negatable; two new multi-output backend-sampler
   tests.
