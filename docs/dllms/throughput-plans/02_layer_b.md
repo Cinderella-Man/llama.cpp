@@ -11,8 +11,8 @@ end-game savings from early-commit, plus a structural prize: SlowFast's span det
 is exactly the DYNAMIC BLOCK SIZING that Layer A's kv_block mode wants.
 
 All references read from CLONED SOURCE (same method as Layer A):
-/tmp/streaming-dllm (xiaoshideta/Streaming-dLLM), /tmp/slowfast
-(LiangrunFlora/Slow-Fast-Sampling), /tmp/remdm (kuleshov-group/remdm).
+/home/car/projects/dllm-references/streaming-dllm (xiaoshideta/Streaming-dLLM), /home/car/projects/dllm-references/slowfast
+(LiangrunFlora/Slow-Fast-Sampling), /home/car/projects/dllm-references/remdm (kuleshov-group/remdm).
 
 ## Reference algorithms as actually implemented
 

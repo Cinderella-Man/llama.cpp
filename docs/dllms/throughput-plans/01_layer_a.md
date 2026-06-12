@@ -7,9 +7,9 @@ read from this repo with file:line, model geometry read from the GGUF header. An
 implementer should need to discover NOTHING beyond this document.
 
 References on disk (clone again if gone):
-- /tmp/fast-dllm  = github.com/NVlabs/Fast-dLLM (read: v1/llada/generate.py,
+- /home/car/projects/dllm-references/fast-dllm  = github.com/NVlabs/Fast-dLLM (read: v1/llada/generate.py,
   v1/dream/model/generation_utils_block.py)
-- /tmp/dllm-cache = github.com/maomaocun/dLLM-cache (V-verify feature caching - Layer A2,
+- /home/car/projects/dllm-references/dllm-cache = github.com/maomaocun/dLLM-cache (V-verify feature caching - Layer A2,
   NOT covered by this guide; future work)
 
 ---
