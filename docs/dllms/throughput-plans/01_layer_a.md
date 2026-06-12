@@ -1,6 +1,7 @@
 # Layer A: step-to-step KV caching for masked dLLMs - IMPLEMENTATION GUIDE
 
-Status: verified design, not yet implemented. Everything below was checked first-hand:
+Status: IMPLEMENTED (commit 454b98de4) - prefix mode shipped, dual mode experimental.
+Section 13 is the implementation log: every discovery made while building, in detail. Everything below was checked first-hand:
 reference algorithms read from cloned source (NOT papers alone), every engine interface
 read from this repo with file:line, model geometry read from the GGUF header. An
 implementer should need to discover NOTHING beyond this document.
@@ -496,9 +497,121 @@ mutually exclusive - kv_block wins, log a warning if both set.
 - r2: corrected "Phase 1 exact" fallacy; added verified FA/mask, out_ids,
   cast/restore findings; code skeletons incl. the PKV_BLOCK view-aliasing hazard and
   its 3-way-concat resolution; catalog interaction map; literal validation commands.
-- r3 (this revision): FA + rectangular mask upgraded from by-construction to
+- r4: IMPLEMENTED. Section 13 added: reserve-graph crash, guard false-positive,
+  required EOS early-exit, the EOT-shrink benchmark trap, step-inflation vs
+  whole-suffix commits, K/V drift -> EOG quarantine + pressure warms, the
+  phase-marker reuse pattern, measured matrix, honest positioning.
+- r3: FA + rectangular mask upgraded from by-construction to
   EMPIRICALLY VERIFIED (DG cached decode executed under -fa on AND off); build_attn
   mask-consumption contract documented (the _cnv alias trap, per-layer is_swa
   selection, the mask/K n_kv invariant); sub-view-cpy precedent cited
   (diffusion-gemma.cpp:432-435); explicit global step-budget + remainder-block
   policy; catalog moved to docs/dllms/.
+
+
+## 13. IMPLEMENTATION LOG (r4, 2026-06-12) - what building it actually taught us
+
+Everything below was discovered by implementing and measuring; each item names the
+symptom, the root cause, and the fix as committed (454b98de4).
+
+### 13.1 Scheduler reserve graphs build under YOUR phase (crash #1)
+Symptom: GGML_ASSERT ggml.c:1751 (view bounds) at step 0.
+Cause: sched_reserve builds dummy graphs with n_tokens=1 AND n_tokens=n_ubatch - and it
+runs lazily at the FIRST decode (backend-sampler attach), i.e. AFTER set_phase(WARM).
+The warm branch's "first P rows of Kcur" view then slices a 1-row tensor with P=19.
+DG never hits this because its reserve happens at context init under UNIFIED.
+Fix: every phase must produce a buildable graph for ANY n_tokens - warm clamps its
+store write (Pw = min(P, n_tokens)); BLOCK falls back to a DECODE-shaped graph when
+s + n_tokens > L. RULE: model-state-driven graphs must be total functions of n_tokens.
+
+### 13.2 The degeneracy guard false-positives under block commits (silent abort)
+Symptom: kv runs ended after 1 step, "end tokens 19/19 committed, 275/294 still masked".
+Cause: with commits restricted near the current block, the model legitimately commits
+the EOT region inside block 1 (it knows the answer is short) - those EOTs are NOT a
+canvas-suffix, so the guard counted them as a scattered flood while counting the
+undecoded-by-design region beyond kv_e as "still masked".
+Fix: guard bounds become [n_input, kv_e) with the tail scanned from kv_e (the world
+ends at kv_e in block mode).
+
+### 13.3 EOS early-exit is REQUIRED, not optional (catalog C2 graduated)
+A short answer on a long canvas EOT-fills block after block, paying one warm forward
+per remaining block. Fix: when the current block is fully committed AND ends in a
+committed EOG run (>= 2), fill [kv_e, max_length) with that EOG deterministically and
+stop. Zero forwards for the entire tail.
+
+### 13.4 THE BENCHMARK TRAP: our own EOT-tail shrink is a competing canvas reducer
+Symptom: kv-prefix 167 ms/step vs baseline 42 ms/step at "the same" canvas.
+Investigation: nsys showed GPU busy only ~45 ms of the 167 (host-idle mystery), then
+per-step row logging (KVTIME) revealed the truth: the BASELINE was not running
+320-row steps at all - the EOT-tail shrink collapses it to ~40 rows after step 0 on
+short-answer prompts (320 -> 43 -> 41 -> ...). We had disabled shrink under kv mode,
+so the cache fought a strawman of itself. The cached steps were actually ~2x faster
+than EQUAL-SIZE uncached steps all along.
+Fix (composition, not competition): prefix mode shrinks freely (a suffix-end change
+does not touch the cached prefix [0..P); the graph rebuilds once per shape change);
+dual mode shrinks only when the block is clean (next step re-warms anyway).
+LESSON: before benchmarking a new optimization, list every EXISTING optimization that
+shapes the baseline's actual work - ours had quietly changed the game.
+
+### 13.5 Block-restricted commits fight whole-canvas threshold decoding (step inflation)
+Symptom: story generation 15 steps (baseline) -> 128-step cap (kv), 4x slower.
+Cause: our threshold decoder commits confident tokens ANYWHERE; restricting commits to
+the current block (the reference's policy) gates progress on the block's slowest token.
+The reference papers never see this because their baselines are 128-1024-step quota
+schedules - the 27x headlines are vs THAT, not vs whole-canvas threshold decoding.
+Fix for prefix mode: commit over the WHOLE decoded suffix (all suffix rows have logits)
+- block structure then only determines what gets cached, not what may commit. Surprise
+bonus: left-to-right prefix growth + whole-suffix commits = FEWER steps than baseline
+(9-10 vs 15 on the story; structured early commits seed later confidence).
+Dual mode cannot do this (only block rows have logits) - hence its experimental status:
+fastest on short answers (5 steps on the haiku), step-inflated on long free-form text.
+
+### 13.6 K/V drift is fast and shows up as EOT-flooding (quality regression + fix chain)
+Symptom: kv-prefix story truncated to "Once upon a time," (baseline: full sentence).
+Cause: the >0.94 cosine similarity is between ADJACENT steps; reusing the step-0
+snapshot (warmed on an ALL-MASK canvas) across 9 steps compounds drift - and the
+degradation mode is specifically INFLATED EOG CONFIDENCE (low-information context ->
+EOT pathology). The reference dodges it by completing blocks (and re-warming) quickly.
+Fix chain (all three needed, in order of discovery):
+ (a) scheduled re-warm every kv_rewarm steps - helped, insufficient alone;
+ (b) EOG QUARANTINE: cached steps may commit any TEXT token but never EOG/pad; only
+     warm steps (exact forwards) may end the answer. Output became byte-identical to
+     baseline on the test prompts;
+ (c) EOG PRESSURE: when a cached step would commit ONLY end tokens (quarantine blocked
+     everything incl. the best-fallback), the answer is probably done - force the next
+     step to warm NOW instead of idling to the next scheduled re-warm.
+With (b)+(c), kv_rewarm relaxed to 12 (warms are mostly pressure-driven).
+
+### 13.7 Graph-reuse correctness landmine + the phase-marker input pattern
+llama.cpp reuses the previous graph when shapes match and every input's can_reuse()
+agrees. Two hazards: (1) blanket can_reuse=false (the DG mask class default) forfeits
+reuse for every cached step - pure overhead; (2) worse, with no custom input at all,
+two DIFFERENT phases with the same batch shape would silently reuse each other's
+graphs - whose store-write views bake in the OLD P/s (consecutive warms of different
+blocks are shape-identical!). Fix: llm_graph_input_diffusion_phase, a zero-cost input
+added in EVERY phase whose can_reuse compares the model's live pkv state against the
+state the graph was built for. The mask class then allows reuse on matching width.
+
+### 13.8 Measured results (RTX 5070, Dream-7B Q4_K_M, threshold 0.6, seed-pinned)
+| case                                   | baseline      | kv-prefix 32     | kv-block 32 |
+| haiku (short, ub 320)                  | 335 ms / 8 st | 479 ms / 13 st   | 277 ms / 5 st |
+| story (medium, ub 512)                 | 1217 / 15     | 2492 / 28        | 128-step cap |
+| Elixir GenServer module (code, ub 512) | 22614 / 96    | **11517 / 58 (1.96x)** | n/a |
+| kintsugi bench aggregate               | 16.8 tok/s    | 9.1 (redraft-luck dominated; heal 148 tok/s, forge_short -32% wall) |
+Honest positioning: the cache wins where content is LONG and real (code - the mission
+workload); short chat answers are owned by EOT-shrink + early-exit; kv-block is
+fastest on short outputs but step-inflates long ones. Default recommendation:
+--diffusion-kv-prefix 32 for code generation; off for short-form; kv-block
+experimental pending a commit-policy redesign (lookahead window).
+Note the story/haiku regressions are STEP-COUNT effects (warm cadence + quarantine
+trading steps for exactness), not per-step cost - cached steps are ~2x cheaper than
+equal-size uncached ones throughout.
+
+### 13.9 Odds and ends
+- LLaDA: ported mechanically (same graph edits, no shift row); compiles; UNTESTED (no
+  LLaDA GGUF on disk) - run the gates before trusting.
+- DG regression: clean (858 ms/step canvas run, kv_cache mode intact).
+- 14/14 sampler tests CPU+GPU throughout; baseline path byte-identical (UNIFIED).
+- Methodology that found the bugs, in order of usefulness: per-step row+ms logging
+  (KVTIME pattern) > nsys kernel sums > GGML_SCHED_DEBUG (no output in release builds)
+  > theorizing. Instrument FIRST next time.
