@@ -181,3 +181,53 @@ shortcut needs this guard everywhere it exists.
 - B-4 (tail anchor): unchanged.
 - B-5 (remask): prerequisite verified (all-row sampling).
 - Bench infrastructure: hardened (the real win of this grilling).
+
+
+## EMPIRICAL GRILLING ROUND 2 (2026-06-12 afternoon): faithful B-1/B-2, three traps, real verdicts
+
+### The traps this round caught (each now has a guard rail)
+1. SILENT BUILD FAILURES: `grep -cE " error "` does not match gcc's "error:" - a failed
+   build masqueraded as success and a STALE binary (new-layout lib, old objects)
+   segfaulted in arg parsing, then later a stale SERVER silently ignored new request
+   params. Rule now: builds are judged by EXIT CODE only; flag changes are smoke-tested
+   with the flag before any measurement (the tell for the stale server: three "different"
+   configs returning byte-identical token totals).
+2. THE defmodulelerler RED HERRING: hours chased a "corruption" that was (a) reproduced
+   via a CLI command that DOUBLE-TEMPLATES the prompt and (b) actually seed-42's normal
+   ugly draft, repaired by the harness since the morning baselines. Rule: reproduce
+   server-path issues with the server, byte-identical request.
+3. THE GUARD FALSE-POSITIVE (real cause of the bench collapse): in-memory compiled
+   modules report :code.which == [] - so (a) purge_candidate_modules had NEVER purged
+   anything since kintsugi's first day, and (b) round-1's stdlib-redefinition guard
+   rejected every RE-compile of a candidate, killing all repair ladders: bench 33/45 ->
+   13/45 on the BASELINE profile. Fix: detect candidates via
+   module_info(:compile)[:source] (carries the marker filename); repeat-compile
+   regression test added. Probes: first/second/third compile :ok/:ok/:ok, defmodule
+   List still rejected. Bench restored to 33/45 VERDICT OK.
+4. INSTRUMENT GAP: Credence (path dep) had moved 5 commits mid-day and the bench header
+   recorded only the llama.cpp rev - verdicts were not attributable. Header now records
+   credence_rev + credence_dirty. (Credence itself was exonerated: identical 33/45 at
+   its new tip once the guard was fixed.)
+
+### REAL B-1/B-2 verdicts (correct binary, fixed guard, fresh baseline)
+- Block-scoped tau (tau_alpha 0.6): code KPI 63.7 s vs 73.8 s multi-seed (-14%) BUT
+  bench REGRESSION: p_max 3/3 + p_sum 3/3 lost (27/45). On small canvases the 32-token
+  window covers most of the active region - effectively global decay again. Same
+  content-length split as Layer A: helps long, hurts short.
+- Prophet early-commit (0.5): bench REGRESSION on p_sum 3/3 (30/45) - commits a
+  confidently-wrong draft the ladder cannot save. BUT: infill tier -35% wall at 6/6
+  passes - PROPHET IS A REPAIR-PATH WIN. Action: kintsugi should set early_commit on
+  REPAIR/infill requests only (they are short, hole-bounded, and verified afterwards);
+  drafts keep it off.
+- Both flags ship DEFAULT OFF. Status: B-1 = available, content-gated like kv flags;
+  B-2 = adopt for infill in kintsugi (follow-up), off for drafts.
+- BENCH GAP exposed: no passing-tier LONG-form case exists, so long-code quality under
+  these flags is unverifiable by the bench (the C tier fails at baseline too). Before
+  any code-targeted schedule flag is blessed, the bench needs a long-form case the
+  models can pass (e.g. multi-clause but single-function). Added to the bench backlog.
+
+### Where Layer B stands after two grilling rounds
+B-1 implemented (block-scoped, floored, off); B-2 implemented (off; repair-path
+candidate); B-3 span-sizing and B-4 tail anchor remain to implement with the same
+gates; B-5 remask unchanged. The instrument survived two self-inflicted wounds and is
+sharper for it: exit-code builds, dependency revs in headers, repeat-compile tests.

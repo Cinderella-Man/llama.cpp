@@ -318,6 +318,15 @@ void diffusion_generate(llama_context *          ctx,
     // with conf_threshold the schedule finishes early - count the steps actually run
     int32_t n_steps_done = 0;
 
+    auto confidences_abs_for = [](size_t mask_idx, const std::vector<std::pair<float, int32_t>> & confs) -> float {
+        for (const auto & c : confs) {
+            if ((size_t) c.second == mask_idx) {
+                return c.first;
+            }
+        }
+        return -1.0f;
+    };
+
     // Layer A cached decoding (docs/dllms/throughput-plans/01_layer_a.md): per kv-block, one
     // full WARM forward snapshots prefix (or full-canvas) K/V, then steps decode only the
     // suffix (prefix cache) or the block (dual cache) against the store.
@@ -685,18 +694,29 @@ void diffusion_generate(llama_context *          ctx,
                     size_t  best        = 0;
                     int32_t n_committed = 0;
 
-                    // Layer B1 adaptive threshold (Streaming-dLLM context_aware_threshold):
-                    // decay tau as masks deplete. r_mask denominator = GENERATION region of
-                    // the active window (NOT the scan width - non-kv scan includes the
-                    // prompt, which would deflate r_mask and over-decay tau at the start)
-                    float tau_eff = params.conf_threshold;
-                    if (params.tau_alpha > 0.0f) {
-                        const int32_t region_lo = kv_on ? kv_s : n_input;
-                        const int32_t region_hi = kv_on ? std::min(batch_last, cur_length) : cur_length;
-                        const float   r_mask    = region_hi > region_lo
-                            ? (float) mask_positions.size() / (float) (region_hi - region_lo)
-                            : 1.0f;
-                        tau_eff = params.conf_threshold * (1.0f - params.tau_alpha * (1.0f - r_mask));
+                    // Layer B1 adaptive threshold, BLOCK-SCOPED (refuted lesson: global
+                    // decay collapses quality - bench 13/45; the reference decays within a
+                    // 32-token block that RESETS). Two zones: positions inside the active
+                    // window [w_lo, w_hi) get the decayed tau; everything beyond keeps the
+                    // base threshold. The window tracks the FIRST remaining mask.
+                    float   tau_window = params.conf_threshold;
+                    int32_t tau_w_hi   = INT32_MAX;
+                    if (params.tau_alpha > 0.0f && !mask_positions.empty()) {
+                        const int32_t w_lo = kv_on ? kv_s : mask_positions.front();
+                        const int32_t w_hi = kv_on ? std::min(batch_last, cur_length)
+                                                   : std::min(w_lo + 32, cur_length);
+                        int32_t masks_in_w = 0;
+                        for (int32_t mp : mask_positions) {
+                            if (mp >= w_lo && mp < w_hi) {
+                                masks_in_w++;
+                            }
+                        }
+                        const float r_mask = w_hi > w_lo ? (float) masks_in_w / (float) (w_hi - w_lo) : 1.0f;
+                        tau_window = params.conf_threshold * (1.0f - params.tau_alpha * (1.0f - r_mask));
+                        if (params.tau_floor > 0.0f) {
+                            tau_window = std::max(tau_window, params.tau_floor);
+                        }
+                        tau_w_hi = w_hi;
                     }
 
                     // Layer A EOG quarantine: stale cached K/V systematically INFLATE
@@ -715,7 +735,10 @@ void diffusion_generate(llama_context *          ctx,
                         if (confidences[i].first > confidences[best].first) {
                             best = i;
                         }
-                        if (confidences[i].first >= tau_eff) {
+                        const float tau_for_pos =
+                            mask_positions[confidences[i].second] < tau_w_hi ? tau_window
+                                                                             : params.conf_threshold;
+                        if (confidences[i].first >= tau_for_pos) {
                             const int32_t mask_idx = confidences[i].second;
                             if (eog_blocked(sampled_tokens[mask_idx])) {
                                 continue;
@@ -742,6 +765,40 @@ void diffusion_generate(llama_context *          ctx,
                             // likely complete - verify with an exact warm forward NOW
                             // instead of idling until the next scheduled re-warm
                             kv_warm_needed = true;
+                        }
+                    }
+
+                    // Layer B2 (Prophet, arXiv:2508.19982): when every remaining masked
+                    // position's top1-top2 prob gap clears the bar, the outcome is already
+                    // decided - commit everything and finish. Exact steps only (cached
+                    // steps route through a warm so drift never finalizes the canvas).
+                    if (params.early_commit > 0.0f && use_backend &&
+                            (!kv_on || kv_steps_since_warm == 0)) {
+                        float min_gap = 1.0f;
+                        for (int32_t pos : mask_positions) {
+                            if (output_tokens[pos] != params.mask_token_id) {
+                                continue;  // committed earlier in this very step
+                            }
+                            const int32_t row = get_row_for_pos(pos);
+                            const float * pr  = llama_get_sampled_probs_ith(ctx, row);
+                            const size_t  n   = llama_get_sampled_probs_count_ith(ctx, row);
+                            const float gap = (pr && n >= 2) ? pr[0] - pr[1] : 0.0f;
+                            min_gap = std::min(min_gap, gap);
+                            if (min_gap < params.early_commit) {
+                                break;
+                            }
+                        }
+                        if (min_gap >= params.early_commit) {
+                            for (size_t i = 0; i < mask_positions.size(); i++) {
+                                const int32_t pos = mask_positions[i];
+                                if (output_tokens[pos] == params.mask_token_id) {
+                                    output_tokens[pos] = sampled_tokens[i];
+                                    if (params.output_confidences) {
+                                        params.output_confidences[pos] = confidences_abs_for(i, confidences);
+                                    }
+                                }
+                            }
+                            break;  // generation complete
                         }
                     }
 

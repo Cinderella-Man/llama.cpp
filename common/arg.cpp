@@ -3955,6 +3955,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.diffusion.tau_alpha = std::stof(value); }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-tau-floor"}, "F",
+        string_format("lower bound for the decayed adaptive threshold (default: %.2f)", (double) params.diffusion.tau_floor),
+        [](common_params & params, const std::string & value) { params.diffusion.tau_floor = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-early-commit"}, "F",
+        string_format("Prophet early-commit: finish when every masked top1-top2 gap >= F (0 = off) (default: %.2f)", (double) params.diffusion.early_commit),
+        [](common_params & params, const std::string & value) { params.diffusion.early_commit = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-replicas"}, "N",
         string_format("diffusion-server: model replicas in one process, one per GPU (0 = one per GPU device) (default: %d)", params.diffusion.replicas),
         [](common_params & params, int value) { params.diffusion.replicas = value; }

@@ -43,6 +43,20 @@ defmodule KintsugiTest do
     end
   end
 
+  describe "Verifier.compile repeat + guard" do
+    test "recompiling the same candidate module succeeds (guard must not false-positive)" do
+      c = "defmodule RepeatGuardProbe do\n  def f, do: 1\nend"
+      assert :ok = Kintsugi.Verifier.compile(c)
+      assert :ok = Kintsugi.Verifier.compile(c)
+      assert :ok = Kintsugi.Verifier.compile(c)
+    end
+
+    test "redefining a loaded core module is rejected" do
+      assert {:error, [%{message: msg} | _]} = Kintsugi.Verifier.compile("defmodule List do\nend")
+      assert msg =~ "redefines"
+    end
+  end
+
   describe "Verifier.run" do
     test "runs a check in an isolated process" do
       code = "defmodule KintsugiRun do\n  def double(n), do: n * 2\nend"

@@ -63,9 +63,15 @@ struct diffusion_params {
     int32_t kv_rewarm        = 6;      // re-warm after this many cached steps (drift guard; swept 2026-06-12)
     int32_t kv_rewarm_commits = 0;     // re-warm after this many commits since last warm (0 = off;
                                        // drift tracks canvas CHANGES, not steps - often the better trigger)
-    float   tau_alpha        = 0.0f;   // Layer B1 adaptive threshold: tau_eff = conf_threshold *
-                                       // (1 - alpha*(1 - r_mask)), r_mask = remaining-mask fraction
-                                       // of the GENERATION region (0 = fixed threshold)
+    float   tau_alpha        = 0.0f;   // Layer B1 adaptive threshold, BLOCK-SCOPED (the reference
+                                       // semantics): tau decays only INSIDE a 32-token window from the
+                                       // first remaining mask; positions beyond keep conf_threshold.
+                                       // tau_eff = conf_threshold * (1 - alpha*(1 - r_mask_window)).
+                                       // Global decay was refuted by bench (13/45). 0 = fixed.
+    float   tau_floor        = 0.0f;   // absolute lower bound for the decayed tau (0 = none)
+    float   early_commit     = 0.0f;   // Layer B2 (Prophet): when EVERY remaining masked position has
+                                       // top1-top2 prob gap >= this, commit all and finish. Only fires
+                                       // on exact (uncached/warm) steps. 0 = off.
 
     int32_t kv_window        = 0;      // suffix lookahead window beyond the active block (0 = mode default:
                                        // prefix decodes the whole suffix, dual decodes the block only).

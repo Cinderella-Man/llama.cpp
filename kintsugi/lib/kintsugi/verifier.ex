@@ -61,11 +61,16 @@ defmodule Kintsugi.Verifier do
     end
   end
 
+  # in-memory modules report :code.which == [] - the compile-source path (which DOES
+  # carry our marker filename) lives in module_info(:compile). Discovered the hard way:
+  # the :code.which variant made the redefinition guard reject every RE-compile of a
+  # candidate (killing all repair ladders, bench 33/45 -> 13/45) and silently broke
+  # purge_candidate_modules since its beginning.
   defp candidate_module?(mod) do
-    case :code.which(mod) do
-      file when is_list(file) -> List.to_string(file) =~ "kintsugi_candidate"
-      _ -> false
-    end
+    src = mod.module_info(:compile)[:source]
+    is_list(src) and List.to_string(src) =~ "kintsugi_candidate"
+  rescue
+    _ -> false
   end
 
   defp do_compile_quoted(code) do
@@ -157,8 +162,7 @@ defmodule Kintsugi.Verifier do
   end
 
   defp purge_candidate_modules do
-    for {mod, file} <- :code.all_loaded(),
-        is_list(file) and List.to_string(file) =~ "kintsugi_candidate" do
+    for {mod, _file} <- :code.all_loaded(), candidate_module?(mod) do
       :code.purge(mod)
       :code.delete(mod)
     end

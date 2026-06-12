@@ -22,7 +22,9 @@ defmodule Kintsugi.Bench.Runner do
   @profiles %{
     "baseline" => %{},
     "kvpfx32" => %{"kv_prefix" => 32},
-    "tau03" => %{"tau_alpha" => 0.3}
+    "tau03" => %{"tau_alpha" => 0.3},
+    "taub06" => %{"tau_alpha" => 0.6},
+    "ec05" => %{"early_commit" => 0.5}
   }
 
   # full request params for infill cases - NO reliance on server defaults
@@ -103,6 +105,20 @@ defmodule Kintsugi.Bench.Runner do
       url: url,
       engine: Map.from_struct(eng),
       git_rev: git.(["rev-parse", "--short", "HEAD"]),
+      # the deterministic-fix layer is part of the measured system - a Credence change
+      # invalidated an afternoon of verdicts before this field existed
+      credence_rev:
+        (case System.cmd("git", ["-C", Path.expand("../../credence", __DIR__), "rev-parse", "--short", "HEAD"],
+               stderr_to_stdout: true) do
+           {out, 0} -> String.trim(out)
+           _ -> nil
+         end),
+      credence_dirty:
+        (case System.cmd("git", ["-C", Path.expand("../../credence", __DIR__), "status", "--porcelain"],
+               stderr_to_stdout: true) do
+           {out, 0} -> out != ""
+           _ -> nil
+         end),
       power_ac: Path.wildcard("/sys/class/power_supply/A*/online")
                 |> Enum.map(&String.trim(File.read!(&1)))
                 |> List.first(),
