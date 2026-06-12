@@ -64,14 +64,50 @@ Features added here:
   (entropy-bound canvas decoding, prefix-KV phases, conversion) and fixed `--cpu-moe`
   handling in the diffusion CLI so the 26B MoE runs in under 6 GB of VRAM with experts in
   system RAM.
+- **Masked-dLLM KV caching** (`--diffusion-kv-prefix N` / `--diffusion-kv-block N`,
+  `--diffusion-kv-rewarm`) - step-to-step K/V reuse for full-attention diffusion models
+  (Dream/LLaDA): a per-block warm forward snapshots the store, then steps decode only the
+  suffix (prefix mode) or the block (dual mode) against it, with drift-guarded re-warms.
+  Measured up to 3.08x on long code generation; content-gated (long-form wins, short
+  answers stay on the square path). Details: `docs/dllms/throughput-plans/01_layer_a.md`.
+- **Decode-schedule refinements** - Prophet-style early commit (`--diffusion-early-commit`,
+  +12% on repair workloads), remask self-correction safety net (`--diffusion-remask`),
+  suffix-window canvas pruning (`--diffusion-window`, up to 3.67x on long code), in-run
+  canvas growth (`--diffusion-gen-initial`), EOT-tail shrink and EOS early-exit defaults.
+  Each carries bench-gated verdicts in `docs/dllms/throughput-plans/02_layer_b.md` /
+  `03_layer_c.md` - several tempting variants are documented as REJECTED with the data.
+- **Fast-dLLM v2 support (block-AR diffusion family)** - new `fast-dllm` architecture
+  (Qwen2.5-lineage block-diffusion, arXiv:2509.26328): conversion, block-causal attention
+  graph, and a reference-faithful semi-autoregressive decode loop (32-token blocks,
+  8-token sub-blocks, seeded nucleus sampling, de-tempered commit confidence). Routed
+  automatically by arch in the CLI and server (`block_ar` in `/health`; infill is
+  structurally unsupported by block-causal attention and rejected explicitly). The 1.5B
+  model is 986 MB at Q4_K_M and out-drafts Dream-7B on code while running ~3x faster.
+- **Committed-block KV cache for block-AR models** (`--diffusion-block-kv`) - committed
+  blocks never change, so their K/V are cached exactly (no rewarm); each step forwards
+  only the active 32-token block and the block-finalize pass doubles as the next block's
+  AR step. Per-step cost goes FLAT (~10 ms at any length on an RTX 5070 laptop vs 27-43 ms
+  growing uncached): 2.2-3.9x wall, 132-156 tok/s raw engine throughput. Logit-equivalence
+  verified against the square path (within the model's own batch-shape numerics envelope;
+  `PROBE_KV=1 llama-diffusion-batch-probe` re-runs the proof).
+- **`llama-diffusion-batch-probe`** - a seven-probe measurement tool for speculative/batched
+  decode economics (cross-sequence isolation, batch-shape numerics envelopes, kv row
+  scaling, commit-rate and chain-acceptance statistics). The data behind parking the
+  speculative-decoding layer: `docs/dllms/throughput-plans/04_layer_d.md`.
 - Smaller fixes: `--diffusion-cfg-scale`/`--diffusion-alg-temp` were parsed but never
   applied; `-bs/--backend-sampling` made negatable; two new multi-output backend-sampler
   tests.
 
+The in-tree verify-and-repair harness that drives all of this end to end (draft ->
+compile -> masked repair -> verified code, plus the bench that gates every claim above)
+lives in [`kintsugi/`](kintsugi/README.md).
+
 Design notes, measurements and reimplementation-grade documentation:
 `docs/dllms/diffusion-gpu-sampling-plan.md`, `docs/dllms/dllm-engine-improvements.md`,
 `docs/dllms/dllm-elixir-harness.md`, `docs/dllms/diffusiongemma-support.md`,
-`docs/dllms/p106-mining-fleet.md`.
+`docs/dllms/diffusiongemma-speed-analysis.md`, `docs/dllms/p106-mining-fleet.md`, and the
+layer-by-layer optimization campaign (plans, measurements, verdicts - including the
+rejected branches) in `docs/dllms/throughput-plans/01_layer_a.md` ... `06_d4_hybrid.md`.
 
 Quick start (masked diffusion, GPU sampling + fast drafts):
 

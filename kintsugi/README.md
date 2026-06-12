@@ -47,6 +47,13 @@ default:
 `forge` works, `heal`/infill does not yet, and it needs ~20 GB host RAM with
 `--cpu-moe`.)
 
+Fast-dLLM v2 (block-AR family, e.g. the 1.5B at 986 MB Q4_K_M) is also served -
+it out-drafts Dream-7B on code at ~3x the speed (add `--diffusion-block-kv` for
+flat ~10 ms steps), BUT block-causal attention cannot see text after a hole:
+infill/`heal` is structurally unsupported, so recovery is whole-draft retry only.
+Use `conf_threshold` 0.9 with it (0.6 is Dream's scale and corrupts block-AR
+output - thresholds are model-scale-specific).
+
 ### 3. Start the engine
 
     ./build/bin/llama-diffusion-server \
@@ -104,6 +111,10 @@ Plumbing (public for direct use, e.g. healing human-written code):
 - `Kintsugi.forge(engine, instruction, opts)` - one draft + its repair loop.
 - `Kintsugi.verify(code, check)` - compile + optional functional check.
 - `Kintsugi.repair(engine, code, diagnostics, opts)` - one mask+infill round.
+- `Kintsugi.generate_hybrid(draft_engine, repair_engine, instruction, opts)` -
+  two-engine ladder (e.g. Fast-dLLM drafts + Dream repairs). Measured and
+  REJECTED as a default (same pass set as Dream-only at half the throughput,
+  see ../docs/dllms/throughput-plans/04_layer_d.md), kept for experiments.
 
 Compilation alone accepts semantically wrong code - pass `"check"` (assertions,
 e.g. `"9 = Mod.triple(3)"`) when correctness matters; generate/forge/heal all
@@ -113,6 +124,9 @@ Useful opts (string keys, passed through to the server): `"seed"`, `"steps"`,
 `"conf_threshold"`, `"temp"`, `"top_k"`, `"max_repairs"` (default 4), and
 `"check"` - a string of assertions like `"4 = Mod.f(2)"`, executed in an
 ISOLATED OS process with a timeout (generated code never runs in the harness VM).
+The kill is OS-level (`timeout -k`): a BEAM-side `Task.shutdown` alone orphans
+the child, and runaway generated code in orphans OOM-killed this machine twice
+before that was understood - do not "simplify" it away.
 
 ## Hard-won knowledge (details in ../docs/dllms/dllm-elixir-harness.md)
 
@@ -131,8 +145,14 @@ The bench is the project's measuring instrument - every optimization claim goes
 through it. Design + empirical calibration: ../docs/dllms/dllm-elixir-harness-measuring-updates.md.
 
     mix run bench/cases.exs          # self-test: every check vs its reference solution
-    mix run bench/bench.exs URL LABEL PROFILE   # profiles: baseline | kvpfx32
+    mix run bench/bench.exs URL LABEL PROFILE [DRAFT_URL]
     mix run bench/compare.exs old.jsonl new.jsonl   # gated diff, exit 1 on regression
+
+Profiles (see `@profiles` in bench/bench.exs for the full, current set): `baseline`,
+`kvpfx32`, `ec05`, `remask03`, `win64`, `grow`, `big384`, `mh2`, `winroute`,
+`fastdllm` (block-AR, threshold 0.9), `d4` (two-engine hybrid; pass the draft
+server as DRAFT_URL). The C5 slim/mid profiles were removed from the runnable set -
+read 03_layer_c.md before considering re-adding them.
 
 Rules (calibrated, not guessed):
 - AC power required (the runner refuses on battery; measured 5x skew).
@@ -141,3 +161,6 @@ Rules (calibrated, not guessed):
   only comparable within a process; cross-restart tails reach +138% on marginal cases).
 - Regression = pass lost in p/h/i tiers, or tier median wall +10%.
 - Baselines: bench/results/baselines/*.jsonl (committed; per-model).
+- ONE bench at a time, never concurrently. The runner protects the machine itself:
+  before every case it sweeps stray `kintsugi_run_` processes and ABORTS (exit 75,
+  partial results preserved) if available RAM drops under 4 GB.
