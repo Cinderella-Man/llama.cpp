@@ -281,6 +281,9 @@ int main(int argc, char ** argv) {
     diff_params.tau_floor        = params.diffusion.tau_floor;
     diff_params.early_commit     = params.diffusion.early_commit;
     diff_params.kv_span          = params.diffusion.kv_span;
+    diff_params.kv_anchor        = params.diffusion.kv_anchor;
+    diff_params.remask_margin    = params.diffusion.remask_margin;
+    diff_params.remask_budget    = params.diffusion.remask_budget;
 
     callback_data cb_data               = { &diff_params, vocab, 0, params.diffusion.visual_progress,
                                             std::max(1, params.diffusion.visual_interval), 0, 0, 24, 80, 0 };

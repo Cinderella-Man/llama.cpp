@@ -130,6 +130,9 @@ static diffusion_params make_masked_params(const server_state & st, const json &
     dp.tau_floor        = req.value("tau_floor",      p.diffusion.tau_floor);
     dp.early_commit     = req.value("early_commit",   p.diffusion.early_commit);
     dp.kv_span          = req.value("kv_span",        p.diffusion.kv_span);
+    dp.kv_anchor        = req.value("kv_anchor",      p.diffusion.kv_anchor);
+    dp.remask_margin    = req.value("remask_margin",  p.diffusion.remask_margin);
+    dp.remask_budget    = req.value("remask_budget",  p.diffusion.remask_budget);
     dp.backend_sampling = req.value("backend_sampling", p.sampling.backend_sampling);
 
     const float   eps          = req.value("eps",          p.diffusion.eps);

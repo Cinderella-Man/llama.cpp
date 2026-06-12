@@ -73,10 +73,20 @@ struct diffusion_params {
                                        // steps, the next block extends over the contiguous
                                        // confident span (confidence >= kv_span) from the block
                                        // start, clamped to [8, 64]. Requires kv_block. 0 = fixed.
+    float   remask_margin    = 0.0f;   // Layer B5 (ReMDM-inspired): on exact steps, a previously
+                                       // committed token whose row now prefers a DIFFERENT token by
+                                       // this prob margin gets re-masked (budget-capped). 0 = off.
+    int32_t remask_budget    = 2;      // max remasks per step (total per run capped at 16)
+
     float   early_commit     = 0.0f;   // Layer B2 (Prophet): when EVERY remaining masked position has
                                        // top1-top2 prob gap >= this, commit all and finish. Only fires
                                        // on exact (uncached/warm) steps. 0 = off.
 
+    int32_t kv_anchor        = 3;      // Layer B4: with kv_window in PREFIX mode, always include the
+                                       // last N canvas rows in the batch (the "final anchor" - the
+                                       // model needs to see that the end exists; streaming-dllm
+                                       // sampler.py tail_keep). BLOCK mode unsupported (store-write
+                                       // offsets assume a contiguous batch). 0 = off.
     int32_t kv_window        = 0;      // suffix lookahead window beyond the active block (0 = mode default:
                                        // prefix decodes the whole suffix, dual decodes the block only).
                                        // With W: decode/commit only [block_start, block_end + W) - distant

@@ -351,6 +351,7 @@ void diffusion_generate(llama_context *          ctx,
     int32_t kv_steps_since_warm   = 0;
     int32_t kv_commits_since_warm = 0;
     int32_t kv_span_hint          = 0;  // B3: next block size detected at the last warm
+    int32_t remask_total          = 0;  // B5: per-run remask cap (progress guarantee)
 
     for (int block_num = 0; block_num < num_blocks; block_num++) {
         int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
@@ -416,9 +417,18 @@ void diffusion_generate(llama_context *          ctx,
                 // distant masks are dropped from the batch entirely (DPad-style - their
                 // attention contribution is negligible and skipping them is pure savings).
                 // In dual mode W > 0 turns the block into a sliding lookahead window.
-                const int32_t kv_batch_end =
+                int32_t kv_batch_end =
                     params.kv_window > 0 ? std::min(cur_length, kv_e + params.kv_window)
                                          : (kv_dual ? kv_e : cur_length);
+                // Layer B4 tail anchor, contiguity-safe variant: appending detached
+                // anchor rows broke the example's row==batch-index assumption (positions
+                // must stay monotonic or commits read the wrong rows - observed as
+                // instant garbage + guard abort). Instead the window SNAPS to the end
+                // when it gets close, so the final rows enter the batch contiguously.
+                if (params.kv_window > 0 && params.kv_anchor > 0 &&
+                        cur_length - kv_batch_end <= params.kv_anchor + 8) {
+                    kv_batch_end = cur_length;
+                }
 
                 if (kv_warm_needed) {
                     llama_diffusion_set_phase(sc_model, /*WARM*/1, kv_dual ? cur_length : b0);
@@ -443,6 +453,7 @@ void diffusion_generate(llama_context *          ctx,
                 batch.seq_id[i][0] = 0;
                 batch.logits[i]    = 1;
             }
+
 
             if (params.self_conditioning) {
                 // step 0 has no previous prediction: keep the SC subgraph (stable graph shape) but gate it off
@@ -825,6 +836,55 @@ void diffusion_generate(llama_context *          ctx,
                                 }
                             }
                             break;  // generation complete
+                        }
+                    }
+
+                    // Layer B5 self-correction (ReMDM-inspired, budget-capped): a token
+                    // committed in an EARLIER step whose row now prefers a different token
+                    // by a clear margin was probably a bad early commit - re-mask it and
+                    // let later steps redo it. Exact steps only; positions masked at THIS
+                    // step's start are exempt (their commits reflect current logits);
+                    // EOG/pad never remasked (the tail must stay terminal).
+                    if (params.remask_margin > 0.0f && use_backend && remask_total < 16 &&
+                            (!kv_on || kv_steps_since_warm == 0)) {
+                        const llama_vocab * rvocab = llama_model_get_vocab(model);
+                        const int32_t r_lo = kv_on ? kv_s : n_input;
+                        const int32_t r_hi = kv_on ? std::min(batch_last, cur_length) : cur_length;
+                        int32_t budget = params.remask_budget;
+                        for (int32_t pos = r_lo; pos < r_hi && budget > 0 && remask_total < 16; pos++) {
+                            const llama_token cur_tok = output_tokens[pos];
+                            if (cur_tok == params.mask_token_id ||
+                                    llama_vocab_is_eog(rvocab, cur_tok) || cur_tok == llama_vocab_pad(rvocab)) {
+                                continue;
+                            }
+                            if (std::binary_search(mask_positions.begin(), mask_positions.end(), pos)) {
+                                continue;  // committed this very step
+                            }
+                            const int32_t row = get_row_for_pos(pos);
+                            if (row < 0 || row >= batch.n_tokens) {
+                                continue;
+                            }
+                            const llama_token * cands = llama_get_sampled_candidates_ith(ctx, row);
+                            const float *       pr    = llama_get_sampled_probs_ith(ctx, row);
+                            const size_t        n     = llama_get_sampled_probs_count_ith(ctx, row);
+                            if (!cands || !pr || n < 1 || cands[0] == cur_tok) {
+                                continue;
+                            }
+                            float p_committed = 0.0f;
+                            for (size_t k = 0; k < n; k++) {
+                                if (cands[k] == cur_tok) {
+                                    p_committed = pr[k];
+                                    break;
+                                }
+                            }
+                            if (pr[0] - p_committed >= params.remask_margin) {
+                                output_tokens[pos] = params.mask_token_id;
+                                if (params.output_confidences) {
+                                    params.output_confidences[pos] = -1.0f;
+                                }
+                                budget--;
+                                remask_total++;
+                            }
                         }
                     }
 

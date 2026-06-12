@@ -3970,6 +3970,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.diffusion.kv_span = std::stof(value); }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-kv-anchor"}, "N",
+        string_format("tail anchor rows for windowed prefix kv batches (default: %d)", params.diffusion.kv_anchor),
+        [](common_params & params, int value) { params.diffusion.kv_anchor = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-remask"}, "F",
+        string_format("self-correction: remask committed tokens out-margined by F (0 = off) (default: %.2f)", (double) params.diffusion.remask_margin),
+        [](common_params & params, const std::string & value) { params.diffusion.remask_margin = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-remask-budget"}, "N",
+        string_format("max remasks per step (default: %d)", params.diffusion.remask_budget),
+        [](common_params & params, int value) { params.diffusion.remask_budget = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-replicas"}, "N",
         string_format("diffusion-server: model replicas in one process, one per GPU (0 = one per GPU device) (default: %d)", params.diffusion.replicas),
         [](common_params & params, int value) { params.diffusion.replicas = value; }

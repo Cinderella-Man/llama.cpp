@@ -24,7 +24,8 @@ defmodule Kintsugi.Bench.Runner do
     "kvpfx32" => %{"kv_prefix" => 32},
     "tau03" => %{"tau_alpha" => 0.3},
     "taub06" => %{"tau_alpha" => 0.6},
-    "ec05" => %{"early_commit" => 0.5}
+    "ec05" => %{"early_commit" => 0.5},
+    "remask03" => %{"remask_margin" => 0.3}
   }
 
   # full request params for infill cases - NO reliance on server defaults

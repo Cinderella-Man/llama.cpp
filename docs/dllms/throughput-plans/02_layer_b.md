@@ -280,3 +280,46 @@ Layer B's honest yield: the schedule layer was largely ALREADY CAPTURED by our e
 threshold machinery; the real wins were Prophet-for-repairs (+12% aggregate) and the
 instrument hardening that the hunt forced (exit-code builds, dep-rev headers,
 repeat-compile guard, boundary tier).
+
+
+## LAYER B COMPLETE (2026-06-12): B-4 + B-5 implemented, layer closed
+
+### B-4 tail anchor: implemented twice, hypothesis REFUTED
+First implementation (appended detached anchor rows) broke instantly: non-monotonic
+batch positions violate the example's row==batch-index assumption (engine may reorder;
+observed garbage commits + guard abort at step 1 - "```imiterdociter"). RULE FOR
+IMPLEMENTERS: batches must stay position-contiguous unless row indirection is added.
+Second implementation (contiguity-safe: the window SNAPS to the canvas end when within
+kv_anchor+8): measured 39.7 s vs 39.7 s without anchor (code, 3 seeds) - identical.
+The anchor hypothesis ("end-visibility is why windows lost") is REFUTED for our stack;
+the windowed prefix mode's loss vs plain prefix (39.7 vs 26.3 s) has other causes
+(restricted commits). --diffusion-kv-anchor ships (default 3, only active with
+kv_window) as the safe variant.
+
+### B-5 remask self-correction: implemented, gated OK, quality-neutral here
+--diffusion-remask F (margin) + --diffusion-remask-budget N (2/step, 16/run cap).
+Mechanics: exact steps only; positions masked at the step's start exempt (their commits
+reflect current logits - prevents dist-sampling thrash); EOG/pad never remasked; row
+bounds guarded. Bench at margin 0.3: VERDICT OK, 35/48 (incl. new m-tier 2/3), p-tier
+walls -13.8% median. No measurable quality GAIN on the current suite - the suite's
+failures are capability-bound, not wrong-commit-bound. Ships default OFF; its expected
+home is as a safety net under aggressive schedule configs (tau/early-commit) and weaker
+models - re-evaluate when those are in play.
+
+### B-6 EB-schedule port: CLOSED as not-pursued
+Three rounds established the schedule layer's headroom is thin on top of our threshold
+machinery; the EB port is medium-effort with no evidence of upside. Revisit only if a
+canvas-model (DiffusionGemma-style) workload becomes primary.
+
+### Final Layer B scorecard
+| item | status | measured outcome |
+| B-1 adaptive tau (block-scoped + floor) | shipped, off | -14% long code; small-canvas regression; content-gated |
+| B-2 Prophet early-commit | shipped, off; ON for kintsugi repairs | +12% bench aggregate (8.03->9.02 tok/s) |
+| B-3 span sizing | shipped, off | no win vs fixed blocks (28.3 vs 27.2 s) |
+| B-4 tail anchor (snap variant) | shipped, default 3 w/ window | refuted hypothesis; neutral |
+| B-5 remask | shipped, off | quality-neutral safety net; gated OK |
+| B-6 EB port | closed | not pursued |
+Durable yield: Prophet-on-repairs (+12% aggregate - the layer's one production win),
+five default-off tuning knobs with honest measurements, and another round of
+instrument/methodology hardening. Regressions at close: 14/14 sampler tests, 12/12
+offline kintsugi tests, bench baseline intact.
