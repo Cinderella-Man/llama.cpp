@@ -306,14 +306,14 @@ NEXT BITES at the ~10.3 ms step floor: backend sampling for block-AR (saves the
 ## E4: backend (GPU) sampling for block-AR (started 2026-06-13; plan 07_layer_f.md)
 
 PROGRESS LOG (resume from here after any crash):
-- [ ] Design written (this section), committed
-- [ ] Loop: diffusion_generate_block_ar backend path + warmup fallback
-- [ ] Build clean, 14/14 sampler tests
-- [ ] Equivalence gate: temp-0 outputs backend vs CPU, 2-3 prompts (expect identical
+- [x] Design written (this section), committed
+- [x] Loop: diffusion_generate_block_ar backend path + warmup fallback
+- [x] Build clean, 14/14 sampler tests (CPU and GPU)
+- [x] Equivalence gate: temp-0 outputs backend vs CPU, 2-3 prompts (expect identical
       or near - confidence renormalizes over top-k, see design)
-- [ ] Speed: CLI ms/step at n_gen 128/256/384, kv on, backend vs CPU sampling
-- [ ] Bench: same-process A/B (profiles e3kv / e4bs), compare vs E3 19/48 + 8.17 tok/s
-- [ ] Docs/memory updated, committed
+- [x] Speed: CLI ms/step, kv on/off, backend vs CPU sampling
+- [x] Bench: same-process A/B (profiles e3kv / e4bs), compare vs E3 19/48 + 8.17 tok/s
+- [x] Docs/memory updated, committed
 
 ### Design (decided after re-reading the masked path + reference semantics)
 
@@ -352,3 +352,70 @@ Mechanics:
   pointer (no decode intervenes between the WARM and the boundary predict).
 - With the sampler attached, needs_raw_logits goes false: the 32-row x 152k x 4 B
   logits D2H disappears per step (the ~3 ms target of the 10.3 ms floor).
+
+### E4 MEASURED (2026-06-13, 5070 laptop, Q4_K_M) - ADOPTED
+
+Equivalence gate (temp 0, seed 7, kv on): BYTE-IDENTICAL backend vs CPU on all 3
+prompts (poem 103 tok, GenServer 155 tok, Stack 472 tok). At 472 tokens the step
+COUNTS differ (293 backend vs 311 CPU - the top-K renormalized confidence commits
+near-boundary positions a step earlier) while the token sequence stays identical:
+the approximation re-times commits without changing content on these prompts.
+
+Speed (CLI, Stack prompt, temp 0, steps cap 384, 472 tok generated both modes):
+
+| config            | CPU sampling      | backend sampling  | per-step | wall  |
+|-------------------|-------------------|-------------------|----------|-------|
+| kv on (block-kv)  | 10.24 ms, 3.18 s  | 8.42 ms, 2.47 s   | 1.22x    | 1.29x |
+| kv off (square)   | 39.75 ms, 9.06 s  | 33.98 ms, 7.20 s  | 1.17x    | 1.26x |
+
+Raw engine throughput kv+bs: 191 tok/s (was 148 CPU-sampled, 132-156 at E3).
+The ~8.4 ms step that remains is ~7 ms forward (layer D probe floor) + ~1.4 ms
+host/readback - the next bite is the forward itself (E6 graph check, sub-block
+width E5a).
+
+BENCH GATE (same server process, request-param profiles e3kv/e4bs; h-tier wall
+noise investigated - see below):
+
+| profile | pass | deliverable | notes |
+|---|---|---|---|
+| e3kv (= E3 config reproduced) | 19/48 | 6.76 tok/s | run 2: 19/48, 6.27 (host-wall drift) |
+| e4bs (+ backend sampling)     | 19/48 | **9.24 tok/s (+37-47%)** | pass outcomes IDENTICAL per compare.exs |
+
+m-tier median 3536 -> 2098 ms, c-tier 3004 -> 1526 ms (failing tiers burn 3 full
+drafts each - step savings compound). compare.exs flagged h-tier +27.5% wall as a
+"regression": h is the Credence-only tier (repairs=0, drafts=0 in every row, zero
+GPU) and a THIRD run (e3kv again) showed 738 -> 941 -> 903 ms across identical
+configs - host-side subprocess (runner VM boot) drift between back-to-back runs,
+not an engine effect. Lesson for the gate: tier-wall comparisons only bind for
+tiers that actually exercise the changed path.
+
+Cross-process note: this session's e3kv reproduces E3's 19/48 exactly (pass-
+exactness survives restarts, as calibrated); deliverable tok/s does NOT transfer
+across processes (8.17 then, 6.27-6.76 now, same config) - the E4 claim is the
+same-process +37-47%.
+
+VERDICT: backend sampling ON for block-AR serving (it is the default via
+params.backend_sampling; --no-backend-sampling / "backend_sampling": false to
+disable). 07_layer_f.md open question 1 ANSWERED: the chain expresses plain-softmax
+confidence EXACTLY (over the top-K set) by omitting temp/top_p from the chain and
+sampling host-side from the K plain probs.
+
+## E5: commit-rate levers (started 2026-06-13; plan 07_layer_f.md)
+
+1.85 commits/step (code, thr 0.9) is the biggest no-training lever: commits/step
+x2 ~= tok/s x2. Three independent bench-gated experiments on top of E4 (kv+bs).
+
+PROGRESS LOG:
+- [ ] E5a sub-block sweep: sb 8 (reference) -> 16, 32. CLI shape probe (commits/
+      step from generated/steps, 2 prompts x temp 0.2), then bench the winner(s).
+- [ ] E5b threshold sweep: 0.9 -> 0.85, 0.8 (0.6 known-corrupt; the 0.8-0.9 edge
+      is unmeasured). Same protocol.
+- [ ] E5c entropy-bound committer port (DG machinery, trained-in there - fail fast).
+- [ ] Docs/memory updated, committed
+
+GATE (07_layer_f.md): bench pass count holds 19/48-class (accept +-2 = the
+measured numerics band); walls + commits/step logged per config. KILL IF passes
+drop >2 at every setting (1.85 is then the model's honest rate).
+Method notes: CLI probes single-seed are SHAPE only (path-luck rule); verdicts
+come from the bench. Profiles are request params (sub_block / conf_threshold) on
+the same server process as the E4 runs.
