@@ -511,6 +511,32 @@ probes the down-ladder. Protocol: quantize from the on-disk F16, ONE bench per
 quant (e4bs profile, same process per pair where possible), CLI ms/step.
 Results below.
 
+### MEASURED (2026-06-13, e4bs profile, kv+bs)
+
+| quant | size | bench | tier shape | deliverable | CLI ms/step (stack, temp 0) |
+|---|---|---|---|---|---|
+| Q4_K_M (shipped) | 986 MB | 19/48 | p 10/18, m 0/3 | 9.2-9.8 | 8.56 (293 steps) |
+| Q8_0   | 1.65 GB | 18/48 | p 6/18, m 3/3 | 12.63 | 9.77 (290 steps) |
+| Q8_0 + thr 0.85 | - | 15/48 | p 6/18, m 0/3 | 8.85 | - |
+| IQ4_XS | 902 MB | 18/48 | p 6/18, m 3/3 | 14.13 | 8.22 (339 steps) |
+
+FINDINGS:
+1. Quant level is a PATH LOTTERY inside the same +-2 quality band for block-AR:
+   totals 18-19/48 across an 1.8x size range, but the CASE MIX flips - both
+   Q8_0 and IQ4_XS pass m_sumdoc 3/3 (Q4_K_M: 0/3) while losing 4 p-tier seeds.
+   The "less quant noise buys numerics-edge passes back" hypothesis is REFUTED
+   in its naive form: Q8 moves the noise, it does not remove the sensitivity.
+2. Deliverable tok/s swings 9.2-14.1 purely by WHICH cases pass (m answers are
+   long) - deliverable comparisons across quants need pass-set context.
+3. Threshold 0.9 holds at every quant (Q8+0.85 strictly worse) - the catalog's
+   "re-calibrate conf_threshold per quant" concern is ANSWERED: not needed in
+   the Q4-Q8 range for this model.
+4. Speeds: Q8_0 +14% step cost; IQ4_XS cheapest per step on Blackwell.
+VERDICT: Q4_K_M stays the default (best p-tier shape, best reference-prompt
+wall). IQ4_XS (902 MB) is the validated option when 986 MB does not fit (3 GB
+P106-090 margins) at equal-band quality. W3/W2 cliffs below IQ4 remain
+unmeasured (no current need).
+
 ## LAYER E PART-1 CLOSURE (2026-06-13)
 
 07_layer_f.md PART 1 status:
