@@ -67,6 +67,16 @@ defmodule KintsugiTest do
       code = "defmodule KintsugiRun2 do\n  def double(n), do: n + 2\nend"
       assert {:error, _} = Verifier.run(code, "4 = KintsugiRun2.double(1)")
     end
+
+    test "timeout kills the OS process, leaving no orphan" do
+      code = "defmodule KintsugiHang do\n  def go(acc), do: go([acc | acc])\nend"
+      check = "KintsugiHang.go([0])"
+      assert {:error, [%{message: msg}]} = Verifier.run(code, check, 3_000)
+      assert msg =~ "timed out"
+      Process.sleep(500)
+      {out, _} = System.cmd("pgrep", ["-fc", "kintsugi_run_"], stderr_to_stdout: true)
+      assert String.trim(out) == "0"
+    end
   end
 
   describe "extract_code" do

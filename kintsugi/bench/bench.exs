@@ -89,6 +89,7 @@ defmodule Kintsugi.Bench.Runner do
 
     rows =
       for c <- Kintsugi.Bench.Cases.all(), seed <- c.seeds do
+        ram_guard!(out)
         row = run_case({eng, draft_eng}, c, seed, profile)
         IO.write(io, JSON.encode!(row) <> "\n")
         row
@@ -96,6 +97,27 @@ defmodule Kintsugi.Bench.Runner do
 
     File.close(io)
     summarize(rows, label, out)
+  end
+
+  # a runaway generated-code runner that escapes the Verifier's kill (or any other
+  # leak) must abort the bench before it takes the whole desktop session down -
+  # two machine OOMs on 2026-06-12 happened exactly this way; cases are sequential,
+  # so no legitimate kintsugi_run_ process exists between them
+  @min_avail_kb 4_000_000
+
+  defp ram_guard!(out) do
+    System.cmd("pkill", ["-9", "-f", "kintsugi_run_"], stderr_to_stdout: true)
+
+    avail_kb =
+      case Regex.run(~r/MemAvailable:\s+(\d+) kB/, File.read!("/proc/meminfo")) do
+        [_, kb] -> String.to_integer(kb)
+        _ -> nil
+      end
+
+    if avail_kb && avail_kb < @min_avail_kb do
+      IO.puts(:stderr, "ABORT: MemAvailable #{div(avail_kb, 1024)} MB below #{div(@min_avail_kb, 1024)} MB floor - partial results preserved in #{out}")
+      System.halt(75)
+    end
   end
 
   defp battery_guard!(flags) do

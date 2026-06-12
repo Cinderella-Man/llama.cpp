@@ -291,3 +291,56 @@ hardware/models is the cheap re-evaluation path (one command, all seven probes).
    7.2 ms vs 27 ms; 103-tok K=2-4 batching 1.20-1.23x; W=128 = 2.78x of W=32).
    Layer D REMAINS PARKED on both models. Next trigger: a genuinely different
    hardware class (P106 measurement) or decode regime.
+
+## D4 HYBRID MEASURED (2026-06-12 evening): two-engine ladder - NO-GO, layer CLOSED
+
+Built after E2 delivered the 1.5B FastDLLM (05_layer_e.md): `Kintsugi.generate_hybrid/4`
+runs FastDLLM-1.5B (:8081, block-AR) as the draft engine and Dream-7B (:8080) as the
+repair/escalation engine - pure harness work, both servers up simultaneously
+(6.0 GB / 8.1 GB on the dev GPU; NOTE: does NOT fit the 6 GB target rig, see memory).
+
+### Bench result (clean run `20260612T182247Z-d4-hybrid-clean.jsonl`, profile d4)
+
+| system | pass | deliverable tok/s |
+|---|---|---|
+| Dream-only full system (wr-baseline) | 35/48 | 6.22 |
+| D4 hybrid (FastDLLM drafts + Dream repairs) | 35/48 | **2.99** |
+
+- Pass SET is IDENTICAL to Dream-only (zero per-case verdict flips) - the hybrid
+  rescues nothing Dream could not already solve, and loses nothing either.
+- Where drafts succeed the hybrid wins: p-tier median 1346 -> 834 ms (-38%).
+- Where drafts fail it pays BOTH ladders: m-tier median 3431 -> 6485 ms (+89%),
+  c-tier 8287 -> 11039 ms (+33%). Rung histogram over 30 forge cases: 12 solved at
+  draft rung, 8 escalated to Dream, 10 exhausted (paid both engines, still failed).
+- Net: throughput HALVES (6.22 -> 2.99 tok/s) for zero pass gain. Even a perfect
+  escalate-after-one-cheap-draft policy bounds the p-tier saving at ~10 s against a
+  ~36 s m/c penalty structure - the best case is a low-single-digit % win, on a
+  two-model memory footprint the target rig cannot hold.
+
+DECISION: D4 NO-GO. Layer D fully CLOSED (D1-D3 parked by the grilling passes above,
+D4 measured and rejected). Dream-only full system remains the shipped configuration.
+
+### Postmortem: the bench-time machine crashes were OURS (verifier orphan leak)
+
+Both 2026-06-12 RAM-OOM machine crashes (19:16 during the E2 bench, 20:02 during the
+first d4-hybrid bench) were caused by `Kintsugi.Verifier.run/3`: generated code ran in
+an OS-level `elixir` child via `System.cmd` inside `Task.async`, and on timeout
+`Task.shutdown(:brutal_kill)` killed only the BEAM task - the OS child survived,
+running runaway generated code (infinite loop / unbounded allocation) forever. The
+20:02 OOM dump showed TEN orphaned beam.smp at 3.4-8.2 GB (~58 GB); the kernel chose
+VSCode (oom_score_adj 300), taking gnome-shell down. The interim "ElixirLS did it"
+diagnosis was wrong - the .elixir_ls build mtimes at the OOM minute were the
+POST-crash ElixirLS restart recompiling (effect, not cause).
+
+Fixes (this commit):
+- verifier.ex: child wrapped in coreutils `timeout -k 2 <secs>` - the OS guarantees
+  the kill; exit 124/137 mapped to the timeout diagnostic.
+- kintsugi_test.exs: hang test (runaway allocator, 3 s timeout) asserts zero
+  `kintsugi_run_` processes survive.
+- bench.exs: `ram_guard!` before every case - sweeps stray `kintsugi_run_` processes
+  and aborts (exit 75) below a 4 GB MemAvailable floor, preserving partial results.
+
+Validation: the clean re-run finished all 48 cases with 0 orphans, RAM flat at
+~55 GB available, GPU <= 61 C. The first (contaminated) run's verdicts were
+confirmed identical; its timings were inflated 30-60% in fast tiers and are not
+citable - cite `20260612T182247Z-d4-hybrid-clean.jsonl`.

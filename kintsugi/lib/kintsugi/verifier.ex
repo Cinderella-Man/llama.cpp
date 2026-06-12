@@ -116,14 +116,25 @@ defmodule Kintsugi.Verifier do
     path = Path.join(System.tmp_dir!(), "kintsugi_run_#{System.unique_integer([:positive])}.exs")
     File.write!(path, script)
 
-    task = Task.async(fn -> System.cmd("elixir", [path], stderr_to_stdout: true) end)
+    # The OS-level `timeout` is the only kill that reaches the child: Task.shutdown
+    # only kills the BEAM-side task and orphans the elixir process, which keeps
+    # running runaway generated code until the kernel OOMs the machine.
+    secs = Integer.to_string(div(timeout_ms, 1000) + 1)
+
+    task =
+      Task.async(fn ->
+        System.cmd("timeout", ["-k", "2", secs, "elixir", path], stderr_to_stdout: true)
+      end)
 
     try do
-      case Task.await(task, timeout_ms) do
+      case Task.await(task, timeout_ms + 5_000) do
         {out, 0} ->
           if String.contains?(out, "KINTSUGI_OK"),
             do: :ok,
             else: {:error, [%{line: 1, message: "check produced no confirmation:\n" <> out, severity: :error}]}
+
+        {_out, status} when status in [124, 137] ->
+          {:error, [%{line: 1, message: "execution timed out after #{timeout_ms} ms", severity: :error}]}
 
         {out, _status} ->
           {:error, [%{line: extract_line(out), message: out, severity: :error}]}
