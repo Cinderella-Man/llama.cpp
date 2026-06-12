@@ -157,15 +157,29 @@ plus block semantics.
   GGML_CUDA_FORCE_GRAPHS on Pascal later.
 - Backend sampler eligibility (cfg_scale<=0 etc., diffusion.cpp:~250) is orthogonal.
 
-### 3e-pre. FlashAttention vs rectangular masks - VERIFIED SAFE
-Upstream's own no-cache path (src/llama-graph.cpp:2175-2185) creates the mask at EXACT
-size [n_tokens, n_tokens] with no GGML_KQ_MASK_PAD padding, F16 when flash_attn - and
-our FA A/B timings (237 vs 254 ms/step) ran Dream through fattn with exactly these
-unpadded masks at non-multiple-of-64 sizes. Rectangular [n_kv, n_q] masks are what the
-AR KV path feeds fattn every day. Conclusion: the decode-phase rectangular mask needs
-NO padding and works under FA. Safety check anyway (one command, sec 11): run a
-kv-prefix generation with -fa on and -fa off and diff outputs at temp 0 - if FA-on
-asserts or garbles, set type_mask F32 + force the no-FA path in decode phases only.
+### 3e-pre. FlashAttention vs rectangular masks - EMPIRICALLY VERIFIED
+By construction: upstream's own no-cache path (src/llama-graph.cpp:2175-2185) creates
+the mask at EXACT size [n_tokens, n_tokens] with no GGML_KQ_MASK_PAD padding, F16 when
+flash_attn; rectangular [n_kv, n_q] masks are what the AR KV path feeds fattn daily.
+By execution (this machine, 2026-06-12): DiffusionGemma's cached decode - the SAME
+rectangular [P+C, C] mask class and concat pattern Dream will use - ran the full EB
+loop with kv_cache=on under BOTH -fa on (954 ms/step, 14 steps) and -fa off
+(885 ms/step, 15 steps), sane output both ways. No padding needed; FA optional.
+(Perf note: FA bought nothing on DG - it is MoE-bound; on Dream FA is ~7% - keep auto.)
+
+### 3e0. build_attn no-cache overload - how the mask is consumed (llama-graph.cpp:2200)
+    const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+    cur = build_attn_mha(q, k_cur, v_cur, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+Three implementer-critical facts: (1) get_kq_mask() returns the *_cnv* alias - the
+subclass MUST set self_kq_mask_cnv = self_kq_mask (DG does; forget it and you pass a
+null mask). (2) selection is per-layer via hparams.is_swa(il) - Dream/LLaDA have
+swa_type NONE so the non-SWA mask is always used; never allocate the swa variant.
+(3) n_kv is implicitly K's row count (K passes straight to build_attn_mha) - INVARIANT:
+mask->ne[0] == concat'd K ->ne[2], both derived from the same P/C/L values. A mismatch
+is a ggml shape assert at graph build (loud, at least).
+Sub-view copy precedent (for PKV_WARM's "store first P rows of Kcur"): DG's debug path
+does exactly this - ggml_view_3d over Kcur's first P rows -> ggml_cpy into a store
+tensor (diffusion-gemma.cpp:432-435). View-of-rope-output -> cpy is proven.
 
 ### 3e2. inp_out_ids under block batches - VERIFIED HARMLESS
 build_inp_out_ids (src/llama-graph.cpp:1924) is kept even when ALL tokens are outputs,
@@ -310,7 +324,7 @@ src/models/diffusion-gemma.cpp (:112 mask class, :378 mask creation, :439 phase
 branches, :631 store, :671 API), src/models/models.h:853 (state fields),
 include/llama.h:574 (API), examples/diffusion/diffusion.cpp (:444 row mapping, :849 EB
 phase usage), src/llama-model.cpp:2013 (memory routing), src/llama-context.cpp:1722 /
-:1515 (encode). Catalog context: docs/dllm-throughput-catalog.md Layer A. Honest
+:1515 (encode). Catalog context: docs/dllms/dllm-throughput-catalog.md Layer A. Honest
 expectations: 2-4x on drafts (not 27x - we already run threshold decoding); code
 workloads cache worse than prose (dLLM-Cache: HumanEval 1.36x vs GSM8K 5.1x).
 
@@ -419,6 +433,13 @@ avoids this by never reading rows it writes in the same graph; mirror that prope
 Integration notes: reuse the existing threshold-commit block verbatim - only the
 batch-build and get_row_for_pos change; keep the degeneracy guard (absolute pos);
 EOT-tail shrink runs at block boundaries only (re-derive cur_length after each block).
+Step budget policy: params.steps stays the GLOBAL cap, counted across warms + block
+steps together (one shared counter; abort when exhausted, like today's n_steps_done).
+The reference instead asserts divisibility and quotas steps per block - we do NOT
+(threshold mode self-terminates per block; the quota path only matters for the
+non-threshold schedules, where diffusion.cpp:322-330 already computes per-block
+transfer counts). Remainder blocks: e = min(s + kvb, cur_length) - no divisibility
+requirement, unlike the reference's assert.
 
 ### 9e. Flags / server
 common/arg.cpp (DIFFUSION example): --diffusion-kv-prefix N, --diffusion-kv-block N ->
@@ -472,7 +493,12 @@ mutually exclusive - kv_block wins, log a warning if both set.
 
 ## 12. Changelog of this guide
 - r1: initial plan (block/dual cache design, DG precedent, phases).
-- r2 (this revision): corrected "Phase 1 exact" fallacy; added verified FA/mask,
-  out_ids, cast/restore findings; code skeletons incl. the PKV_BLOCK view-aliasing
-  hazard and its 3-way-concat resolution; catalog interaction map; literal validation
-  commands.
+- r2: corrected "Phase 1 exact" fallacy; added verified FA/mask, out_ids,
+  cast/restore findings; code skeletons incl. the PKV_BLOCK view-aliasing hazard and
+  its 3-way-concat resolution; catalog interaction map; literal validation commands.
+- r3 (this revision): FA + rectangular mask upgraded from by-construction to
+  EMPIRICALLY VERIFIED (DG cached decode executed under -fa on AND off); build_attn
+  mask-consumption contract documented (the _cnv alias trap, per-layer is_swa
+  selection, the mask/K n_kv invariant); sub-view-cpy precedent cited
+  (diffusion-gemma.cpp:432-435); explicit global step-budget + remainder-block
+  policy; catalog moved to docs/dllms/.
