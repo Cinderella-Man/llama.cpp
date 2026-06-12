@@ -158,8 +158,14 @@ llama_model_dream::graph::graph(const llama_model & model, const llm_graph_param
                                                 dmodel.pkv.k[il]->nb[1], dmodel.pkv.k[il]->nb[2], 0);
                 ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv.v[il], n_embd_head, n_head_kv, P_decode,
                                                 dmodel.pkv.v[il]->nb[1], dmodel.pkv.v[il]->nb[2], 0);
-                Katt = ggml_concat(ctx0, pk, Kcur, 2);
-                Vatt = ggml_concat(ctx0, pv, Vcur, 2);
+                ggml_tensor * Kc = Kcur;
+                ggml_tensor * Vc = Vcur;
+                if (dmodel.pkv.k[il]->type != Kcur->type) {  // F16 store: match types for concat
+                    Kc = ggml_cast(ctx0, Kcur, dmodel.pkv.k[il]->type);
+                    Vc = ggml_cast(ctx0, Vcur, dmodel.pkv.v[il]->type);
+                }
+                Katt = ggml_concat(ctx0, pk, Kc, 2);
+                Vatt = ggml_concat(ctx0, pv, Vc, 2);
             } else if (is_block) {
                 // dual cache: write the block rows into the store for the NEXT step, and
                 // attend the 3-way concat [store(0..s) | fresh block | store(s+C..L)] -
@@ -175,6 +181,10 @@ llama_model_dream::graph::graph(const llama_model & model, const llm_graph_param
 
                 Katt = Kcur;
                 Vatt = Vcur;
+                if (dmodel.pkv.k[il]->type != Kcur->type) {  // F16 store
+                    Katt = ggml_cast(ctx0, Kcur, dmodel.pkv.k[il]->type);
+                    Vatt = ggml_cast(ctx0, Vcur, dmodel.pkv.v[il]->type);
+                }
                 if (pkv_s > 0) {
                     ggml_tensor * prek = ggml_view_3d(ctx0, dmodel.pkv.k[il], n_embd_head, n_head_kv, pkv_s,
                                                       dmodel.pkv.k[il]->nb[1], nb2k, 0);

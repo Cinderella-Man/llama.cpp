@@ -402,6 +402,9 @@ struct common_params_diffusion {
 
     int32_t kv_prefix     = 0;        // Layer A prefix cache block size (0 = off)
     int32_t kv_block      = 0;        // Layer A dual cache block size (0 = off; subsumes kv_prefix)
+    int32_t kv_rewarm     = 6;        // Layer A: re-warm after N cached steps
+    int32_t kv_rewarm_commits = 0;    // Layer A: re-warm after N commits (0 = off)
+    int32_t kv_window     = 0;        // Layer A: suffix lookahead window (0 = mode default)
 
     // entropy-bound decoder (DiffusionGemma canvas models); params default to GGUF metadata, then reference
     int32_t eb_mode          = 0;     // 0=auto (on for canvas models), 1=force on, 2=off

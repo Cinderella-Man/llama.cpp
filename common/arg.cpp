@@ -3935,6 +3935,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.diffusion.kv_block = value; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-kv-rewarm"}, "N",
+        string_format("masked-dLLM KV cache: re-warm after N cached steps (default: %d)", params.diffusion.kv_rewarm),
+        [](common_params & params, int value) { params.diffusion.kv_rewarm = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-kv-rewarm-commits"}, "N",
+        string_format("masked-dLLM KV cache: re-warm after N commits since last warm (0 = off) (default: %d)", params.diffusion.kv_rewarm_commits),
+        [](common_params & params, int value) { params.diffusion.kv_rewarm_commits = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-kv-window"}, "N",
+        string_format("masked-dLLM KV cache: suffix lookahead window beyond the active block (0 = mode default) (default: %d)", params.diffusion.kv_window),
+        [](common_params & params, int value) { params.diffusion.kv_window = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-replicas"}, "N",
         string_format("diffusion-server: model replicas in one process, one per GPU (0 = one per GPU device) (default: %d)", params.diffusion.replicas),
         [](common_params & params, int value) { params.diffusion.replicas = value; }

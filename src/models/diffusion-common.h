@@ -121,11 +121,16 @@ static inline void llama_diffusion_pkv_ensure_store(const llama_model_base & m, 
     GGML_ASSERT(pkv.ctx != nullptr);
     pkv.k.resize(n_layer);
     pkv.v.resize(n_layer);
+    // F16 store was tried and REJECTED for now: CUDA ggml_concat asserts src F32
+    // (ggml/src/ggml-cuda/concat.cu:149), and the decode path concatenates the store
+    // with fresh K/V every step. Revisit only with an F16 concat kernel or a
+    // copy-into-preallocated layout instead of concat. Store stays F32.
+    const ggml_type st = GGML_TYPE_F32;
     for (int il = 0; il < n_layer; ++il) {
         const int64_t hd  = m.hparams.n_embd_head_k(il);
         const int64_t nkv = m.hparams.n_head_kv(il);
-        pkv.k[il] = ggml_new_tensor_3d(pkv.ctx, GGML_TYPE_F32, hd, nkv, cap);
-        pkv.v[il] = ggml_new_tensor_3d(pkv.ctx, GGML_TYPE_F32, hd, nkv, cap);
+        pkv.k[il] = ggml_new_tensor_3d(pkv.ctx, st, hd, nkv, cap);
+        pkv.v[il] = ggml_new_tensor_3d(pkv.ctx, st, hd, nkv, cap);
         ggml_format_name(pkv.k[il], "diff_pkv_k_l%d", il);
         ggml_format_name(pkv.v[il], "diff_pkv_v_l%d", il);
     }

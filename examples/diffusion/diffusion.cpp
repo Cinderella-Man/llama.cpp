@@ -335,9 +335,12 @@ void diffusion_generate(llama_context *          ctx,
     bool    kv_warm_needed = true; // next forward must be a full WARM
     // cached K/V drift as the canvas fills (cosine similarity is only high between
     // ADJACENT steps - reusing a step-0 snapshot for many steps compounds the error and
-    // measurably degrades output: the model EOT-floods). Re-warm every few cached steps.
-    const int32_t kv_rewarm = 12;
-    int32_t kv_steps_since_warm = 0;
+    // measurably degrades output: the model EOT-floods). Two re-warm triggers: step
+    // cadence (kv_rewarm) and commit mass (kv_rewarm_commits - drift tracks canvas
+    // CHANGES, so counting commits is the more principled guard).
+    const int32_t kv_rewarm = params.kv_rewarm > 0 ? params.kv_rewarm : 1000000000;
+    int32_t kv_steps_since_warm   = 0;
+    int32_t kv_commits_since_warm = 0;
 
     for (int block_num = 0; block_num < num_blocks; block_num++) {
         int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
@@ -387,6 +390,9 @@ void diffusion_generate(llama_context *          ctx,
                 if (kv_steps_since_warm >= kv_rewarm) {
                     kv_warm_needed = true;
                 }
+                if (params.kv_rewarm_commits > 0 && kv_commits_since_warm >= params.kv_rewarm_commits) {
+                    kv_warm_needed = true;
+                }
                 if (kv_s >= cur_length) {
                     break;  // every position committed
                 }
@@ -394,16 +400,25 @@ void diffusion_generate(llama_context *          ctx,
                 // Dream shift_logits: include one extra leading row so position kv_s gets the
                 // logits of kv_s-1 exactly (kv_s >= n_input >= 1, so kv_s-1 always exists)
                 const int32_t b0 = params.shift_logits ? kv_s - 1 : kv_s;
+                // suffix lookahead window: decode (and commit) only up to kv_e + W;
+                // distant masks are dropped from the batch entirely (DPad-style - their
+                // attention contribution is negligible and skipping them is pure savings).
+                // In dual mode W > 0 turns the block into a sliding lookahead window.
+                const int32_t kv_batch_end =
+                    params.kv_window > 0 ? std::min(cur_length, kv_e + params.kv_window)
+                                         : (kv_dual ? kv_e : cur_length);
+
                 if (kv_warm_needed) {
                     llama_diffusion_set_phase(sc_model, /*WARM*/1, kv_dual ? cur_length : b0);
                 } else if (!kv_dual) {
                     llama_diffusion_set_phase(sc_model, /*DECODE*/2, b0);
                     batch_first = b0;
+                    batch_last  = kv_batch_end;
                 } else {
                     llama_diffusion_set_block(sc_model, b0, cur_length);
                     llama_diffusion_set_phase(sc_model, /*BLOCK*/3, 0);
                     batch_first = b0;
-                    batch_last  = kv_e;
+                    batch_last  = kv_batch_end;
                 }
             }
 
@@ -492,8 +507,9 @@ void diffusion_generate(llama_context *          ctx,
 
             if (kv_on) {
                 if (kv_warm_needed) {
-                    kv_warm_needed      = false;  // the store is fresh
-                    kv_steps_since_warm = 0;
+                    kv_warm_needed        = false;  // the store is fresh
+                    kv_steps_since_warm   = 0;
+                    kv_commits_since_warm = 0;      // commits from here on stale the store
                 } else {
                     kv_steps_since_warm++;
                 }
@@ -517,11 +533,11 @@ void diffusion_generate(llama_context *          ctx,
             int64_t time_start_sampling = ggml_time_us();
 
             mask_positions.clear();
-            // prefix mode decodes the WHOLE suffix - commit anywhere in it (restricting
-            // commits to the block inflated 15-step runs to the 128-step cap); dual mode
-            // only has logits for the block rows
+            // commits are possible wherever we HAVE logits: the whole batch window.
+            // (restricting commits to the block inflated 15-step runs to the 128-step
+            // cap; whole-window commits keep baseline step dynamics)
             const int32_t scan_lo = kv_on ? kv_s : 0;
-            const int32_t scan_hi = (kv_on && kv_dual) ? kv_e : cur_length;
+            const int32_t scan_hi = kv_on ? std::min(batch_last, cur_length) : cur_length;
             for (int32_t i = scan_lo; i < scan_hi; i++) {
                 if (output_tokens[i] == params.mask_token_id) {
                     // For block-based, only consider current block
@@ -695,6 +711,7 @@ void diffusion_generate(llama_context *          ctx,
                                 params.output_confidences[mask_positions[mask_idx]] = confidences[i].first;
                             }
                             n_committed++;
+                            kv_commits_since_warm++;
                         }
                     }
 
@@ -705,6 +722,7 @@ void diffusion_generate(llama_context *          ctx,
                             if (params.output_confidences) {
                                 params.output_confidences[mask_positions[mask_idx]] = confidences[best].first;
                             }
+                            kv_commits_since_warm++;
                         } else {
                             // a cached step wants to commit ONLY end tokens: the answer is
                             // likely complete - verify with an exact warm forward NOW

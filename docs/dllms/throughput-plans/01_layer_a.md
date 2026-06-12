@@ -615,3 +615,69 @@ equal-size uncached ones throughout.
 - Methodology that found the bugs, in order of usefulness: per-step row+ms logging
   (KVTIME pattern) > nsys kernel sums > GGML_SCHED_DEBUG (no output in release builds)
   > theorizing. Instrument FIRST next time.
+
+
+## 14. EXHAUSTION LOG (r5, 2026-06-12): parameter sweeps + wild ideas, all measured
+
+Method: fixed 3-prompt matrix (haiku ub320 / story ub512 / Elixir GenServer CODE ub512 -
+the mission KPI), single-seed for exploration, 3 seeds {3,103,203} for finals (the bench
+taught us single-seed deltas are path-luck: rewarm 4/6/8 single-seed gave 11.6/9.4/15.2 s
+- a jagged landscape that only seed-sums resolve). Completeness verified by zero mask
+pieces in output (all reported configs produced complete, fence-terminated code).
+
+### 14.1 FINAL multi-seed results, CODE KPI (sum of 3 seeds)
+| config                  | total (3 seeds) | speedup | notes |
+| baseline (kv off)       | 76.7 s          | 1.00x   | 23.5/28.4/24.7 s |
+| kv_prefix 32, rewarm 12 | 37.5 s          | 2.04x   | tight: 12.4-12.6 s |
+| kv_prefix 32, rewarm 6  | 29.1 s          | 2.64x   | tight: 9.5-10.0 s |
+| kv_block 32             | 24.9 s          | 3.08x   | tight: 8.0-8.7 s - the code champion |
+Short-form check (single seed): haiku off 0.39 s, prefix+window 0.55 s, kv_block 2.0 s;
+story off 1.28 s, kv_block 2.9 s. NOTHING earns default-on; the recommendation is
+content-aware (sec 14.4).
+
+### 14.2 kv-block REDEEMED for code (and why the earlier verdict was incomplete)
+Sec 13.5 called dual mode "step-inflated on long free-form text" - true for the STORY
+(prose: model wants to commit globally; story off=15 steps, blk32=58). But long CODE is
+locally-structured: block-ordered commits cost steps (128 vs 96) yet each block step is
+~8x cheaper, netting 3.08x. The step count is not the cost model; rows x steps is.
+kv_block 64 and kv_block+rewarm tweaks measured slightly worse than plain kv_block 32.
+
+### 14.3 Wild ideas: tried, measured, verdicts
+- COMMIT-MASS re-warm trigger (drift tracks canvas changes, so re-warm after N commits
+  instead of N steps - principled!): REJECTED. cm24 = 18.4 s vs cadence-12's 11.7 s on
+  code. Mechanism: heavy-commit phases are exactly when generation is going WELL; the
+  trigger fires warms at the worst moments. Principled != better.
+- SUFFIX LOOKAHEAD WINDOW (--diffusion-kv-window W; DPad-style: drop distant masks from
+  the batch entirely; in dual mode = sliding-window lookahead commits, the sec 13.5
+  "commit-policy redesign"): MIXED, net REJECTED as default. prefix+w64 11.3 s (vs 11.7)
+  with 111 cheap steps - marginal; dual+w64 10.0 s vs plain dual 8.0 s - worse (lookahead
+  rows cost more than the steps they save); +commit-mass combos hit the step cap. The
+  flag stays (harmless, possibly useful on other shapes) but earns no default.
+- F16 STORE: BLOCKED by CUDA - ggml_concat asserts src0 F32 (ggml/src/ggml-cuda/
+  concat.cu:149) and decode concatenates the store every step. Crashed at step 1 on
+  512-canvas (small canvases sneak through via different graph paths - a trap). The env
+  toggle was REMOVED (a crashing knob is worse than no knob); revisit via an F16 concat
+  kernel or a copy-into-preallocated-buffer layout (no concat at all - which would also
+  kill the 3-way-concat aliasing dance of sec 9c). Cast plumbing left in the graphs.
+- REWARM CADENCE: swept {4,6,8,12,24}; 6 wins on multi-seed (2.64x vs 2.04x at 12) and
+  is now the DEFAULT (kv_rewarm=6). Fresher caches commit better, fewer steps - down to
+  the point where warm cost dominates (4 is worse).
+
+### 14.4 Recommendation table (until kintsugi grows content-length routing)
+| workload                          | config |
+| short answers / chat (<~150 tok)  | kv OFF (EOT-shrink owns this regime) |
+| kintsugi drafts at n_gen <= 192   | kv OFF (bench-verified: prefix costs +38% wall) |
+| long code generation (>= ~300 tok)| kv_block 32 (3.1x) or kv_prefix 32 rewarm 6 (2.6x, gentler worst-case) |
+| prose/story                       | kv OFF |
+All defaults remain OFF; flags: --diffusion-kv-prefix/-kv-block/-kv-rewarm/-kv-window
+(+ server request params kv_prefix/kv_block/kv_rewarm/kv_rewarm_commits/kv_window).
+
+### 14.5 Exhaustion status
+Layer A core: DONE (prefix + dual shipped, tuned, content-routed recommendations).
+Tried-and-rejected: commit-mass warms, sliding-window lookahead, F16-store-via-concat.
+Remaining in the wider Layer A family (deliberately deferred, see catalog): A2 V-verify
+feature caching (code workloads cache worst per its own paper), A3 design bake-off,
+F10 cross-request canvas cache (needs a design doc; biggest open idea - repair canvases
+are 95% identical across requests), F16 store via layout change, LLaDA execution test
+(no model on disk). Regressions green at exit: 14/14 sampler tests, baseline path
+byte-identical (363 ms haiku), DG untouched.

@@ -60,6 +60,14 @@ struct diffusion_params {
                                        // warm forward, then block-only steps vs the frozen full canvas.
                                        // Requires conf_threshold > 0, timestep schedule, no infill/cfg/sc.
 
+    int32_t kv_rewarm        = 6;      // re-warm after this many cached steps (drift guard; swept 2026-06-12)
+    int32_t kv_rewarm_commits = 0;     // re-warm after this many commits since last warm (0 = off;
+                                       // drift tracks canvas CHANGES, not steps - often the better trigger)
+    int32_t kv_window        = 0;      // suffix lookahead window beyond the active block (0 = mode default:
+                                       // prefix decodes the whole suffix, dual decodes the block only).
+                                       // With W: decode/commit only [block_start, block_end + W) - distant
+                                       // masks are dropped from the batch entirely (DPad-style)
+
     float * output_confidences = nullptr;  // [out, optional, size max_length] confidence at commit time per
                                            // position; -1 = prompt/uncommitted/ORIGIN (records no confidence)
 
