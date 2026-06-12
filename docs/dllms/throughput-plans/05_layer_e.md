@@ -479,3 +479,40 @@ temp 0, seed 7, kv+bs, steps 384 = the 8.42 ms/step E4 reference):
 GGML_CUDA_DISABLE_GRAPHS=1 (CUDA-graph replay off) x LLAMA_GRAPH_REUSE_DISABLE=1
 (llama graph-rebuild every decode). Expected 1.2-1.5x if launch-bound, possibly
 nothing if already reusing. Results below.
+
+### E6 MEASURED (2026-06-13, 5070 laptop AC, 2 reps each, 293 steps/472 tok fixed)
+
+| config | ms/step (rep1 / rep2) |
+|---|---|
+| default (graphs + reuse)   | 8.48 / 8.52 |
+| GGML_CUDA_DISABLE_GRAPHS=1 | 8.46 / 8.52 |
+| LLAMA_GRAPH_REUSE_DISABLE=1| 8.60 / 8.65 |
+| both off                   | 8.58 / 8.61 |
+
+VERDICT: NOTHING TO GAIN on this hardware. CUDA-graph replay is worth exactly
+zero on AC (the GPU is the bottleneck; launches hide behind the async queue -
+same conclusion as the 2026-06-10 Dream A/B); llama-graph reuse IS engaging on
+the DECODE path and is worth ~0.1 ms/step (~1.5%) - the can_reuse/phase-marker
+machinery works as designed, the answer to the "was capture/replay measured"
+question is now yes. The ~8.4 ms step is forward-bound (~7 ms model forward,
+layer-D probe floor + ~1.4 ms host loop/readback). CAVEAT carried forward: this
+null is 5070-on-AC-specific; launch-bound regimes (battery, Pascal Celeron rig)
+are where graphs paid 1.5x before - the rig-day GGML_CUDA_FORCE_GRAPHS A/B
+(p106 doc E3) is still owed and unaffected by this verdict.
+
+## LAYER E PART-1 CLOSURE (2026-06-13)
+
+07_layer_f.md PART 1 status:
+- E4 backend sampling: ADOPTED (+37-47% deliverable, 9.2-9.8 vs 6.3-6.8 tok/s
+  same-process; raw 191 tok/s; temp-0 byte-identical; default ON).
+- E5 commit-rate levers: ALL MEASURED, NONE ADOPTED - 1.85 commits/step is the
+  model's honest decode-side rate; further gains are training-side (E1/F3).
+- E6 graph check: measured, nothing to gain on the 5070/AC; rig caveat recorded.
+- E-rig P106 validation: BLOCKED on hardware (no P106 on hand) - runbook in
+  docs/dllms/p106-mining-fleet.md sec 9 unchanged; note the pkv per-MODEL state
+  caveat (one replica per model process) still applies.
+- E1 SDTT: stays PARKED behind F2's oracle-probe verdict (07_layer_f.md).
+Bench state at close: e4bs = 19/48, 9.24-9.76 tok/s deliverable (vs 3.54 at E2
+uncached CPU-sampled = 2.6-2.8x cumulative from E3+E4). Regressions green:
+14/14 sampler tests CPU+GPU; Dream masked path untouched (block-AR loop only);
+defaults: thr 0.9, sb 8, block_kv per request, backend sampling on.
