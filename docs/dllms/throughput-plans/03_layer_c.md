@@ -186,11 +186,13 @@ square no-cache path takes any contiguous batch; rope uses batch.pos).
 - C5: REJECTED (slim 28/48, mid catastrophic; full wrapper stays). See C5 section.
 - C6: DONE as opt-in ("multi_hole"); pass-neutral and DORMANT on Dream bench
   (parse cascades produce one diagnostic at a time). See C6 section.
-- Layer C net: ONE production win (C1a window 64 = 3.67x on long code), one engine
-  capability banked default-off (C4), two harness hypotheses cleanly refuted by the
-  bench (C5, C6-on-Dream). The recommendation table consolidates across layers:
-  long-code generation wants window 64 (3.67x) OR kv_block 32 (3.08x) - composition
-  of the two is the obvious next experiment (currently mutually exclusive in v1).
+- Layer C net (after second pass): ONE production win (C1a window 64 = 3.67x on
+  long code), one engine capability banked default-off (C4 - mechanism-mismatched,
+  see second-pass section), three hypotheses refuted cross-checked (C5; C6 dormant
+  on BOTH models; window-x-kv composition worse at HEAD too). Final recommendation:
+  long-code generation wants window 64 (3.67x) OR kv_block 32 (3.08x), NOT both -
+  the exclusion is empirical now. LAYER C IS CLOSED; bench profiles slim/mid are
+  retired from the runnable set (crash hazard + verdict recorded).
 
 ### C5 prompt slimming: MEASURED, REJECTED (recovered from crashed sessions)
 Two sessions died mid-C5 (see crash post-mortem below); results recovered from
@@ -241,6 +243,31 @@ growth fires when needed (gen_initial 48 counter: grew once 91->155, complete co
   showed 2x - same content-gated family as window 64 / kv_block 32; composition with
   window is the open experiment.
 
+### C4 second-pass review (same day): verdict UPGRADED to "mechanism mismatched"
+A deeper probe round invalidated even the residual "long generations" hope:
+- Across ALL 76 grow-enabled server generations (grow bench + probes): grew 0
+  time(s), every single run. The stack-task "2x win" above also grew 0 - it was
+  path perturbation from the smaller start, not growth.
+- STUB ADAPTATION, the root cause: gen_initial 32 on the 7-function Stack task
+  produces a complete-LOOKING module whose bodies are "# stack implementation"
+  comment stubs, EOG'd neatly inside the 32-token window (2 seeds, identical
+  behavior). The model PLANS THE ANSWER TO FIT THE VISIBLE CANVAS - canvas size is
+  effectively a length prompt. Growth-by-frontier-pressure assumes autoregressive
+  overflow demand; masked diffusion shapes demand to supply, so the trigger
+  (frontier near end, no EOG) is starved by construction. Prose prompts EOT-bail
+  even on the full canvas (story task: 0 words at 512), so no regime exercises it.
+- The ONLY observed firing remains the gi-48 counter probe (structural momentum of
+  unclosed code outran the plan by a hair: one grow, 91->155).
+- Degeneracy guard with growth: 0 aborts in all 76 grow-enabled bench generations
+  (plan risk "C4 must not fight the guard" - no false positives observed; the v3
+  criterion is bound-independent by design).
+- window + gen_initial compose without geometry errors (244 rows pruned + growth
+  bookkeeping + EOT-shrink in one run, clean termination).
+- FINAL: C4 stays in the tree as a correct, default-off curiosity. Do NOT spend
+  further tuning effort on growth triggers; any future "small active canvas" work
+  must counter stub adaptation FIRST (e.g. length-hint prompting or schedule-side
+  length control), which is a different research problem.
+
 ### C6 multi-hole repair: IMPLEMENTED, MECHANISM VERIFIED - DORMANT on bench v2
 Implemented opt-in ("multi_hole" => cap, bench profile mh2; cap 2 per unresolved
 Q2): on a FRESH error (same-line streak 0), >= 2 semantic error diagnostics on
@@ -260,6 +287,14 @@ sizes - one infill, one verify; broken results fall back to the single-hole ladd
   Re-check on DiffuCoder (different failure modes) before investing further; the
   "fewer roundtrips on p_double cascades" expectation is REFUTED for Dream (those
   cascades are parse errors, by construction outside C6's reach).
+- DIFFUCODER RE-CHECK DONE (second pass, same day): fresh baseline at HEAD 33/48
+  (committed to baselines/, replaces the stale 45-case one), mh2 33/48 - repairs
+  63 == 63, zero flips, zero per-case repair-count changes. Multi-hole NEVER FIRED
+  on DiffuCoder either. The dormancy is now CROSS-MODEL: by the time a real draft
+  PARSES, at most one semantic error line remains (truncation/fence damage fails at
+  the parser, which reports one error per round and serializes the ladder). C6's
+  precondition is structurally absent from dLLM draft pathology, not just Dream's.
+  CLOSED - keep the opt-in, spend nothing more here.
 
 ### Verification record (this session)
 - 14/14 sampler tests CPU+GPU at HEAD and again (GPU) after the C4 engine change.
@@ -283,6 +318,18 @@ sizes - one infill, one verify; broken results fall back to the single-hole ladd
    (never fires); revisit with DiffuCoder.
 3. C1a+kv mutual exclusion: kept for v1; window-x-kv composition remains the top
    open experiment for long-code generation (3.67x vs 3.08x candidates).
+   SECOND PASS: composition MEASURED at HEAD and CLOSED. Motivation for re-test:
+   the Layer A "dual+w64 worse" verdict predated guard v3, and guard v2 was a known
+   false-positive source under kv+window combos. Result at HEAD (CLI, stack task,
+   seed 3): blk32 2.46 s/40 steps, blk32+kvw64 4.05 s/47, blk32+kvw128 6.22 s/63 -
+   monotonically worse with window size, same direction as the old verdict, now
+   clean of the guard-v2 confound. Mechanism: dual mode's per-step batch is the
+   BLOCK (tiny); a lookahead window multiplies per-step rows for steps it rarely
+   saves. The window family's value is exclusive to the square path; kv dual stays
+   pure-block; the mutual exclusion is now EMPIRICALLY justified, not v1 caution.
+   (Caveat: raw-CLI prompts are path-jagged on Dream - off/win64 EOT-bailed on this
+   task - but the dual-mode ordering is internally consistent and matches history;
+   not worth 3-seed finals on a flaky elicitation.)
 
 ### Crash post-mortem (2026-06-12, two dead sessions)
 Both deaths occurred during C5 `mid`-profile bench runs, ~4-5 min into sustained

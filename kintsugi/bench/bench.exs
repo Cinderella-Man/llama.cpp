@@ -27,8 +27,10 @@ defmodule Kintsugi.Bench.Runner do
     "ec05" => %{"early_commit" => 0.5},
     "remask03" => %{"remask_margin" => 0.3},
     "win64" => %{"window" => 64},
-    "slim" => %{"slim_prompt" => true},
-    "mid" => %{"slim_prompt" => "mid"},
+    # C5 slim/mid REMOVED from the runnable set (results kept in results/*c5-*):
+    # both REJECTED (slim 28/48, mid 8/18 p-tier), and their repair-cascade load
+    # crashed the machine twice - see 03_layer_c.md crash post-mortem. Re-adding
+    # them requires reading that section first.
     "grow" => %{"n_gen" => 384, "gen_initial" => 96},
     "big384" => %{"n_gen" => 384},
     "mh2" => %{"multi_hole" => 2}
