@@ -64,10 +64,12 @@ Three independent, cheap, bench-gated experiments (~one bench each; can share a 
 
 ### E-rig. P106 validation run (deployment gate, not a speedup)
 - FastDLLM Q4 (986 MB) + block-kv on one P106-100: measure ms/step, tok/s, VRAM.
-- CAVEAT (documented in 05_layer_e.md): pkv state is per-MODEL - one replica per
-  model process; the multi-replica single-process server does NOT compose with
-  block-kv yet. Either run one process per card on the rig, or move pkv to
-  per-context state first (small refactor; do it only if the rig numbers justify).
+- CAVEAT RESOLVED (2026-06-13, F1 de-risk probe): the multi-replica server DOES
+  compose with block-kv - each replica is its OWN llama_model instance
+  (mmap-shared weights, separate pkv store/phase state), and 3 concurrent
+  block_kv requests across 3 replicas on one GPU ran correctly. The per-MODEL
+  pkv caveat only forbids sharing ONE model object across concurrent contexts,
+  which the server never does. No per-context refactor needed for the rig.
 
 ### E1. SDTT distillation - STAYS PARKED until F2 evidence lands
 Bar unchanged: beat 21/42 draft-only at <= 1 GB. F2's oracle probe (below) may

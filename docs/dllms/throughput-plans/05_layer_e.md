@@ -298,7 +298,9 @@ on edge cases; the 21 vs 19 delta is that sensitivity, not a cache defect.
 RECOMMENDATION: --diffusion-block-kv ON for FastDLLM serving (2.3x deliverable,
 2.5x wall; the rig's currency). Note for multi-replica rig serving: pkv phase
 state is per-MODEL - single replica per model process only (same caveat as
-Dream layer A).
+Dream layer A). [CAVEAT RESOLVED 2026-06-13: the multi-replica server creates a
+SEPARATE llama_model per replica, so block-kv + replicas compose fine - verified
+live with 3 concurrent block_kv requests on 3 replicas (F1 probe, 07_layer_f.md).]
 
 NEXT BITES at the ~10.3 ms step floor: backend sampling for block-AR (saves the
 ~3 ms full-vocab 32-row D2H per step), sub-block tuning, P106 validation.
