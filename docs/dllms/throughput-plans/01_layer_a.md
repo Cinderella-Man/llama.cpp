@@ -157,6 +157,30 @@ plus block semantics.
   GGML_CUDA_FORCE_GRAPHS on Pascal later.
 - Backend sampler eligibility (cfg_scale<=0 etc., diffusion.cpp:~250) is orthogonal.
 
+### 3e-pre. FlashAttention vs rectangular masks - VERIFIED SAFE
+Upstream's own no-cache path (src/llama-graph.cpp:2175-2185) creates the mask at EXACT
+size [n_tokens, n_tokens] with no GGML_KQ_MASK_PAD padding, F16 when flash_attn - and
+our FA A/B timings (237 vs 254 ms/step) ran Dream through fattn with exactly these
+unpadded masks at non-multiple-of-64 sizes. Rectangular [n_kv, n_q] masks are what the
+AR KV path feeds fattn every day. Conclusion: the decode-phase rectangular mask needs
+NO padding and works under FA. Safety check anyway (one command, sec 11): run a
+kv-prefix generation with -fa on and -fa off and diff outputs at temp 0 - if FA-on
+asserts or garbles, set type_mask F32 + force the no-FA path in decode phases only.
+
+### 3e2. inp_out_ids under block batches - VERIFIED HARMLESS
+build_inp_out_ids (src/llama-graph.cpp:1924) is kept even when ALL tokens are outputs,
+deliberately, for constant graph topology (upstream comment cites pipeline parallelism).
+encode() marks every row as output, so for block batches out_ids is an identity row
+selection - no change needed in dream.cpp:98.
+
+### 3e3. Reading model state inside the graph + phase restore precedents
+DG graph ctor reads phase via a C-style cast (diffusion-gemma.cpp:296):
+    const auto & dmodel = (const llama_model_diffusion_gemma &) model;
+    const auto   phase  = dmodel.pkv_phase;
+Dream's graph ctor gets the same `const llama_model & model` - copy the pattern.
+Phase-restore precedents to imitate: examples/diffusion/diffusion.cpp:834 (restore
+before fallback paths) and :966 (restore after the EB loop "for later turns").
+
 ### 3e. Model geometry (read from the GGUF header, gguf-py)
 Dream-7B: 28 layers, 28 Q heads, 4 KV heads, n_embd 3584 -> head_dim 128,
 n_embd_k_gqa = 512. rope_freq_base 1e6. DiffuCoder = same arch (Dream).
@@ -289,3 +313,166 @@ phase usage), src/llama-model.cpp:2013 (memory routing), src/llama-context.cpp:1
 :1515 (encode). Catalog context: docs/dllm-throughput-catalog.md Layer A. Honest
 expectations: 2-4x on drafts (not 27x - we already run threshold decoding); code
 workloads cache worse than prose (dLLM-Cache: HumanEval 1.36x vs GSM8K 5.1x).
+
+
+## 9. Code skeletons (near-compilable; names final unless noted)
+
+### 9a. models.h - state fields for llama_model_dream (copy for llada)
+    // prompt/prefix KV store for cached diffusion decoding (see docs/dllms/
+    // throughput-plans/01_layer_a.md). Mirrors llama_model_diffusion_gemma.
+    enum pkv_phase_t { PKV_UNIFIED = 0, PKV_WARM = 1, PKV_DECODE = 2, PKV_BLOCK = 3 };
+    mutable pkv_phase_t pkv_phase = PKV_UNIFIED;
+    mutable int64_t     pkv_P     = 0;   // cached prefix length (WARM: rows to store)
+    mutable int64_t     pkv_L     = 0;   // full canvas length (BLOCK mode)
+    mutable int64_t     pkv_s     = 0;   // block start (BLOCK mode)
+    mutable int64_t     pkv_cap   = 0;
+    mutable std::vector<ggml_tensor *> pkv_k, pkv_v;
+    mutable ggml_context * pkv_ctx = nullptr;
+    mutable ggml_backend_buffer_t pkv_buf = nullptr;
+(Numbering note: DG keeps PKV_PREFILL=1/PKV_DECODE=2; Dream's WARM generalizes PREFILL.
+Keep the public ints stable: 0=unified, 1=warm/prefill, 2=decode, 3=block.)
+
+### 9b. set_phase generalization (diffusion-gemma.cpp or a new diffusion-common.cpp)
+    void llama_diffusion_set_phase(struct llama_model * model, int phase, int32_t P) {
+        if (auto * dg = dynamic_cast<llama_model_diffusion_gemma *>(model)) {
+            dg->pkv_phase = ...; dg->pkv_P = P;
+            if (phase && P > 0) pkv_ensure_store(dg->fields..., P);
+            return;
+        }
+        if (auto * dr = dynamic_cast<llama_model_dream *>(model)) { ...same...; return; }
+        if (auto * ll = dynamic_cast<llama_model_llada *>(model)) { ...same...; return; }
+    }
+    // NEW API (llama.h, next to :574):
+    LLAMA_API void llama_diffusion_set_block(struct llama_model*, int32_t s, int32_t L);
+pkv_ensure_store = dg_ensure_pkv_store (:631) parameterized by (hparams, dev, fields) -
+it already only uses n_layer, n_embd_head_k(il), n_head_kv(il), dev_layer(0).
+
+### 9c. dream.cpp graph - phase branches (insert between rope :88 and build_attn :94)
+    const auto & dmodel = (const llama_model_dream &) model;
+    const auto   phase  = dmodel.pkv_phase;     // read ONCE before the layer loop
+    const int64_t P     = dmodel.pkv_P;
+    // mask setup before the layer loop (replaces unconditional :68):
+    llm_graph_input_attn_no_cache * inp_attn = nullptr;
+    if (phase == PKV_DECODE || phase == PKV_BLOCK) {
+        const int64_t n_kv = (phase == PKV_BLOCK) ? dmodel.pkv_L : P + n_tokens;
+        auto uptr = std::make_unique<llm_graph_input_attn_diffusion_decode>(
+                        hparams, cparams, n_kv - n_tokens, n_tokens);  // all-allow fill
+        const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
+        ggml_set_input(uptr->self_kq_mask);
+        uptr->self_kq_mask_cnv = uptr->self_kq_mask;
+        inp_attn = (llm_graph_input_attn_no_cache *) res->add_input(std::move(uptr));
+    } else {
+        inp_attn = build_attn_inp_no_cache();
+    }
+    // per layer, after rope:
+    if (phase == PKV_WARM) {                    // square attn + store first P rows
+        ggml_tensor * sk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv,
+                                        P, dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], 0);
+        ggml_tensor * kP = ggml_view_3d(ctx0, Kcur, n_embd_head, n_head_kv, P,
+                                        Kcur->nb[1], Kcur->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, kP, sk));   // same for V
+        // attention: unchanged square path (Q,K,V as today)
+    } else if (phase == PKV_DECODE) {           // prefix-cache step
+        ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv,
+                                        P, ..., 0);
+        ggml_tensor * Kfull = ggml_concat(ctx0, pk, Kcur, 2);    // same for V
+        cur = build_attn(inp_attn, wo, ..., Qcur, Kfull, Vfull, ..., il);
+    } else if (phase == PKV_BLOCK) {            // dual-cache step (Phase 2)
+        // write batch rows into store at block offset (BYTE offsets!):
+        ggml_tensor * dst = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv,
+                                        n_tokens, nb1, nb2, (size_t)(dmodel.pkv_s) * nb2);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, dst));  // same for V
+        ggml_tensor * Kall = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv,
+                                        dmodel.pkv_L, nb1, nb2, 0);
+        cur = build_attn(inp_attn, wo, ..., Qcur, Kall, Vall, ..., il);
+    } else { /* UNIFIED: existing code, untouched */ }
+ORDERING SUBTLETY (PKV_BLOCK): the cpy into the store and the attention read of the
+store are both in one graph - ggml executes in dependency order, and Kall is a VIEW of
+the same buffer the cpy writes. ggml does not track view aliasing as a dependency!
+Force ordering: build the cpy with ggml_build_forward_expand BEFORE creating Kall, and
+make Kall depend on the cpy via ggml_view of the SAME tensor AFTER... safest pattern:
+attend Kfull = ggml_concat(store_prefix_view, Kcur, store_suffix_view) instead of
+writing-then-reading in one graph (3-way concat: [0..s) cached, [s..e) fresh from
+Kcur, [e..L) cached) and do the store WRITE of block rows too (for the NEXT step).
+The 3-way-concat read does not alias the written region - no ordering hazard. DG
+avoids this by never reading rows it writes in the same graph; mirror that property.
+
+### 9d. diffusion.cpp - prefix-cache loop (Phase 1, threshold path)
+    const int32_t kvb = params.kv_prefix;                 // block size, 0 = off
+    for (int32_t s = n_input; s < cur_length; s += kvb) {
+        const int32_t e = std::min(s + kvb, cur_length);
+        // (a) warm: full canvas, store rows [0..s)
+        llama_diffusion_set_phase(model, /*WARM*/1, s);
+        build_full_batch(0, cur_length);                  // pos 0..cur_length
+        decode + sample + commit(mask: pos < e);          // existing threshold code
+        // (b) cached steps until block clean
+        llama_diffusion_set_phase(model, /*DECODE*/2, s);
+        const int32_t b0 = params.shift_logits ? s - 1 : s;   // extra row for shift
+        while (block_has_masks(s, e) && steps_left) {
+            build_batch(b0, cur_length);                  // pos b0..cur_length
+            decode + sample + commit(mask: pos < e);
+            // row lookup: row = (shift ? pos-1 : pos) - b0
+        }
+    }
+    llama_diffusion_set_phase(model, 0, 0);               // EVERY exit path
+Integration notes: reuse the existing threshold-commit block verbatim - only the
+batch-build and get_row_for_pos change; keep the degeneracy guard (absolute pos);
+EOT-tail shrink runs at block boundaries only (re-derive cur_length after each block).
+
+### 9e. Flags / server
+common/arg.cpp (DIFFUSION example): --diffusion-kv-prefix N, --diffusion-kv-block N ->
+common_params_diffusion { int32_t kv_prefix = 0; int32_t kv_block = 0; } (note: DG
+already has eb_kv_cache; keep names distinct). diffusion-server.cpp make_masked_params:
+dp.kv_prefix = req.value("kv_prefix", p.diffusion.kv_prefix); same for kv_block;
+mutually exclusive - kv_block wins, log a warning if both set.
+
+## 10. Interactions with the rest of the catalog (sequencing advice)
+- B1 adaptive threshold (tiny, do FIRST): fewer steps per block raises the warm-to-step
+  ratio - re-measure Layer A gains AFTER B1 lands so the bench reflects the real ratio.
+- G9 skeleton-seeded drafts: pre-committed spans mean blocks may START fully committed -
+  the block loop must skip clean blocks without spending a warm forward on each (check
+  block_has_masks BEFORE warming; one shared warm covers consecutive clean blocks since
+  nothing needs decoding there - just advance s).
+- C1 suffix-window pruning: composes in PKV_BLOCK by capping the attended store view at
+  e+W (sec 5 step 14); in PKV_DECODE by capping the suffix batch at min(cur_length, e+W).
+- EOT-tail shrink: already integrated (block-boundary shrink, sec 5 step 11).
+- D1 SSD / D3 batching: only meaningful AFTER dual cache (they exploit the tiny per-step
+  batches); re-measure memory-boundness then.
+- Infill (kintsugi repairs): leave kv off initially (sec 5 step 16) - repair canvases
+  are small and fixed-overhead-dominated; measure before bothering.
+- A2 dLLM-Cache (V-verify feature caching): a different, deeper mechanism (caches
+  AttnOut/FFN too, partial recompute). Build A1 first; A2 only if the bench shows
+  remaining headroom AND code-workload caveat (HumanEval 1.36x) is acceptable.
+
+## 11. Validation commands (copy-paste)
+    # build
+    cmake --build build -j --target llama-diffusion-cli llama-diffusion-server \
+        test-backend-sampler
+    # sampler regression (must stay 14/14 on both)
+    LLAMACPP_TEST_MODELFILE=~/models/qwen05b/qwen2.5-0.5b-instruct-q8_0.gguf \
+        ./build/bin/test-backend-sampler --device gpu   # and --device cpu
+    # deterministic-mode token diff (catches row-mapping off-by-ones; threshold OFF,
+    # fixed seed, pure schedule):
+    ./build/bin/llama-diffusion-cli -m ~/models/dream7b/Dream-*Q4_K_M.gguf -p "test" \
+        -ub 256 --diffusion-eps 0.001 --diffusion-steps 32 --temp 0 --seed 7 -ngl 99 \
+        [--diffusion-kv-prefix 32]   # run with and without; diff the outputs; EXPECT
+                                     # small drift (approximation) - review, not assert
+    # FA interaction check
+    ... same command with -fa on / -fa off under kv-prefix: both must produce sane text
+    # quality gate (the real one): kintsugi bench on both models
+    ./build/bin/llama-diffusion-server -m <dream|diffucoder> -ub 512 -ngl 99 \
+        --diffusion-eps 0.001 --diffusion-steps 128 --temp 0.2 --top-k 40 \
+        --diffusion-kv-prefix 32 &
+    cd kintsugi && mix run bench/bench.exs    # pass-rate within noise vs baseline table
+    # DG regression (phase API shared): one canvas generate via server + eb kv_cache on
+    # VRAM check
+    nvidia-smi --query-compute-apps=used_memory --format=csv,noheader  # +27-57 MB only
+    # per-step timing: server log "time per step" by block index (expect shrink)
+
+## 12. Changelog of this guide
+- r1: initial plan (block/dual cache design, DG precedent, phases).
+- r2 (this revision): corrected "Phase 1 exact" fallacy; added verified FA/mask,
+  out_ids, cast/restore findings; code skeletons incl. the PKV_BLOCK view-aliasing
+  hazard and its 3-way-concat resolution; catalog interaction map; literal validation
+  commands.
