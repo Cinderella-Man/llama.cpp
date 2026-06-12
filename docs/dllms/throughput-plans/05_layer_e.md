@@ -408,8 +408,8 @@ x2 ~= tok/s x2. Three independent bench-gated experiments on top of E4 (kv+bs).
 PROGRESS LOG:
 - [x] E5a sub-block sweep: sb 8 (reference) -> 16, 32. Server shape probe, bench.
 - [x] E5b threshold sweep: 0.9 -> 0.85, 0.8. Same protocol.
-- [ ] E5c entropy-bound committer port (DG machinery, trained-in there - fail fast).
-- [ ] Docs/memory updated, committed
+- [x] E5c entropy-bound committer port (DG machinery, trained-in there - fail fast).
+- [x] Docs/memory updated, committed
 
 GATE (07_layer_f.md): bench pass count holds 19/48-class (accept +-2 = the
 measured numerics band); walls + commits/step logged per config. KILL IF passes
@@ -446,3 +446,27 @@ p-tier. sb32's long-form step saving (1.32x wall on the 448-tok probe) does NOT
 transfer to the bench's short drafts - same content-length split as Dream's
 window-64/kv_block (Layers A/C): a knob for genuinely long output, not a default.
 DEFAULTS UNCHANGED: sb 8, thr 0.9.
+
+### E5c MEASURED (2026-06-13) - KILLED
+
+Implemented minimally on E4's machinery (entropy over the top-K plain probs is
+~free in predict(); the EB rule sorts the sub-block's masked positions by
+ascending entropy and accepts while cumulative H <= block_eb, lowest always
+commits). Engine param block_eb + server "block_eb"; default 0 = off; the
+default path is untouched (e4bs re-run on the new binary/process: 19/48, 9.76
+tok/s - also the in-process reference below).
+
+Shape probe (stack-prompt steps): eb 0.1 = 348 (WORSE than thr 0.9's 273 - a
+tight budget under-commits), 0.3 = 297, 0.6 = 281, 1.0 = 241. The budget rule
+only beats the threshold rule at eb 1.0, i.e. at thr-0.8-class aggressiveness.
+
+BENCH e5eb10 (eb 1.0, same process as the e4bs 19/48 / 9.76 reference):
+17/48 - p_double 42+142 and p_max 41+141 LOST (p 10 -> 8), deliverable 9.37.
+VERDICT: REGRESSION - killed. The EB rule samples the same quality-vs-rate curve
+the threshold sweep mapped; without DG's training there is no better operating
+point on it. block_eb stays in the tree default-off (canvas-model precedent).
+
+### E5 LAYER VERDICT
+All three levers measured, NONE adopted: 1.85 commits/step IS the model's honest
+rate (the plan's KILL-IF outcome, now with data). Commit-rate gains for block-AR
+models are training-side work (E1/F3 territory), not decode-side.
