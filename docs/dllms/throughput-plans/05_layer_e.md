@@ -470,3 +470,12 @@ point on it. block_eb stays in the tree default-off (canvas-model precedent).
 All three levers measured, NONE adopted: 1.85 commits/step IS the model's honest
 rate (the plan's KILL-IF outcome, now with data). Commit-rate gains for block-AR
 models are training-side work (E1/F3 territory), not decode-side.
+
+## E6: forward-cost floor - CUDA graph / llama-graph reuse check (2026-06-13)
+
+Plan (07_layer_f.md): the fast-dllm DECODE path sets allow_reuse=true but
+capture/replay was never measured here. A/B at fixed geometry (stack prompt,
+temp 0, seed 7, kv+bs, steps 384 = the 8.42 ms/step E4 reference):
+GGML_CUDA_DISABLE_GRAPHS=1 (CUDA-graph replay off) x LLAMA_GRAPH_REUSE_DISABLE=1
+(llama graph-rebuild every decode). Expected 1.2-1.5x if launch-bound, possibly
+nothing if already reusing. Results below.
