@@ -47,6 +47,10 @@ defmodule Kintsugi.Bench.Runner do
     # e4bs = + backend (GPU) sampling for the block-AR loop
     "e3kv" => %{"conf_threshold" => 0.9, "block_kv" => true, "backend_sampling" => false},
     "e4bs" => %{"conf_threshold" => 0.9, "block_kv" => true, "backend_sampling" => true},
+    # E5 commit-rate levers on top of e4bs (05_layer_e.md)
+    "e5sb32" => %{"conf_threshold" => 0.9, "block_kv" => true, "backend_sampling" => true, "sub_block" => 32},
+    "e5t08" => %{"conf_threshold" => 0.8, "block_kv" => true, "backend_sampling" => true},
+    "e5t085" => %{"conf_threshold" => 0.85, "block_kv" => true, "backend_sampling" => true},
     # D4 hybrid: per-engine thresholds live INSIDE generate_hybrid (draft 0.9,
     # repair engine on its own defaults) - the profile stays empty on purpose
     "d4" => %{}
