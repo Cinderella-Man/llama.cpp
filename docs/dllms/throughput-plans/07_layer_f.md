@@ -78,6 +78,34 @@ standalone quality - reassess after F2.
 
 ## PART 2 - Layer F proper (start when Part 1 E4+E5 are measured)
 
+### F1 MEASURED (2026-06-13) - KILLED on single-GPU; rig racing needs no engine work
+
+De-risk probe ran WITHOUT engine surgery, via the multi-replica server (each
+replica = own llama_model instance = own pkv store, so block_kv + concurrency is
+safe): --diffusion-replicas 3 on the 5070 (3.9 GB VRAM), stack-task drafts at
+seeds {3,103,203}, kv+bs E4 config.
+
+- sequential 3 drafts: 1.38 s wall (0.43/0.39/0.56 s each)
+- concurrent 3 drafts: 1.21 s wall, but EACH request slows to 1.07-1.21 s
+- ratio vs one draft: 2.63 (bar was < 3)
+
+2.63 < 3 passes the formal bar but kills the use case: first-success racing
+SLOWS every case whose first seed passes (0.43 -> 1.07 s, the majority of
+p-tier) and saves only 12% on triple-fail cases. Race-only-redrafts (seed 1
+sequential, 2+3 raced on failure) saves ~10% on double-redraft cases only -
+noise at bench level. The batched-multi-seq variant (one N x 32-row batch,
+per-seq pkv stores) would land ~2.0-2.2x by the E2-checkpoint row-scaling
+numbers - same conclusion, plus the engine surgery the plan costed. The 5070
+has no spare arithmetic at 32-row 1.5B shapes; this is Layer D findings 3/6
+again on the new model.
+
+DECISION: F1 CLOSED for single-GPU serving. Cross-CARD racing on the rig is the
+already-designed farm pattern (catalog G5/G6, kintsugi fires seeds at replicas;
+zero engine work) - implement it AS HARNESS WORK on rig day, where N cards make
+the ratio exactly 1.
+
+Original premise kept for the record:
+
 ### F1. Parallel seed racing (catalog G5/G6) - the layer D re-entry trigger has FIRED
 - PREMISE: layer D was parked with re-entry condition "a genuinely different decode
   regime". E3 IS that regime: flat 10 ms steps, 32-row batches, 1.5B model.
