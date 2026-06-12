@@ -124,3 +124,20 @@ ISOLATED OS process with a timeout (generated code never runs in the harness VM)
 - Vary the seed per repair round or identical canvases re-fail identically.
 - One server endpoint can be a whole multi-GPU rig (`--diffusion-replicas`) -
   the harness only needs multiple endpoints for multiple HOSTS.
+
+## Bench v2 protocol
+
+The bench is the project's measuring instrument - every optimization claim goes
+through it. Design + empirical calibration: ../docs/dllms/dllm-elixir-harness-measuring-updates.md.
+
+    mix run bench/cases.exs          # self-test: every check vs its reference solution
+    mix run bench/bench.exs URL LABEL PROFILE   # profiles: baseline | kvpfx32
+    mix run bench/compare.exs old.jsonl new.jsonl   # gated diff, exit 1 on regression
+
+Rules (calibrated, not guessed):
+- AC power required (the runner refuses on battery; measured 5x skew).
+- Same-seed outcomes are deterministic: identical-config reruns must match exactly.
+- A/B configs run against ONE server process (profiles are request params - walls are
+  only comparable within a process; cross-restart tails reach +138% on marginal cases).
+- Regression = pass lost in p/h/i tiers, or tier median wall +10%.
+- Baselines: bench/results/baselines/*.jsonl (committed; per-model).

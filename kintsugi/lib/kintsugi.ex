@@ -65,6 +65,15 @@ defmodule Kintsugi do
   defp attempt_drafts(eng, instruction, opts, budget, spent, t0, last_error) do
     if budget <= 0 do
       {reason, stats} = last_error || {:no_drafts_attempted, %{drafts: 0, repairs: 0, ms_total: 0, history: []}}
+
+      # failures must bill ALL attempts: without this restamp a 3-draft failure reported
+      # only the last attempt's wall (measured 4-6x under-billing - bench grilling
+      # finding 2 in docs/dllms/dllm-elixir-harness-measuring-updates.md)
+      stats =
+        stats
+        |> Map.put(:ms_wall, System.monotonic_time(:millisecond) - t0)
+        |> Map.put(:drafts, spent)
+
       {:error, reason, stats}
     else
       # each retry drafts from a different seed (identical canvases fail identically)

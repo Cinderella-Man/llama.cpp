@@ -315,3 +315,18 @@ behavior does), the kv_prefix recommendation overturned by the instrument itself
 per-model tier metadata introduced, and server-flag configs replaced by request-level
 profiles that make same-process A/B the standard. Implementation can now proceed with
 no unverified assumptions except the battery-refusal path.
+
+
+## IMPLEMENTED (2026-06-12, commit follows) - validation matrix executed
+- T1 self-test: 13/13 checks valid. T2 offline tests: 10/10.
+- T3 self-consistency: two identical runs -> pass outcomes IDENTICAL, tier medians
+  within 1.2%, VERDICT OK, exit 0.
+- T4 kv-prefix profile (same server, request-level params): passes identical, p-tier
+  median +38.7% -> VERDICT REGRESSION, exit 1. The instrument correctly flags the
+  known Layer-A-on-small-canvas cost; quality gate confirms EOG quarantine holds.
+- T5 failure accounting: external/reported wall ratio now 1.00 on every failing case
+  (was 4-6x under-billed before the lib restamp fix).
+- T6 DiffuCoder baseline: reproduces the probed profile exactly (33/45; p 15/18,
+  c 3/9 - the per-model shape).
+Baselines committed: kintsugi/bench/results/baselines/{dream-baseline,
+dream-kvpfx32, diffucoder-baseline}.jsonl.
