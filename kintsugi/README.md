@@ -24,7 +24,7 @@ Zero runtime dependencies: `:httpc` + the built-in `JSON` module.
 - For GPU speed (strongly recommended - this is the point of the fork): an NVIDIA
   GPU with >= 6 GB VRAM and the CUDA toolkit. Note the toolkit/hardware pairing:
   CUDA 13.x for Turing and newer, CUDA 12.x if you need to target Pascal mining
-  cards (CUDA 13 cannot compile for them - see `../docs/p106-mining-fleet.md`).
+  cards (CUDA 13 cannot compile for them - see `../docs/dllms/p106-mining-fleet.md`).
   CPU-only works for trying things out, just slower per step.
 
 ### 1. Build llama.cpp (the parent directory of this project)
@@ -114,7 +114,7 @@ Useful opts (string keys, passed through to the server): `"seed"`, `"steps"`,
 `"check"` - a string of assertions like `"4 = Mod.f(2)"`, executed in an
 ISOLATED OS process with a timeout (generated code never runs in the harness VM).
 
-## Hard-won knowledge (details in ../docs/dllm-elixir-harness.md)
+## Hard-won knowledge (details in ../docs/dllms/dllm-elixir-harness.md)
 
 - Masked diffusion fills EXACTLY the hole - an undershot hole truncates perfectly
   valid code mid-expression. Size holes by tokenizing the replaced text

@@ -26,7 +26,7 @@ Features added here:
   backend samplers made multi-row) and switched the diffusion sampling loop to it. The
   per-step sampling stage drops from 24-1900 ms (CPU, machine-state dependent) to a flat
   ~2 ms; measured up to 5.3x end-to-end on battery power. Default on;
-  `--no-backend-sampling` reverts. Details: `docs/diffusion-gpu-sampling-plan.md`.
+  `--no-backend-sampling` reverts. Details: `docs/dllms/diffusion-gpu-sampling-plan.md`.
 - **Confidence-threshold parallel decoding** (`--diffusion-conf-threshold`, Fast-dLLM style) -
   commit every token whose confidence clears the threshold each step; 128 steps -> 17-47.
   Includes de-tempered confidence calibration so thresholds mean the same thing at any
@@ -55,7 +55,7 @@ Features added here:
   upstream Ampere+ gate is a heuristic, not a hardware limit). Aimed at Pascal mining
   cards behind weak host CPUs, where per-kernel launch overhead dominates; measured 1.5x
   from graphs on launch-bound hosts.
-- **Cheap-GPU fleet research** (`docs/p106-mining-fleet.md`) - why diffusion LLMs suit old
+- **Cheap-GPU fleet research** (`docs/dllms/p106-mining-fleet.md`) - why diffusion LLMs suit old
   high-compute-per-dollar cards (the workload is prompt-processing-shaped, not
   token-generation-shaped), with a verified build recipe for Pascal/P106 mining rigs
   (CUDA 12.x, driver 580 legacy branch), measured VRAM/RAM envelopes for 6 GB cards, and a
@@ -69,9 +69,9 @@ Features added here:
   tests.
 
 Design notes, measurements and reimplementation-grade documentation:
-`docs/diffusion-gpu-sampling-plan.md`, `docs/dllm-engine-improvements.md`,
-`docs/dllm-elixir-harness.md`, `docs/diffusiongemma-support.md`,
-`docs/p106-mining-fleet.md`.
+`docs/dllms/diffusion-gpu-sampling-plan.md`, `docs/dllms/dllm-engine-improvements.md`,
+`docs/dllms/dllm-elixir-harness.md`, `docs/dllms/diffusiongemma-support.md`,
+`docs/dllms/p106-mining-fleet.md`.
 
 Quick start (masked diffusion, GPU sampling + fast drafts):
 
