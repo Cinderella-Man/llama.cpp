@@ -58,6 +58,7 @@ struct server_state {
 
     int64_t canvas_length = 0;     // > 0 -> canvas/block-diffusion model (entropy-bound path)
     bool    shift_logits  = false;
+    bool    block_ar      = false; // fast-dllm: semi-AR block diffusion decode
 
     diffusion_eb_params eb_defaults;  // resolved from GGUF metadata + CLI overrides (canvas models)
 
@@ -133,6 +134,7 @@ static diffusion_params make_masked_params(const server_state & st, const json &
     dp.kv_anchor        = req.value("kv_anchor",      p.diffusion.kv_anchor);
     dp.window           = req.value("window",         p.diffusion.window);
     dp.gen_initial      = req.value("gen_initial",    p.diffusion.gen_initial);
+    dp.sub_block        = req.value("sub_block",      0);
     dp.remask_margin    = req.value("remask_margin",  p.diffusion.remask_margin);
     dp.remask_budget    = req.value("remask_budget",  p.diffusion.remask_budget);
     dp.backend_sampling = req.value("backend_sampling", p.sampling.backend_sampling);
@@ -231,7 +233,15 @@ static json handle_generate(server_state & st, server_replica & rep, const json 
         dp.out_degenerate = &degenerate;
 
         int32_t n_generated = 0;
-        diffusion_generate(rep.ctx, prefix.data(), output_tokens.data(), n_input, dp, n_generated);
+        if (st.block_ar) {
+            // Fast-dLLM v2: semi-AR block diffusion (infill is not meaningful here)
+            if (infill) {
+                throw std::runtime_error("infill is not supported for block-AR models");
+            }
+            diffusion_generate_block_ar(rep.ctx, prefix.data(), output_tokens.data(), n_input, dp, n_generated);
+        } else {
+            diffusion_generate(rep.ctx, prefix.data(), output_tokens.data(), n_input, dp, n_generated);
+        }
         if (n_generated <= (infill ? 0 : n_input)) {
             throw std::runtime_error("generation failed");
         }
@@ -404,6 +414,7 @@ int main(int argc, char ** argv) {
             }
 
             st.canvas_length = meta_i(rep->model, "diffusion.canvas_length", 0);
+            st.block_ar      = meta_str(rep->model, "general.architecture") == "fast-dllm";
             st.mask_token_id = llama_vocab_mask(rep->vocab);
 
             if (st.mask_token_id != LLAMA_TOKEN_NULL) {
@@ -491,6 +502,7 @@ int main(int argc, char ** argv) {
             {"mask_token_id", st.mask_token_id},
             {"mask_piece",    st.mask_piece},
             {"canvas_length", st.canvas_length},
+            {"block_ar",      st.block_ar},
             {"n_ctx",         (int) llama_n_ctx(st.replicas[0]->ctx)},
             {"n_ubatch",      (int) st.params.n_ubatch},
             {"replicas",      st.replicas.size()},

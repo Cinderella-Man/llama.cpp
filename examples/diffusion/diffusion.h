@@ -92,6 +92,9 @@ struct diffusion_params {
                                        // than 8 masks remain and no EOG is committed; max_length
                                        // stays the allocation. 0 = off (start at max_length).
 
+    int32_t sub_block        = 0;      // Fast-dLLM v2 block-AR decode: sub-block size for the
+                                       // left-to-right commit schedule (0 = 8, the reference).
+
     int32_t kv_anchor        = 3;      // Layer B4: with kv_window in PREFIX mode, always include the
                                        // last N canvas rows in the batch (the "final anchor" - the
                                        // model needs to see that the end exists; streaming-dllm
@@ -117,6 +120,21 @@ void diffusion_generate(llama_context *          ctx,
                         int32_t                  n_input,
                         const diffusion_params & params,
                         int32_t &                n_generated);
+
+// Fast-dLLM v2 (arXiv:2509.26328) block-AR decode: the canvas grows one block_length
+// block at a time (semi-autoregressive); within a block, sub_block spans commit left
+// to right by confidence threshold (always at least the argmax). Attention is
+// block-causal (built into the fast-dllm graph); logits are token-shifted like Dream.
+// v1 is UNCACHED: every step re-forwards [0 .. block_end) on the square path.
+// Uses: max_length (allocation), block_length (0 = 32), sub_block (0 = 8),
+// conf_threshold (0 = 0.9), steps (cap), mask_token_id, top_p/temperature (v1:
+// reference semantics - temperature 0 = argmax; sampling ignored otherwise).
+void diffusion_generate_block_ar(llama_context *          ctx,
+                                 const llama_token *      input_tokens,
+                                 llama_token *            output_tokens,
+                                 int32_t                  n_input,
+                                 const diffusion_params & params,
+                                 int32_t &                n_generated);
 
 // Entropy-bound denoiser for block-diffusion canvas models (DiffusionGemma). Unlike the masked path, the
 // canvas is random-initialized and non-accepted positions are renoised each step; tokens are accepted by a

@@ -229,17 +229,65 @@ verify batch is near-free, which (Finding 3) it is only on the kv-block path.
 3. D2 Spiffy calibration only if D1-lite acceptance < ~60%.
 4. D3a/D3b: CLOSED (Finding 3). D4: unchanged, E2-gated.
 
+## SECOND GRILLING PASS (2026-06-12, same day): the kv question answered - layer PARKED
+
+Probes 1e/5/6 added to the tool; all run on the 5070, Dream Q4_K_M.
+
+### Finding 5: batch-shape numerics do NOT touch commit decisions (1e)
+The single argmax flip in the 103-row identity test sits at confidence 0.128 - far
+below any commit threshold. Zero flips at conf >= 0.5. The Finding-2 drift flips
+only near-tie argmaxes that the threshold rule never commits; "approximately
+lossless" is in practice "commit-stable across batch shapes". The bench gate
+remains mandatory but is expected to be a formality.
+
+### Finding 6: kv-path row-scaling is LINEAR - K=4 verify is NO-GO by the set bar (5)
+Measured WITHOUT mask surgery (timing is mask-content-independent): WARM a 256
+canvas, then BLOCK-phase decodes at W rows vs the shared store:
+W=32 28.0 ms, W=64 43.0 (1.53x), W=96 55.1 (1.97x), W=128 67.9 (2.42x).
+~18 ms floor + ~0.31 ms/row. The plan's GO bar ("K=4 copies <= 2x one block
+step") FAILS at 2.42x. Only K=2 (1.53x) amortizes meaningfully.
+
+### Finding 7: chain acceptance is strong at depth 1, dead beyond (6)
+Oracle probe (greedy threshold replay of the counter task; predictions recorded
+per step, scored when positions commit): Delta1 = 86% (122/142), Delta2 = 40%,
+Delta3 = 32%. One-step-ahead drafts are predictable; two-plus are coin flips.
+Spiffy's multi-level draft graphs (whose value is depth) are DEAD on this decode;
+only k=1 chain speculation has fuel. Caveats: single task, greedy approximation,
+and acceptance measured on positions that DID commit - an optimistic bound for
+the stall steps speculation actually targets.
+
+### Layer verdict: PARKED
+The only configuration left standing is k=1 chain on kv_block with K=2 verify:
+cost 1.53 steps, expected extra commits 0.86 -> ~1.2x on stall plateaus (53% of
+steps), diluted to ~1.05-1.15x overall - BELOW every shipped layer's win, before
+paying the block-diagonal mask surgery and per-variant bookkeeping it requires.
+On the P106 target the economics worsen (compute-poor -> linear term dominates ->
+less amortization, not more). DECISION: park Layer D; the catalog's E2 (tiny
+model existence proof) is the higher-ROI next move, and a future model/hardware
+where the floor share grows (or a decode whose stall fraction rises) is the
+re-entry trigger. The probe tool stays in the tree - re-running it on new
+hardware/models is the cheap re-evaluation path (one command, all seven probes).
+
 ## Unresolved questions (post-grilling)
 1. D0 NO-GO threshold: ANSWERED EMPIRICALLY on the 5070 - square path NO-GO at
    production sizes, tiny-row (<~50) regime GO (Finding 3). P106 re-verify still
    owed before promoting anything to rig defaults.
 2. D3a API shape: MOOT - D3a closed (Finding 3).
 3. D3b racing scope: MOOT - D3b closed (Finding 3).
-4. D1-lite draft length k: OPEN - sweep {2,3,5} in the first matrix; the stall
-   histogram (Finding 4: most stalls are 1-3 commits) predicts k=3 dominates.
-5. Chain order: OPEN, recommendation REVISED - confidence-descending still matches
-   the commit rule, but exact identity is unattainable anyway (Finding 2), so the
-   tie-breaker is acceptance rate, not identity; measure both orders once.
-6. NEW - kv-path block-diagonal batch submask: v1 throwaway hack to unblock the
-   kv microbench, or design the reusable multi-variant phase up front?
-   Recommended: hack first, measure, design only after a GO.
+4. D1-lite draft length k: ANSWERED by the second pass - k=1 is the only economic
+   config (K=4 verify costs 2.42x, depth-2+ acceptance 40%/32%). Moot while parked.
+5. Chain order: MOOT while parked (a depth-1 chain has no ordering question).
+6. kv-path block-diagonal submask: MOOT - the microbench was achieved WITHOUT the
+   surgery (timing is mask-content-independent, Finding 6); the surgery is needed
+   only if the layer is un-parked.
+7. NEW - re-entry triggers for the parked layer: hardware/models where the fixed
+   floor share grows, or decode regimes with higher stall fractions. CONCRETE
+   CHECKPOINT: when E2's 1.5B tiny model lands, re-run the probe tool - per-row
+   cost shrinks ~5x but the ~18 ms floor does not, so the amortizing regime may
+   extend well past 128 rows, reviving D1-lite AND multi-canvas batching in one
+   stroke. One command, all seven probes.
+   CHECKPOINT EXECUTED (2026-06-12, Fast_dLLM_v2_1.5B Q4_K_M - see 05_layer_e.md):
+   hypothesis REFUTED - the floor shrank WITH the per-row cost (tiny forward
+   7.2 ms vs 27 ms; 103-tok K=2-4 batching 1.20-1.23x; W=128 = 2.78x of W=32).
+   Layer D REMAINS PARKED on both models. Next trigger: a genuinely different
+   hardware class (P106 measurement) or decode regime.

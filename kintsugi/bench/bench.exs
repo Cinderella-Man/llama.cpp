@@ -34,7 +34,10 @@ defmodule Kintsugi.Bench.Runner do
     "grow" => %{"n_gen" => 384, "gen_initial" => 96},
     "big384" => %{"n_gen" => 384},
     "mh2" => %{"multi_hole" => 2},
-    "winroute" => %{"win_route" => true}
+    "winroute" => %{"win_route" => true},
+    # Fast-dLLM v2 (block-AR): the commit threshold is the model's own scale -
+    # 0.6 (Dream-tuned) floods adjacent commits into duplicate-token corruption
+    "fastdllm" => %{"conf_threshold" => 0.9}
   }
 
   # full request params for infill cases - NO reliance on server defaults

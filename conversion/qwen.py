@@ -335,6 +335,27 @@ class Qwen3NextModel(Qwen2MoeModel):
             yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Fast_dLLM_QwenForCausalLM")
+class FastDLLMQwenModel(Qwen2Model):
+    model_arch = gguf.MODEL_ARCH.FAST_DLLM
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        # block-diffusion: bidirectional within bd_size blocks, causal across
+        self.gguf_writer.add_causal_attention(False)
+
+        if (bd_size := self.hparams.get("bd_size")) is not None:
+            self.gguf_writer.add_uint32("fast-dllm.block_size", bd_size)
+
+        # the |<MASK>| token lives only in added_tokens.json, not config.json
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
+        mask_id = tokenizer.get_added_vocab().get("|<MASK>|")
+        if mask_id is not None:
+            self.gguf_writer.add_mask_token_id(mask_id)
+
+
 @ModelBase.register("RND1")
 class RND1Model(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.RND1

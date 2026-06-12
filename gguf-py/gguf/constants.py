@@ -516,6 +516,7 @@ class MODEL_ARCH(IntEnum):
     COGVLM           = auto()
     MINIMAXM2        = auto()
     RND1             = auto()
+    FAST_DLLM        = auto()
     PANGU_EMBED      = auto()
     MISTRAL3         = auto()
     MISTRAL4         = auto()
@@ -1074,6 +1075,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MINIMAXM2:        "minimax-m2",
     MODEL_ARCH.COGVLM:           "cogvlm",
     MODEL_ARCH.RND1:             "rnd1",
+    MODEL_ARCH.FAST_DLLM:        "fast-dllm",
     MODEL_ARCH.PANGU_EMBED:      "pangu-embedded",
     MODEL_ARCH.MISTRAL3:         "mistral3",
     MODEL_ARCH.MISTRAL4:         "mistral4",
@@ -2055,6 +2057,21 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
     ],
     MODEL_ARCH.DREAM: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.FAST_DLLM: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,

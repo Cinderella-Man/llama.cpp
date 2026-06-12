@@ -428,7 +428,13 @@ int main(int argc, char ** argv) {
             diff_params.max_length = params.n_ubatch;
             cb_data.n_input        = n_input;
             int32_t n_generated = 0;
-            diffusion_generate(ctx, prefix.data(), output_tokens.data(), n_input, diff_params, n_generated);
+            char arch_buf[64] = {0};
+            llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf));
+            if (strcmp(arch_buf, "fast-dllm") == 0) {
+                diffusion_generate_block_ar(ctx, prefix.data(), output_tokens.data(), n_input, diff_params, n_generated);
+            } else {
+                diffusion_generate(ctx, prefix.data(), output_tokens.data(), n_input, diff_params, n_generated);
+            }
             if (n_generated <= n_input) {
                 LOG_INF("Error: diffusion generation failed\n");
                 return "";

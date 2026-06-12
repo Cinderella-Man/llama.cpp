@@ -516,6 +516,21 @@ struct llama_model_llada_moe : public llama_model_base {
 };
 
 
+struct llama_model_fast_dllm : public llama_model_base {
+    llama_model_fast_dllm(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    uint32_t bd_size = 32;  // block-diffusion block size (fast-dllm.block_size kv)
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_rnd1 : public llama_model_base {
     llama_model_rnd1(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

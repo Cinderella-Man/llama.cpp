@@ -17,6 +17,7 @@
 #include "log.h"
 #include "chat.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -230,6 +231,27 @@ int main(int argc, char ** argv) {
                 "(>0 => cross-seq contamination PROVEN)\n", d, flips, La);
     }
 
+    // ---- 1e. WHERE do the batch-shape argmax flips sit? (Finding 2 follow-up) ----
+    {
+        int flips_hi = 0, flips_lo = 0;
+        for (int i = 0; i < La; i++) {
+            int am_r = 0, am_0 = 0;
+            for (int v = 0; v < n_vocab; v++) {
+                if (ref[(size_t) i * n_vocab + v] > ref[(size_t) i * n_vocab + am_r]) am_r = v;
+                if (dup[(size_t) i * n_vocab + v] > dup[(size_t) i * n_vocab + am_0]) am_0 = v;
+            }
+            if (am_0 != am_r) {
+                // softmax prob of the ref argmax (confidence of the flipped decision)
+                double mx = ref[(size_t) i * n_vocab + am_r], Z = 0;
+                for (int v = 0; v < n_vocab; v++) Z += std::exp((double) ref[(size_t) i * n_vocab + v] - mx);
+                const double p = 1.0 / Z;
+                LOG_INF("PROBE1e flip at row %d: ref-argmax prob %.3f\n", i, p);
+                (p >= 0.5 ? flips_hi : flips_lo)++;
+            }
+        }
+        LOG_INF("PROBE1e flips: %d at conf>=0.5 (commit-relevant), %d below\n", flips_hi, flips_lo);
+    }
+
     // ---- 2. MIXED lengths: A+B batched vs each alone -----------------------------
     auto refb = forward_batched(ctx, { canvas_b }, n_vocab, &ms);
     auto mix  = forward_batched(ctx, { canvas_a, canvas_b }, n_vocab, &ms);
@@ -345,6 +367,122 @@ int main(int argc, char ** argv) {
     LOG_INF("PROBE4 total: %d steps, %d commits, avg %.2f/step, stall(<=3) steps %d (%.0f%%)\n",
             steps_total, commits_total, steps_total ? (double) commits_total / steps_total : 0,
             stall_steps, steps_total ? 100.0 * stall_steps / steps_total : 0);
+
+    // ---- 5. KV-BLOCK row-scaling: W-row decode vs the shared frozen store ---------
+    // The speculative verify batch (K copies of a 32-row block) has the same row
+    // count and store geometry as a single (K*32)-row block decode - mask content
+    // does not change the timing. GO/NO-GO: K=4 (128 rows) <= 2x the 32-row step?
+    {
+        const int Lc = 256;
+        auto canvas = make_canvas(vocab, "Write a long detailed essay about rivers and their role in history.", Lc);
+        canvas.resize(Lc);
+        llama_model * m = const_cast<llama_model *>(llama_get_model(ctx));
+        // WARM at full canvas (dual mode geometry): writes the store
+        llama_diffusion_set_phase(m, /*WARM*/1, Lc);
+        double ms_warm = 0;
+        forward_batched(ctx, { canvas }, n_vocab, &ms_warm);
+        LOG_INF("PROBE5 kv row-scaling (store L=%d, warm %.2f ms):\n", Lc, ms_warm);
+        const int s = 64;
+        double base32 = 0;
+        for (int W : { 32, 64, 96, 128 }) {
+            std::vector<llama_token> blk(canvas.begin() + s, canvas.begin() + s + W);
+            double acc = 0;
+            for (int it = 0; it < 19; it++) {
+                llama_diffusion_set_block(m, s, Lc);
+                llama_diffusion_set_phase(m, /*BLOCK*/3, 0);
+                llama_batch b = llama_batch_init(W, 0, 1);
+                b.n_tokens = W;
+                for (int i = 0; i < W; i++) {
+                    b.token[i] = blk[i]; b.pos[i] = s + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+                }
+                const int64_t t0 = ggml_time_us();
+                llama_decode(ctx, b);
+                llama_synchronize(ctx);
+                const int64_t t1 = ggml_time_us();
+                llama_batch_free(b);
+                if (it >= 3) acc += (t1 - t0) / 1000.0;
+            }
+            const double t = acc / 16.0;
+            if (W == 32) base32 = t;
+            LOG_INF("  W=%3d rows vs store: %7.2f ms/step (%.2fx of W=32)\n", W, t,
+                    base32 > 0 ? t / base32 : 0.0);
+        }
+        llama_diffusion_set_phase(m, /*UNIFIED*/0, 0);
+    }
+
+    // ---- 6. ORACLE chain-acceptance: would step t's draft survive step t+1? -------
+    // Mini greedy threshold decode (argmax + raw-prob conf; approximates the engine
+    // at temp 0.2 after de-temper). At each step record argmax for EVERY masked
+    // position; when a position commits at step t+Delta, check agreement with the
+    // argmax recorded at earlier steps (Delta = 1, 2, 3): the SSD chain hit-rate.
+    {
+        common_chat_templates_inputs ci;
+        common_chat_msg msg;
+        msg.role = "user";
+        msg.content = "Write Elixir code for the following task. Reply with ONLY a single "
+                      "```elixir code block, no explanation.\n\nTask: a GenServer module "
+                      "implementing a counter with increment, decrement and get operations.";
+        ci.messages.push_back(msg);
+        ci.add_generation_prompt = true;
+        common_chat_templates_ptr tm2 = common_chat_templates_init(model, "");
+        const std::string fp = common_chat_templates_apply(tm2.get(), ci).prompt;
+        std::vector<llama_token> canvas(512);
+        int n_in = llama_tokenize(vocab, fp.c_str(), (int32_t) fp.size(), canvas.data(), (int32_t) canvas.size(), true, true);
+        canvas.resize(n_in);
+        const int n_gen = 160;
+        for (int i = 0; i < n_gen; i++) canvas.push_back(g_probe_mask_id);
+        const int L = (int) canvas.size();
+
+        std::vector<std::vector<llama_token>> pred_hist;  // per step: argmax per position (or -1)
+        int hits1 = 0, tot1 = 0, hits2 = 0, tot2 = 0, hits3 = 0, tot3 = 0;
+        for (int step = 0; step < 64; step++) {
+            auto lg = forward_batched(ctx, { canvas }, n_vocab, nullptr);
+            if (lg.empty()) break;
+            std::vector<llama_token> pred(L, -1);
+            std::vector<std::pair<double, int>> conf;  // (prob, pos)
+            for (int i = n_in; i < L; i++) {
+                if (canvas[i] != g_probe_mask_id) continue;
+                // shift_logits: row i-1 predicts pos i (Dream)
+                const float * row = lg.data() + (size_t) (i - 1) * n_vocab;
+                int am = 0;
+                for (int v = 1; v < n_vocab; v++) if (row[v] > row[am]) am = v;
+                double mx = row[am], Z = 0;
+                for (int v = 0; v < n_vocab; v++) Z += std::exp((double) row[v] - mx);
+                pred[i] = am;
+                conf.emplace_back(1.0 / Z, i);
+            }
+            if (conf.empty()) break;
+            // commit rule: all above 0.6, else best one
+            int committed = 0;
+            for (auto & c : conf) {
+                if (c.first >= 0.6) {
+                    const int pos = c.second;
+                    // score the chain draft: did earlier-step predictions foresee this?
+                    for (int d = 1; d <= 3; d++) {
+                        if ((int) pred_hist.size() >= d) {
+                            const llama_token old = pred_hist[pred_hist.size() - d][pos];
+                            if (old >= 0) {
+                                (d == 1 ? tot1 : d == 2 ? tot2 : tot3)++;
+                                if (old == pred[pos]) (d == 1 ? hits1 : d == 2 ? hits2 : hits3)++;
+                            }
+                        }
+                    }
+                    canvas[pos] = pred[pos];
+                    committed++;
+                }
+            }
+            if (committed == 0) {
+                auto best = std::max_element(conf.begin(), conf.end());
+                canvas[best->second] = pred[best->second];
+            }
+            pred_hist.push_back(std::move(pred));
+        }
+        LOG_INF("PROBE6 oracle chain acceptance (counter task, greedy/0.6): "
+                "Delta1 %d/%d (%.0f%%), Delta2 %d/%d (%.0f%%), Delta3 %d/%d (%.0f%%)\n",
+                hits1, tot1, tot1 ? 100.0 * hits1 / tot1 : 0,
+                hits2, tot2, tot2 ? 100.0 * hits2 / tot2 : 0,
+                hits3, tot3, tot3 ? 100.0 * hits3 / tot3 : 0);
+    }
 
     llama_free(ctx);
     llama_model_free(model);

@@ -1183,6 +1183,244 @@ void diffusion_generate(llama_context *          ctx,
     n_generated = params.max_length;
 }
 
+// Fast-dLLM v2 block-AR decode (see diffusion.h). Reference: modeling.py generate()
+// of Efficient-Large-Model/Fast_dLLM_v2_1.5B - semantics replicated exactly, minus
+// the KV caches (v1 re-forwards [0..block_end) each step; the fast-dllm graph builds
+// the block-causal mask from positions, so a full square forward equals their
+// cached block forward).
+void diffusion_generate_block_ar(llama_context *          ctx,
+                                 const llama_token *      input_tokens,
+                                 llama_token *            output_tokens,
+                                 int32_t                  n_input,
+                                 const diffusion_params & params,
+                                 int32_t &                n_generated) {
+    n_generated = 0;
+    if (!ctx || !input_tokens || !output_tokens || n_input <= 0 || params.max_length <= n_input) {
+        return;
+    }
+
+    const int32_t bd  = params.block_length   > 0    ? params.block_length   : 32;
+    const int32_t sb  = params.sub_block      > 0    ? params.sub_block      : 8;
+    const float   thr = params.conf_threshold > 0.0f ? params.conf_threshold : 0.9f;
+    const int32_t steps_cap = params.steps > 0 ? params.steps : 256;
+    const int32_t L_max = params.max_length;
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::copy(input_tokens, input_tokens + n_input, output_tokens);
+
+    llama_set_causal_attn(ctx, false);
+
+    llama_batch batch = llama_batch_init(L_max, 0, 1);
+
+    // forward rows [0..len); returns logits base pointer (row i predicts pos i+1)
+    auto forward = [&](int32_t len) -> const float * {
+        batch.n_tokens = len;
+        for (int32_t i = 0; i < len; i++) {
+            batch.token[i]     = output_tokens[i];
+            batch.pos[i]       = i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = 1;
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            return nullptr;
+        }
+        return llama_get_logits(ctx);
+    };
+
+    // reference sample_with_top_p: temperature 0 = argmax + plain softmax prob;
+    // else nucleus sampling at temperature, confidence = renormalized prob of the
+    // sampled token. Seeded - draft retries NEED diversity (repairs are impossible
+    // for block-AR models, so redrafting is the only recovery path).
+    std::mt19937 rng(params.seed);
+    const float  temp  = params.temperature;
+    const float  top_p = params.top_p > 0.0f && params.top_p < 1.0f ? params.top_p : 0.95f;
+
+    std::vector<std::pair<float, int32_t>> cand;
+    cand.reserve(4096);
+
+    auto predict = [&](const float * logits, int32_t pos, float & p_out) -> llama_token {
+        const float * row = logits + (size_t) (pos - 1) * n_vocab;
+        int32_t am = 0;
+        for (int32_t v = 1; v < n_vocab; v++) {
+            if (row[v] > row[am]) {
+                am = v;
+            }
+        }
+        if (temp <= 0.0f) {
+            double Z = 0.0;
+            for (int32_t v = 0; v < n_vocab; v++) {
+                Z += exp((double) row[v] - row[am]);
+            }
+            p_out = (float) (1.0 / Z);
+            return am;
+        }
+        // sample at temperature; the COMMIT confidence is the PLAIN softmax prob of
+        // the sampled token (Layer B de-temper lesson: the threshold is an absolute
+        // scale - temperature sharpening must not leak into it, or every sub-block
+        // position clears 0.9 at once and simultaneous shifted commits emit
+        // adjacent-duplicate garbage; observed before this fix)
+        double Z_plain = 0.0;
+        double Z_temp  = 0.0;
+        for (int32_t v = 0; v < n_vocab; v++) {
+            Z_plain += exp((double) row[v] - row[am]);
+            Z_temp  += exp(((double) row[v] - row[am]) / temp);
+        }
+        cand.clear();
+        for (int32_t v = 0; v < n_vocab; v++) {
+            const float p = (float) (exp(((double) row[v] - row[am]) / temp) / Z_temp);
+            if (p > 1e-8f) {
+                cand.emplace_back(p, v);
+            }
+        }
+        std::sort(cand.begin(), cand.end(), std::greater<>());
+        double cum = 0.0;
+        size_t n_keep = 0;
+        while (n_keep < cand.size() && cum < top_p) {
+            cum += cand[n_keep++].first;
+        }
+        std::uniform_real_distribution<double> uni(0.0, cum);
+        double target = uni(rng), acc = 0.0;
+        size_t sel = 0;
+        for (size_t j = 0; j < n_keep; j++) {
+            acc += cand[j].first;
+            if (acc >= target) {
+                sel = j;
+                break;
+            }
+        }
+        const int32_t v_sel = cand[sel].second;
+        p_out = (float) (exp((double) row[v_sel] - row[am]) / Z_plain);
+        return v_sel;
+    };
+
+    const int64_t t0      = ggml_time_us();
+    int32_t       cur     = n_input;
+    int32_t       n_steps = 0;
+    bool          done    = false;
+
+    while (cur < L_max && !done && n_steps < steps_cap) {
+        // block-aligned boundary: one AR step produces the next block's first token
+        // (reference: argmax of the last row after a block completes / aligned prefill)
+        if (cur % bd == 0) {
+            const float * logits = forward(cur);
+            n_steps++;
+            if (!logits) {
+                break;
+            }
+            float p;
+            const llama_token tok = predict(logits, cur, p);
+            output_tokens[cur++] = tok;
+            if (llama_vocab_is_eog(vocab, tok)) {
+                break;
+            }
+            if (cur >= L_max) {
+                break;
+            }
+        }
+
+        // open the block: pad to the boundary with masks
+        const int32_t blk_end = std::min((cur / bd + 1) * bd, L_max);
+        for (int32_t i = cur; i < blk_end; i++) {
+            output_tokens[i] = params.mask_token_id;
+        }
+        const int32_t blk_start = (cur / bd) * bd;
+
+        // sub-blocks strictly left to right
+        for (int32_t s = blk_start; s < blk_end && !done; s += sb) {
+            const int32_t e = std::min(s + sb, blk_end);
+            for (;;) {
+                int32_t n_masked = 0;
+                for (int32_t i = s; i < e; i++) {
+                    if (output_tokens[i] == params.mask_token_id) {
+                        n_masked++;
+                    }
+                }
+                if (n_masked == 0) {
+                    break;
+                }
+                if (n_steps >= steps_cap) {
+                    done = true;
+                    break;
+                }
+
+                const float * logits = forward(blk_end);
+                n_steps++;
+                if (!logits) {
+                    done = true;
+                    break;
+                }
+
+                // commit everything above thr in THIS sub-block; if nothing clears
+                // the bar, the max-prob position commits anyway (progress guarantee)
+                int32_t     n_committed = 0;
+                float       best_p      = -1.0f;
+                int32_t     best_pos    = -1;
+                llama_token best_tok    = LLAMA_TOKEN_NULL;
+                for (int32_t i = s; i < e; i++) {
+                    if (output_tokens[i] != params.mask_token_id) {
+                        continue;
+                    }
+                    float p;
+                    const llama_token tok = predict(logits, i, p);
+                    if (p > thr) {
+                        output_tokens[i] = tok;
+                        n_committed++;
+                    } else if (p > best_p) {
+                        best_p   = p;
+                        best_pos = i;
+                        best_tok = tok;
+                    }
+                }
+                if (n_committed == 0 && best_pos >= 0) {
+                    output_tokens[best_pos] = best_tok;
+                }
+
+                // reference stop rule: EOG in the generated region with no mask before it
+                for (int32_t i = n_input; i < blk_end; i++) {
+                    if (output_tokens[i] == params.mask_token_id) {
+                        break;
+                    }
+                    if (llama_vocab_is_eog(vocab, output_tokens[i])) {
+                        cur  = i + 1;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!done) {
+            cur = blk_end;
+            // EOG committed mid-block (with masks after it now filled): stop here too
+            for (int32_t i = n_input; i < cur; i++) {
+                if (llama_vocab_is_eog(vocab, output_tokens[i])) {
+                    cur  = i + 1;
+                    done = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // pad the tail so the caller's [n_input, max_length) slice detokenizes cleanly
+    const llama_token pad = llama_vocab_eot(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_eot(vocab)
+                                                                       : llama_vocab_eos(vocab);
+    for (int32_t i = cur; i < L_max; i++) {
+        output_tokens[i] = pad;
+    }
+
+    const int64_t t1 = ggml_time_us();
+    LOG_INF("\nblock-ar: total time: %0.2fms, steps: %d, time per step: %0.2fms, generated %d tokens\n",
+            (t1 - t0) / 1000.0, n_steps, (t1 - t0) / 1000.0 / std::max(n_steps, 1), cur - n_input);
+
+    llama_batch_free(batch);
+    n_generated = L_max;
+}
+
 // Entropy-bound denoiser for DiffusionGemma-style canvas models (see diffusion.h). The canvas is
 // random-initialized; each step samples a candidate per position, accepts the lowest-entropy positions
 // within a mutual-information bound, and renoises the rest under a linear temperature schedule. The output
