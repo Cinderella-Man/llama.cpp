@@ -1215,21 +1215,41 @@ void diffusion_generate_block_ar(llama_context *          ctx,
 
     llama_batch batch = llama_batch_init(L_max, 0, 1);
 
-    // forward rows [0..len); returns logits base pointer (row i predicts pos i+1)
-    auto forward = [&](int32_t len) -> const float * {
-        batch.n_tokens = len;
-        for (int32_t i = 0; i < len; i++) {
-            batch.token[i]     = output_tokens[i];
-            batch.pos[i]       = i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = 1;
+    // E3 cached mode (docs/dllms/throughput-plans/05_layer_e.md): committed blocks'
+    // K/V live in the model pkv store; each forward is only the active block instead
+    // of the whole [committed | block] square. Committed content is final, so the
+    // cached rows are exact - no rewarm machinery. The finalize WARM of each block
+    // doubles as the AR step (its last row predicts the next block's first token),
+    // which the uncached path pays a full square forward for.
+    const bool    kv_on     = params.block_kv;
+    llama_model * model_mut = const_cast<llama_model *>(model);
+    int32_t       kv_P      = 0;        // rows committed to the store
+    const float * ar_logits = nullptr;  // last WARM logits; valid only until the next decode
+    int32_t       ar_base   = 0;        // position of ar_logits row 0
+    const int32_t store_cap = ((L_max + bd - 1) / bd) * bd;
+    if (kv_on) {
+        llama_diffusion_set_block(model_mut, 0, store_cap);  // allocate the store once
+    }
+
+    // forward rows [from..to) at absolute positions; returns logits base pointer
+    // (row i predicts pos from+i+1)
+    auto forward_range = [&](int32_t from, int32_t to) -> const float * {
+        batch.n_tokens = to - from;
+        for (int32_t i = from; i < to; i++) {
+            batch.token[i - from]     = output_tokens[i];
+            batch.pos[i - from]       = i;
+            batch.n_seq_id[i - from]  = 1;
+            batch.seq_id[i - from][0] = 0;
+            batch.logits[i - from]    = 1;
         }
         if (llama_decode(ctx, batch) != 0) {
             return nullptr;
         }
         return llama_get_logits(ctx);
     };
+
+    // uncached square: rows [0..len)
+    auto forward = [&](int32_t len) -> const float * { return forward_range(0, len); };
 
     // reference sample_with_top_p: temperature 0 = argmax + plain softmax prob;
     // else nucleus sampling at temperature, confidence = renormalized prob of the
@@ -1242,8 +1262,10 @@ void diffusion_generate_block_ar(llama_context *          ctx,
     std::vector<std::pair<float, int32_t>> cand;
     cand.reserve(4096);
 
-    auto predict = [&](const float * logits, int32_t pos, float & p_out) -> llama_token {
-        const float * row = logits + (size_t) (pos - 1) * n_vocab;
+    // base = position of logits row 0 (0 for the uncached square; blk_start for cached
+    // block forwards)
+    auto predict = [&](const float * logits, int32_t pos, int32_t base, float & p_out) -> llama_token {
+        const float * row = logits + (size_t) (pos - 1 - base) * n_vocab;
         int32_t am = 0;
         for (int32_t v = 1; v < n_vocab; v++) {
             if (row[v] > row[am]) {
@@ -1302,17 +1324,48 @@ void diffusion_generate_block_ar(llama_context *          ctx,
     int32_t       n_steps = 0;
     bool          done    = false;
 
-    while (cur < L_max && !done && n_steps < steps_cap) {
-        // block-aligned boundary: one AR step produces the next block's first token
-        // (reference: argmax of the last row after a block completes / aligned prefill)
-        if (cur % bd == 0) {
-            const float * logits = forward(cur);
+    // cached mode: prefill the complete prompt blocks into the store, one WARM per
+    // 32-aligned block (block-causality across the prompt is enforced by the feed
+    // order; the all-allow mask only ever sees [earlier blocks | own block])
+    if (kv_on) {
+        while (kv_P + bd <= n_input && n_steps < steps_cap) {
+            llama_diffusion_set_block(model_mut, kv_P, store_cap);   // s = write offset
+            llama_diffusion_set_phase(model_mut, /*WARM*/1, kv_P);   // P = cached prefix
+            ar_logits = forward_range(kv_P, kv_P + bd);
             n_steps++;
-            if (!logits) {
+            if (!ar_logits) {
+                done = true;
                 break;
             }
+            ar_base = kv_P;
+            kv_P   += bd;
+        }
+    }
+
+    while (cur < L_max && !done && n_steps < steps_cap) {
+        // block-aligned boundary: one AR step produces the next block's first token
+        // (reference: argmax of the last row after a block completes / aligned prefill).
+        // Cached mode reads it from the last WARM's logits - no extra forward.
+        if (cur % bd == 0) {
+            const float * logits;
+            int32_t       base;
+            if (kv_on) {
+                if (!ar_logits) {
+                    break;  // should not happen: every aligned boundary follows a WARM
+                }
+                logits = ar_logits;
+                base   = ar_base;
+            } else {
+                logits = forward(cur);
+                n_steps++;
+                if (!logits) {
+                    break;
+                }
+                base = 0;
+            }
             float p;
-            const llama_token tok = predict(logits, cur, p);
+            const llama_token tok = predict(logits, cur, base, p);
+            ar_logits            = nullptr;  // consumed; invalidated by the next decode
             output_tokens[cur++] = tok;
             if (llama_vocab_is_eog(vocab, tok)) {
                 break;
@@ -1347,12 +1400,21 @@ void diffusion_generate_block_ar(llama_context *          ctx,
                     break;
                 }
 
-                const float * logits = forward(blk_end);
+                const float * logits;
+                if (kv_on) {
+                    // forward only the active block vs the cached committed prefix
+                    GGML_ASSERT(kv_P == blk_start);
+                    llama_diffusion_set_phase(model_mut, /*DECODE*/2, kv_P);
+                    logits = forward_range(blk_start, blk_end);
+                } else {
+                    logits = forward(blk_end);
+                }
                 n_steps++;
                 if (!logits) {
                     done = true;
                     break;
                 }
+                const int32_t fwd_base = kv_on ? blk_start : 0;
 
                 // commit everything above thr in THIS sub-block; if nothing clears
                 // the bar, the max-prob position commits anyway (progress guarantee)
@@ -1365,7 +1427,7 @@ void diffusion_generate_block_ar(llama_context *          ctx,
                         continue;
                     }
                     float p;
-                    const llama_token tok = predict(logits, i, p);
+                    const llama_token tok = predict(logits, i, fwd_base, p);
                     if (p > thr) {
                         output_tokens[i] = tok;
                         n_committed++;
@@ -1404,6 +1466,21 @@ void diffusion_generate_block_ar(llama_context *          ctx,
                 }
             }
         }
+
+        // cached mode: the block is final - one WARM pass writes its K/V into the
+        // store and its last row IS the AR step for the next block
+        if (kv_on && !done && blk_end < L_max && n_steps < steps_cap) {
+            llama_diffusion_set_block(model_mut, kv_P, store_cap);
+            llama_diffusion_set_phase(model_mut, /*WARM*/1, kv_P);
+            ar_logits = forward_range(blk_start, blk_end);
+            n_steps++;
+            if (!ar_logits) {
+                done = true;
+            } else {
+                ar_base = blk_start;
+                kv_P    = blk_end;
+            }
+        }
     }
 
     // pad the tail so the caller's [n_input, max_length) slice detokenizes cleanly
@@ -1413,9 +1490,14 @@ void diffusion_generate_block_ar(llama_context *          ctx,
         output_tokens[i] = pad;
     }
 
+    if (kv_on) {
+        llama_diffusion_set_phase(model_mut, /*UNIFIED*/0, 0);  // restore for later requests / kv-off calls
+    }
+
     const int64_t t1 = ggml_time_us();
-    LOG_INF("\nblock-ar: total time: %0.2fms, steps: %d, time per step: %0.2fms, generated %d tokens\n",
-            (t1 - t0) / 1000.0, n_steps, (t1 - t0) / 1000.0 / std::max(n_steps, 1), cur - n_input);
+    LOG_INF("\nblock-ar%s: total time: %0.2fms, steps: %d, time per step: %0.2fms, generated %d tokens\n",
+            kv_on ? " (block-kv)" : "", (t1 - t0) / 1000.0, n_steps, (t1 - t0) / 1000.0 / std::max(n_steps, 1),
+            cur - n_input);
 
     llama_batch_free(batch);
     n_generated = L_max;

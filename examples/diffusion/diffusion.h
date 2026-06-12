@@ -95,6 +95,9 @@ struct diffusion_params {
     int32_t sub_block        = 0;      // Fast-dLLM v2 block-AR decode: sub-block size for the
                                        // left-to-right commit schedule (0 = 8, the reference).
 
+    bool    block_kv         = false;  // Fast-dLLM v2 block-AR decode (E3): cache committed blocks'
+                                       // KV in the model pkv store; forward only the active block
+
     int32_t kv_anchor        = 3;      // Layer B4: with kv_window in PREFIX mode, always include the
                                        // last N canvas rows in the batch (the "final anchor" - the
                                        // model needs to see that the end exists; streaming-dllm

@@ -286,6 +286,7 @@ int main(int argc, char ** argv) {
     diff_params.gen_initial      = params.diffusion.gen_initial;
     diff_params.remask_margin    = params.diffusion.remask_margin;
     diff_params.remask_budget    = params.diffusion.remask_budget;
+    diff_params.block_kv         = params.diffusion.block_kv;
 
     callback_data cb_data               = { &diff_params, vocab, 0, params.diffusion.visual_progress,
                                             std::max(1, params.diffusion.visual_interval), 0, 0, 24, 80, 0 };

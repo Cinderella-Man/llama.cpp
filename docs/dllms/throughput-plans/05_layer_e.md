@@ -171,3 +171,93 @@ does not use - treat as row-scaling proxies, not decode-path numbers.)
 3. Bench accounting for block-AR models: keep i-tier as structural zeros in the
    48-case total, or report /42 alongside (recommended: report both, the doc
    already does)?
+
+## E3: KV cache for committed blocks (started 2026-06-12 evening)
+
+PROGRESS LOG (updated as work lands; resume from here after any crash):
+- [x] Design written (this section)
+- [x] Engine: pkv plumbing for fast-dllm (models.h, set_phase/set_block dispatch)
+- [x] Engine: fast-dllm.cpp DECODE/WARM graph phases
+- [x] Loop: diffusion_generate_block_ar cached mode + CLI/server flag
+- [x] Build clean
+- [x] Equivalence gate: temp-0 argmax outputs cached vs uncached (expect identical
+      or near; committed blocks are FINAL when warmed - no Dream-style drift/rewarm)
+- [x] Speed: CLI ms/step at n_gen 128/256/384
+- [ ] Bench: ONE kintsugi run (profile fastdllm + kv), compare 21/48 + walls
+- [ ] Docs/memory updated, committed
+
+### Design (decided after reading the code, 0 new machinery needed)
+
+Reuses the Layer A shared pkv store VERBATIM (src/models/diffusion-common.h:
+llama_diffusion_pkv in models.h:463, llm_graph_input_attn_diffusion_decode,
+llm_graph_input_diffusion_phase, llama_diffusion_pkv_ensure_store). Standard llama
+KV cache route REJECTED: create_memory is arch-level (nullptr for FAST_DLLM,
+llama-model.cpp:2019), would need per-step llama_memory_seq_rm churn, and the pkv
+machinery is already proven on Dream/LLaDA/DiffusionGemma.
+
+Key insight: the current 32-block attends ALL committed prefix + itself
+bidirectionally = the rectangular ALL-ALLOW mask llm_graph_input_attn_diffusion_decode
+already fills. No custom cached mask needed. Block-causality within a multi-block
+prompt is enforced by feeding ONE 32-aligned block per llama_decode during prefill.
+
+Engine changes:
+1. models.h: add `mutable llama_diffusion_pkv pkv;` to llama_model_fast_dllm.
+2. diffusion-gemma.cpp llama_diffusion_set_phase + set_block (lines 616/646): add
+   llama_model_fast_dllm to the dynamic_cast chain (shared-pkv branch).
+3. fast-dllm.cpp graph, keyed off pkv.phase (copy dream.cpp:90-209 pattern):
+   - UNIFIED (0): existing square block-causal path, unchanged (v1 default).
+   - DECODE (2): batch = current block rows; mask = diffusion_decode rect
+     [P + n_tokens, n_tokens] all-allow, allow_reuse=true + phase marker; per layer
+     concat [store(0..P) | fresh roped K/V] (dream.cpp is_decode branch, 156-168).
+   - WARM (1) = COMMIT: same attention as DECODE *plus* ggml_cpy of ALL batch K/V
+     rows into the store at offset pkv.s (write-at-offset precedent: dream.cpp
+     is_block, 173-180). Used for prompt prefill (block-by-block) and the one
+     finalize pass per completed block.
+
+Loop changes (diffusion_generate_block_ar, examples/diffusion/diffusion.cpp:1191):
+- New param block_kv (default OFF for v1 equivalence), CLI --diffusion-block-kv,
+  server passes through; bench profile carries it.
+- Cached flow: P=0; prefill complete prompt blocks one WARM(P, s=P) decode each,
+  P+=bd; per generation block: denoise steps are DECODE(P) over rows
+  [blk_start, blk_end) (logit row index = pos-1-blk_start, NOT pos-1); on block
+  completion one WARM(P, s=blk_start) finalize pass whose last-row logits ARE the
+  AR step for the next block's first token (v1 pays a full square forward for
+  this; cached mode gets it free). Prompt-tail rows inside the first generation
+  block (n_input % bd != 0) ride along in the batch and get stored at finalize -
+  matches reference semantics (block K/V computed from final block content).
+- Store capacity: ensure via set_block(s, L_max) up front; F32, 1.5B GQA =
+  28 layers x 2 x 256 x 4 B = 57 KB/token -> 1024-token ctx = 59 MB. Fits.
+
+Why no rewarm machinery (unlike Dream A1/A2): committed blocks are FINAL when
+warmed - the cached K/V are exact by construction (the model is TRAINED for this;
+modeling.py does exactly this pass). No drift, no rewarm triggers, no cadence.
+
+Expected: per-step cost flat ~7-8 ms (32-row forward, tiny model) vs v1's growing
+23+ ms at 171 tokens -> ~3x at 171, more at 384+. Engine throughput target:
+~200-300 tok/s raw (DiffusionGemma speed analysis doc gives the context).
+
+### E3 MEASURED (2026-06-12, 5070 laptop, Q4_K_M, temp 0 argmax)
+
+Equivalence gate: 96-token generation (3 blocks) BYTE-IDENTICAL cached vs uncached -
+prefill WARM, DECODE mask, finalize offsets and the free AR step all verified. Longer
+runs diverge on near-tie argmax flips (accumulated float differences between the
+concat-store path and the square path - same acceptance criterion as Dream layer A;
+the bench is the quality arbiter).
+
+Speed (CLI, --diffusion-conf-threshold 0.9, GenServer KV-store prompt):
+
+| output  | uncached v1            | cached (--diffusion-block-kv) | wall speedup |
+|---------|------------------------|-------------------------------|--------------|
+| 210 tok | 27.0 ms/step, 3.46 s   | 10.2 ms/step, 1.59 s          | 2.2x         |
+| 338 tok | 36.7 ms/step, 8.00 s   | 10.3 ms/step, 2.17 s          | 3.7x         |
+| ~440 tok| 43.4 ms/step, 11.85 s  | 10.4 ms/step, 3.02 s          | 3.9x         |
+
+Cached per-step cost is FLAT (~10.3 ms) at every length - the concat read of the
+F32 store is negligible against the 32-row forward. Raw engine throughput
+132-156 tok/s (vs 35-61 uncached). The ~10 ms floor decomposes as ~7 ms forward
+(layer D probe) + ~3 ms full-vocab CPU logits readback (152k vocab x 32 rows) -
+backend sampling is the known next bite at it.
+
+Caveat for the rig: pkv phase state lives on the MODEL - concurrent requests on
+multiple contexts of one model (multi-replica server) would race. Single-replica
+per model only, or per-context state later.

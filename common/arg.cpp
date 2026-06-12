@@ -3935,6 +3935,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.diffusion.kv_block = value; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-block-kv"},
+        string_format("block-AR models (fast-dllm): cache committed blocks' KV, forward only the active block (default: %s)",
+                      params.diffusion.block_kv ? "on" : "off"),
+        [](common_params & params) { params.diffusion.block_kv = true; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-kv-rewarm"}, "N",
         string_format("masked-dLLM KV cache: re-warm after N cached steps (default: %d)", params.diffusion.kv_rewarm),
         [](common_params & params, int value) { params.diffusion.kv_rewarm = value; }

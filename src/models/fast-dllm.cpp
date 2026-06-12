@@ -105,6 +105,24 @@ llama_model_fast_dllm::graph::graph(const llama_model & model, const llm_graph_p
 
     const auto & dmodel = (const llama_model_fast_dllm &) model;
 
+    // E3 cached block-AR (docs/dllms/throughput-plans/05_layer_e.md): the batch is one
+    // 32-block; it attends ALL committed prefix (the store) + itself bidirectionally,
+    // which is exactly the rectangular all-allow diffusion_decode mask. WARM additionally
+    // writes the batch K/V rows into the store at offset pkv.s (block finalize / prompt
+    // prefill - committed content is final, so the cached rows are exact, no rewarm).
+    // UNIFIED stays byte-identical to the v1 square path. Like dream.cpp: every phase
+    // must produce a buildable graph for ANY n_tokens (scheduler reserve graphs).
+    const int     phase = dmodel.pkv.phase;
+    const int64_t pkv_P = dmodel.pkv.P;
+    const int64_t pkv_s = dmodel.pkv.s;
+
+    // WARM writes (and DECODE with P>0 reads) the store - both need it allocated;
+    // DECODE with P==0 (first block, short prompt) never touches it (concat is gated)
+    const bool store_ok  = dmodel.pkv.cap > 0 && !dmodel.pkv.k.empty();
+    const bool is_warm   = phase == llama_diffusion_pkv::WARM   && store_ok;
+    const bool is_decode = phase == llama_diffusion_pkv::DECODE && (pkv_P == 0 || store_ok);
+    const bool is_cached = is_warm || is_decode;
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -112,9 +130,22 @@ llama_model_fast_dllm::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp_pos = build_inp_pos();
 
-    // block-causal mask input (replaces build_attn_inp_no_cache)
+    // phase-marker input: keys graph reuse on the pkv state (see diffusion-common.h)
+    res->add_input(std::make_unique<llm_graph_input_diffusion_phase>(&dmodel.pkv));
+
     llm_graph_input_attn_no_cache * inp_attn = nullptr;
-    {
+    if (is_cached) {
+        // rectangular all-allow mask [P + n_tokens, n_tokens]
+        const int64_t n_kv = pkv_P + n_tokens;
+        auto uptr = std::make_unique<llm_graph_input_attn_diffusion_decode>(hparams, cparams, pkv_P, n_tokens);
+        uptr->allow_reuse = true;  // pkv-state changes are guarded by the phase marker
+        const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
+        ggml_set_input(uptr->self_kq_mask);
+        uptr->self_kq_mask_cnv = uptr->self_kq_mask;
+        inp_attn = (llm_graph_input_attn_no_cache *) res->add_input(std::move(uptr));
+    } else {
+        // block-causal square mask input (replaces build_attn_inp_no_cache)
         auto uptr = std::make_unique<llm_graph_input_attn_block_causal>(hparams, cparams, dmodel.bd_size);
         const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
         uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
@@ -146,9 +177,49 @@ llama_model_fast_dllm::graph::graph(const llama_model & model, const llm_graph_p
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
+            ggml_tensor * Katt = Kcur;
+            ggml_tensor * Vatt = Vcur;
+
+            if (is_warm) {
+                // finalize: write the batch rows into the store at offset s. The write
+                // region (s..s+n) never aliases the read region (0..P, P == s) - clamped
+                // so scheduler reserve graphs (arbitrary n_tokens) still build.
+                const int64_t W = std::min<int64_t>((int64_t) n_tokens, dmodel.pkv.cap - pkv_s);
+                if (W > 0) {
+                    const size_t nb2k = dmodel.pkv.k[il]->nb[2];
+                    const size_t nb2v = dmodel.pkv.v[il]->nb[2];
+                    ggml_tensor * kW = ggml_view_3d(ctx0, Kcur, n_embd_head, n_head_kv, W,
+                                                    Kcur->nb[1], Kcur->nb[2], 0);
+                    ggml_tensor * vW = ggml_view_3d(ctx0, Vcur, n_embd_head, n_head_kv, W,
+                                                    Vcur->nb[1], Vcur->nb[2], 0);
+                    ggml_tensor * sk = ggml_view_3d(ctx0, dmodel.pkv.k[il], n_embd_head, n_head_kv, W,
+                                                    dmodel.pkv.k[il]->nb[1], nb2k, (size_t) pkv_s * nb2k);
+                    ggml_tensor * sv = ggml_view_3d(ctx0, dmodel.pkv.v[il], n_embd_head, n_head_kv, W,
+                                                    dmodel.pkv.v[il]->nb[1], nb2v, (size_t) pkv_s * nb2v);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, kW, sk));
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, vW, sv));
+                }
+            }
+
+            if (is_cached && pkv_P > 0) {
+                // attend [store(0..P) | fresh block]
+                ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv.k[il], n_embd_head, n_head_kv, pkv_P,
+                                                dmodel.pkv.k[il]->nb[1], dmodel.pkv.k[il]->nb[2], 0);
+                ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv.v[il], n_embd_head, n_head_kv, pkv_P,
+                                                dmodel.pkv.v[il]->nb[1], dmodel.pkv.v[il]->nb[2], 0);
+                ggml_tensor * Kc = Kcur;
+                ggml_tensor * Vc = Vcur;
+                if (dmodel.pkv.k[il]->type != Kcur->type) {  // F16 store: match types for concat
+                    Kc = ggml_cast(ctx0, Kcur, dmodel.pkv.k[il]->type);
+                    Vc = ggml_cast(ctx0, Vcur, dmodel.pkv.v[il]->type);
+                }
+                Katt = ggml_concat(ctx0, pk, Kc, 2);
+                Vatt = ggml_concat(ctx0, pv, Vc, 2);
+            }
+
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
+                    Qcur, Katt, Vatt, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {

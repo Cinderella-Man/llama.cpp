@@ -622,13 +622,16 @@ void llama_diffusion_set_phase(struct llama_model * model, int phase, int32_t P)
         }
         return;
     }
-    // masked dLLMs (Layer A): shared pkv state; the store must cover max(P, L)
+    // masked dLLMs (Layer A) + fast-dllm block-AR (E3): shared pkv state; the store
+    // must cover max(P, L)
     llama_diffusion_pkv * pkv = nullptr;
     const llama_model_base * base = nullptr;
     if (auto * dr = dynamic_cast<llama_model_dream *>(model)) {
         pkv = &dr->pkv; base = dr;
     } else if (auto * ll = dynamic_cast<llama_model_llada *>(model)) {
         pkv = &ll->pkv; base = ll;
+    } else if (auto * fd = dynamic_cast<llama_model_fast_dllm *>(model)) {
+        pkv = &fd->pkv; base = fd;
     }
     if (!pkv) {
         return;
@@ -642,6 +645,7 @@ void llama_diffusion_set_phase(struct llama_model * model, int phase, int32_t P)
 }
 
 // Layer A BLOCK phase geometry: s = block start row, L = full canvas length (store rows).
+// fast-dllm (E3) reuses s as the WARM write offset and L as the store capacity bound.
 // No-op for models without the shared pkv state (DiffusionGemma uses set_phase only).
 void llama_diffusion_set_block(struct llama_model * model, int32_t s, int32_t L) {
     llama_diffusion_pkv * pkv = nullptr;
@@ -650,6 +654,8 @@ void llama_diffusion_set_block(struct llama_model * model, int32_t s, int32_t L)
         pkv = &dr->pkv; base = dr;
     } else if (auto * ll = dynamic_cast<llama_model_llada *>(model)) {
         pkv = &ll->pkv; base = ll;
+    } else if (auto * fd = dynamic_cast<llama_model_fast_dllm *>(model)) {
+        pkv = &fd->pkv; base = fd;
     }
     if (!pkv) {
         return;

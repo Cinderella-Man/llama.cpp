@@ -523,6 +523,11 @@ struct llama_model_fast_dllm : public llama_model_base {
 
     uint32_t bd_size = 32;  // block-diffusion block size (fast-dllm.block_size kv)
 
+    // E3 cached block-AR decoding (docs/dllms/throughput-plans/05_layer_e.md):
+    // DECODE reads [store(0..P) | block], WARM additionally writes the batch rows
+    // at store offset s. Committed blocks are final, so no rewarm machinery.
+    mutable llama_diffusion_pkv pkv;
+
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
     };

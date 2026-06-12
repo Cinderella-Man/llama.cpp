@@ -135,6 +135,7 @@ static diffusion_params make_masked_params(const server_state & st, const json &
     dp.window           = req.value("window",         p.diffusion.window);
     dp.gen_initial      = req.value("gen_initial",    p.diffusion.gen_initial);
     dp.sub_block        = req.value("sub_block",      0);
+    dp.block_kv         = req.value("block_kv",       p.diffusion.block_kv);
     dp.remask_margin    = req.value("remask_margin",  p.diffusion.remask_margin);
     dp.remask_budget    = req.value("remask_budget",  p.diffusion.remask_budget);
     dp.backend_sampling = req.value("backend_sampling", p.sampling.backend_sampling);
