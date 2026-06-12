@@ -194,6 +194,24 @@ square no-cache path takes any contiguous batch; rope uses batch.pos).
   the exclusion is empirical now. LAYER C IS CLOSED; bench profiles slim/mid are
   retired from the runnable set (crash hazard + verdict recorded).
 
+### Adoption attempt: window-64 content routing in kintsugi - REJECTED by bench
+The last executable piece: nothing in production sent window 64, and the one place
+kintsugi reaches >=384-token canvases is redraft-doubling (16/48 bench cases reach
+a doubled draft). Implemented as opt-in routing ("win_route": retry attempts whose
+effective n_gen >= 384 add window 64; first drafts and explicit "window" callers
+untouched), verified live (window engaged on attempts 2-3 only), bench-gated
+same-process: baseline 35/48 (4th reproduction today) vs winroute 33/48 -
+p_reverse flips to fail on BOTH seeds, and the redraft population's wall INFLATES
+61% (119.6 s -> 192.6 s). Mechanism: the KPI's 3.67x needs output that actually
+FILLS the long canvas; a doubled redraft still writes a ~100-token answer, so the
+window restricts commit visibility on a canvas EOT-shrink would collapse anyway -
+step inflation, no row savings that matter. VERDICT: routing stays opt-in default
+OFF ("win_route" kept for future models); kintsugi adopts NOTHING from Layer C.
+window 64's win is real but belongs to genuinely long OUTPUT (CLI / raw server
+long-form code generation), not to kintsugi's short-answer draft workload. The
+recommendation table's "content-aware" gate means OUTPUT length, which the harness
+cannot know in advance - the engine-side flag remains the right delivery vehicle.
+
 ### C5 prompt slimming: MEASURED, REJECTED (recovered from crashed sessions)
 Two sessions died mid-C5 (see crash post-mortem below); results recovered from
 kintsugi/bench/results/*c5-*.jsonl and the surviving working-tree diff (forge_wrapper

@@ -84,6 +84,18 @@ defmodule Kintsugi do
         |> Map.update("seed", spent * 1000, &(&1 + spent * 1000))
         |> Map.update("n_gen", 192 * round(:math.pow(2, spent)), &(&1 * round(:math.pow(2, spent))))
 
+      # Layer C content-length routing (03_layer_c.md): window 64 earns its 3.67x on
+      # >=384-token generations ONLY (it degrades 192-canvas drafts, win64 bench
+      # 23/48) - so it rides along exactly when redraft-doubling reaches that size.
+      retry_opts =
+        if Map.get(retry_opts, "win_route", false) and
+             Map.get(retry_opts, "n_gen", 192) >= 384 and
+             not Map.has_key?(opts, "window") do
+          Map.put(retry_opts, "window", 64)
+        else
+          retry_opts
+        end
+
       case forge(eng, instruction, retry_opts) do
         {:ok, code, stats} ->
           {:ok, code, restamp(stats, eng, code, spent, t0)}
@@ -124,7 +136,7 @@ defmodule Kintsugi do
 
     prompt = forge_wrapper(opts) <> instruction
 
-    case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check", "slim_prompt", "multi_hole"])) do
+    case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check", "slim_prompt", "multi_hole", "win_route"])) do
       {:ok, %{"text" => text, "ms_total" => ms}} ->
         code =
           text |> extract_code() |> Autofix.run() |> normalize_draft() |> align_module_name(check)

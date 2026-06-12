@@ -33,7 +33,8 @@ defmodule Kintsugi.Bench.Runner do
     # them requires reading that section first.
     "grow" => %{"n_gen" => 384, "gen_initial" => 96},
     "big384" => %{"n_gen" => 384},
-    "mh2" => %{"multi_hole" => 2}
+    "mh2" => %{"multi_hole" => 2},
+    "winroute" => %{"win_route" => true}
   }
 
   # full request params for infill cases - NO reliance on server defaults
