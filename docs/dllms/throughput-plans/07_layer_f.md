@@ -128,14 +128,79 @@ standalone quality - reassess after F2.
 ---
 
 ## Order for tomorrow
-1. E4 backend sampling (one session, known machinery, ~1.3-1.4x)
-2. E5a/b/c commit-rate sweeps (bench-gated, biggest no-training lever)
-3. E6 CUDA-graph check (half session, possibly free 1.2-1.5x)
-4. F2 STEP 1 oracle probe (cheap, strategic - decides F2 vs E1 vs F3)
+1. E4 backend sampling - DONE 2026-06-13, ADOPTED (+37-47% deliverable, 191 tok/s
+   raw; open question 1 answered - see 05_layer_e.md E4)
+2. E5a/b/c commit-rate sweeps - DONE 2026-06-13, ALL KILLED (1.85 commits/step is
+   the model's honest rate; open question 2 answered: NO setting beats it without
+   dropping passes - see 05_layer_e.md E5)
+3. E6 CUDA-graph check - DONE 2026-06-13, null on 5070/AC (reuse already engaged;
+   step is forward-bound; rig caveat recorded - see 05_layer_e.md E6)
+4. F2 STEP 1 oracle probe (cheap, strategic - decides F2 vs E1 vs F3) <- NEXT
 5. F1 de-risk probe, then build if ratio < N
-6. E-rig P106 run when an engine config stabilizes
-Compounded plausible ceiling from 1-3 alone: ~2.5-3x over E3 (-> 400-500 tok/s raw
-territory on the 5070).
+6. E-rig P106 run when an engine config stabilizes (hardware-gated)
+The 1-3 compounded ceiling estimate (~2.5-3x over E3) was NOT reached: only E4
+landed (1.22-1.29x engine, +40% deliverable); E5/E6 headroom did not exist.
+Decode-side exhaustion on this model is now measured, which is exactly why F2
+(verify-against-AR, a different axis) is the next move.
+
+## F2 STEP 1 work log (started 2026-06-13)
+
+Oracle acceptance probe design (PROBE6 methodology, two-phase to keep one model
+on the GPU at a time):
+1. DRAFT phase: FastDLLM-1.5B server (kv+bs, the E4 config) generates drafts for
+   the bench p-tier instructions (kintsugi forge wrapper, the production prompt
+   shape) + m_sumdoc + c_stack (longer = more blocks), greedy AND t0.2, seeds
+   {3,103,203} for the sampled variant. Drafts + the wrapped user content saved
+   as JSONL.
+2. VERIFY phase: new probe tool llama-oracle-probe (examples/diffusion): loads
+   the AR verifier (Qwen2.5-7B-Instruct Q4_K_M, SAME tokenizer family), applies
+   its own chat template to the user content (identical Qwen2.5 template), one
+   causal decode over [prompt | draft] with all logits, then per 32-token block
+   of the draft: L = consecutive positions from block start where the verifier's
+   greedy argmax (row pos-1) equals the draft token. Reports per-block L, mean L,
+   per-position agreement.
+   Retokenization note: drafts cross as TEXT (shared tokenizer; canonical
+   re-tokenization) - acceptable for an oracle estimate, exact token plumbing
+   only matters in STEP 2.
+3. Speedup model with measured numbers (filled after the probe): draft cost/block
+   ~ (32/1.85 commits-per-step) x 8.4 ms + verify 1 forward; AR baseline ~ Qwen-7B
+   ~35-40 ms/token tg. Speedup ~ L / (draft+verify cost expressed in AR-tokens).
+GO bar: L >= ~8 -> wire as llama.cpp speculative pair (STEP 2). KILL: L < ~4-6
+off-the-shelf -> document L, park F2 (drafter training = E1-class effort).
+
+### F2 STEP 1 MEASURED (2026-06-13) - acceptance GO, economics RE-BASED
+
+Probe: 32 drafts (8 cases x greedy + 3 t0.2 seeds; FastDLLM E4 config) verified
+by Qwen2.5-7B-Instruct Q4_K_M greedy (llama-oracle-probe, new tool in
+examples/diffusion):
+
+- 70 blocks | mean L 12.01 | MEDIAN L 8 | mean first-block L 12.25 | overall
+  token agreement 84.9% | blocks with L>=8: 38/70 | fully accepted: 12/70.
+- Distribution is bimodal: the 12 L=32 blocks come from two 256-token repetitive
+  drafts (repetition is trivially predictable) - the honest center is median 8 /
+  first-block 12.25. Per-case first-block L: double 29(all of it), even 5,
+  sum 14, reverse 8, max 13, swap 6, sumdoc 12, stack 11.
+- Probe caveat: blocks after the first are conditioned on the DRAFTER's own
+  continuation; a real spec loop re-drafts from the verifier's corrected prefix
+  (first-block L is the cleanest per-round proxy).
+
+THE ECONOMICS CHANGED UNDER US: measured Qwen2.5-7B Q4_K_M on the 5070 =
+52.6 tok/s tg (19.0 ms/token; the plan assumed ~35), pp512 2808 t/s. Round
+arithmetic with measured numbers: draft a 32-block ~145 ms (17.3 steps x 8.4 ms,
+1.85 commits/step) + verify ~15 ms (32 rows vs cache) vs gain (L+1) x 19 ms ->
+1.54x at L=12, 1.07x at median L=8. Off-the-shelf pairing is REAL but NOT the
+paper's >6x (their drafter is trained AND cheap). Draft-length tuning is the
+obvious lever: acceptance dies by ~12-14, so 16-token drafts (~72 ms) project
+~1.8-2x. RIG NOTE: economics INVERT on Pascal (drafter forward is compute-shaped
+= 11x slower; AR verify is bandwidth-shaped = barely slower) - F2 is a
+laptop/modern-card play only.
+
+VERDICT: GO bar met (median 8, first-block 12.25) -> STEP 2 v0 prototype
+justified, with expectations re-based to ~1.5-2x over AR (= ~80-100 tok/s at
+Qwen-7B quality - still a NEW QUALITY CEILING vs Dream's 35/48 system). The v0's
+real job: measure TRUE closed-loop acceptance (oracle is approximate in both
+directions) and end-to-end tok/s vs the same-process AR baseline.
+Drafts: /tmp/f2_drafts.jsonl (regenerate via the doc's recipe; bench prompts).
 
 ## Unresolved questions (answer as they land)
 1. E4: can the backend sampler chain express plain-softmax commit confidence

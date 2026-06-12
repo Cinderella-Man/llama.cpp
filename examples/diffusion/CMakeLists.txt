@@ -14,6 +14,11 @@ add_executable(${TARGET} diffusion-batch-probe.cpp)
 target_link_libraries(${TARGET} PRIVATE llama-diffusion llama llama-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+set(TARGET llama-oracle-probe)
+add_executable(${TARGET} oracle-probe.cpp)
+target_link_libraries(${TARGET} PRIVATE llama llama-common ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
 set(TARGET llama-diffusion-server)
 add_executable(${TARGET} diffusion-server.cpp)
 install(TARGETS ${TARGET} RUNTIME)
