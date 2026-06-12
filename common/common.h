@@ -412,6 +412,7 @@ struct common_params_diffusion {
     float   remask_margin = 0.0f;     // Layer B5: self-correction margin (0 = off)
     int32_t remask_budget = 2;        // Layer B5: remasks per step
     int32_t kv_anchor     = 3;        // Layer B4: tail anchor rows for windowed prefix batches
+    int32_t window        = 0;        // Layer C1a: square-path suffix window (0 = off)
 
     // entropy-bound decoder (DiffusionGemma canvas models); params default to GGUF metadata, then reference
     int32_t eb_mode          = 0;     // 0=auto (on for canvas models), 1=force on, 2=off

@@ -82,6 +82,11 @@ struct diffusion_params {
                                        // top1-top2 prob gap >= this, commit all and finish. Only fires
                                        // on exact (uncached/warm) steps. 0 = off.
 
+    int32_t window           = 0;      // Layer C1a: contiguous suffix window on the SQUARE (no-kv)
+                                       // path - batch ends at max(first_mask + W, last committed
+                                       // non-EOG + 1); distant uncommitted masks are not decoded.
+                                       // Commits scan the whole batch (no step inflation). 0 = off.
+
     int32_t kv_anchor        = 3;      // Layer B4: with kv_window in PREFIX mode, always include the
                                        // last N canvas rows in the batch (the "final anchor" - the
                                        // model needs to see that the end exists; streaming-dllm

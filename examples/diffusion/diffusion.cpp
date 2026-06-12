@@ -352,6 +352,9 @@ void diffusion_generate(llama_context *          ctx,
     int32_t kv_commits_since_warm = 0;
     int32_t kv_span_hint          = 0;  // B3: next block size detected at the last warm
     int32_t remask_total          = 0;  // B5: per-run remask cap (progress guarantee)
+    int32_t win_ext_max           = 0;  // C1a instrumentation: max window extension beyond
+                                        // frontier+W forced by committed islands (C1b decision)
+    int64_t win_rows_saved        = 0;  // C1a instrumentation: total rows pruned
 
     for (int block_num = 0; block_num < num_blocks; block_num++) {
         int32_t block_start = (params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
@@ -383,6 +386,34 @@ void diffusion_generate(llama_context *          ctx,
             // Layer A: pick phase + batch window for this step
             int32_t batch_first = 0;
             int32_t batch_last  = cur_length;
+
+            // Layer C1a: contiguous suffix window on the square path - skip decoding
+            // distant uncommitted masks. The window always covers the frontier + W AND
+            // any committed non-EOG islands beyond it (they are real context; the
+            // contiguous rule extends rather than drops - see 03_layer_c.md).
+            if (!kv_on && params.window > 0 && params.conf_threshold > 0.0f) {
+                int32_t first_mask = -1;
+                int32_t last_committed_nontail = n_input - 1;
+                const llama_vocab * wvocab = llama_model_get_vocab(model);
+                for (int32_t i = n_input; i < cur_length; i++) {
+                    const llama_token t = output_tokens[i];
+                    if (t == params.mask_token_id) {
+                        if (first_mask < 0) {
+                            first_mask = i;
+                        }
+                    } else if (!llama_vocab_is_eog(wvocab, t) && t != llama_vocab_pad(wvocab)) {
+                        last_committed_nontail = i;
+                    }
+                }
+                if (first_mask >= 0) {
+                    const int32_t frontier_end = std::min(cur_length, first_mask + params.window);
+                    batch_last = std::min(cur_length,
+                                          std::max(frontier_end, last_committed_nontail + 1));
+                    win_ext_max    = std::max(win_ext_max, batch_last - frontier_end);
+                    win_rows_saved += cur_length - batch_last;
+                }
+            }
+
             if (kv_on) {
                 auto block_clean = [&](int32_t s, int32_t e) {
                     for (int32_t i = s; i < e; i++) {
@@ -560,7 +591,7 @@ void diffusion_generate(llama_context *          ctx,
             // (restricting commits to the block inflated 15-step runs to the 128-step
             // cap; whole-window commits keep baseline step dynamics)
             const int32_t scan_lo = kv_on ? kv_s : 0;
-            const int32_t scan_hi = kv_on ? std::min(batch_last, cur_length) : cur_length;
+            const int32_t scan_hi = std::min(batch_last, cur_length);
             for (int32_t i = scan_lo; i < scan_hi; i++) {
                 if (output_tokens[i] == params.mask_token_id) {
                     // For block-based, only consider current block
@@ -571,6 +602,21 @@ void diffusion_generate(llama_context *          ctx,
             }
 
             if (mask_positions.empty()) {
+                // C1a: an empty WINDOW scan does not mean done - masks beyond batch_last
+                // exist when the window just completed; the next step recomputes the
+                // frontier and the window SLIDES forward
+                if (!kv_on && params.window > 0 && batch_last < cur_length) {
+                    bool more = false;
+                    for (int32_t i = batch_last; i < cur_length; i++) {
+                        if (output_tokens[i] == params.mask_token_id) {
+                            more = true;
+                            break;
+                        }
+                    }
+                    if (more) {
+                        continue;
+                    }
+                }
                 break;
             }
 
@@ -894,38 +940,34 @@ void diffusion_generate(llama_context *          ctx,
                     {
                         const llama_vocab * gvocab = llama_model_get_vocab(model);
 
-                        // a contiguous committed-EOT SUFFIX is the normal end of a short
-                        // answer - only end tokens scattered through the non-tail region
-                        // signal degeneracy
-                        // in Layer A block mode positions beyond kv_e are masked BY DESIGN -
-                        // the guard must only judge the decoded region [n_input, kv_e)
-                        const int32_t guard_end = kv_on ? kv_e : params.max_length;
-                        int32_t tail_start = guard_end;
-                        while (tail_start > n_input) {
-                            const llama_token t = output_tokens[tail_start - 1];
-                            if (t != params.mask_token_id &&
-                                (llama_vocab_is_eog(gvocab, t) || t == llama_vocab_pad(gvocab))) {
-                                tail_start--;
-                            } else {
-                                break;
-                            }
-                        }
+                        // GENERAL criterion (third revision - the suffix-tail exclusions
+                        // false-positived under kv blocks AND C1a windows, because every
+                        // reduced-decode mode grows its EOT tail incrementally): an EOG
+                        // token is "scattered" (degenerate signal) only when committed
+                        // TEXT exists at a LATER position; an EOG run bordering masks or
+                        // undecoded space is a tail in progress, in any decode mode.
+                        const int32_t guard_end = kv_on ? kv_e : std::min(batch_last, cur_length);
 
                         int32_t n_committed_total = 0;
-                        int32_t n_committed_eog   = 0;
+                        int32_t n_committed_eog   = 0;  // scattered only
                         int32_t n_masked          = 0;
-                        for (int32_t i = n_input; i < tail_start; i++) {
-                            if (output_tokens[i] == params.mask_token_id) {
+                        bool    seen_text_after   = false;
+                        for (int32_t i = guard_end - 1; i >= n_input; i--) {
+                            const llama_token t = output_tokens[i];
+                            if (t == params.mask_token_id) {
                                 n_masked++;
-                            } else {
-                                n_committed_total++;
-                                if (llama_vocab_is_eog(gvocab, output_tokens[i]) ||
-                                    output_tokens[i] == llama_vocab_pad(gvocab)) {
+                                continue;
+                            }
+                            n_committed_total++;
+                            if (llama_vocab_is_eog(gvocab, t) || t == llama_vocab_pad(gvocab)) {
+                                if (seen_text_after) {
                                     n_committed_eog++;
                                 }
+                            } else {
+                                seen_text_after = true;
                             }
                         }
-                        const int32_t n_gen = tail_start - n_input;
+                        const int32_t n_gen = guard_end - n_input;
                         if (n_committed_total > 8 &&
                                 n_committed_eog > 0.9f * n_committed_total &&
                                 n_masked        > 0.2f * n_gen) {
@@ -1067,6 +1109,11 @@ void diffusion_generate(llama_context *          ctx,
 
     if (kv_on) {
         llama_diffusion_set_phase(sc_model, /*UNIFIED*/0, 0);  // restore for later requests
+    }
+
+    if (params.window > 0 && win_rows_saved > 0) {
+        LOG_INF("diffusion window: %lld rows pruned total, max island extension %d (C1b decision metric)\n",
+                (long long) win_rows_saved, win_ext_max);
     }
 
     int64_t time_end = ggml_time_us();

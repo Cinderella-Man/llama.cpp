@@ -133,3 +133,55 @@ square no-cache path takes any contiguous batch; rope uses batch.pos).
 3. C1a + kv mutual exclusion in v1: acceptable (recommended: yes - kv modes already
    window their batches; composing two window systems risks subtle geometry bugs for
    marginal gain)?
+
+
+## EMPIRICAL GRILLING (2026-06-12): C1a pre-implemented; guard generalized (v3); probes
+
+### Offline probes (cheap kills first)
+- C6 VIABLE WITH CORRECTION: multi-error files yield MULTIPLE diagnostics for SEMANTIC
+  errors (probe: 3 undefined fns -> 4 diagnostics, lines [4,3,2,0] - filter the line-0
+  generic entry) but only ONE for PARSE errors (the parser stops). Multi-hole repair
+  targets semantic multiplicity; parse cascades stay one-hole-at-a-time.
+- C4 init claim VERIFIED in code: diffusion.cpp:186-188 pre-fills [n_input, max_length)
+  with masks and confidences with -1 - growth really is "raise cur_length".
+
+### C1a implemented and fought through three bugs (all now guarded)
+1. Degeneracy guard false positive #3 (after Layer A's and the kv variant): the
+   suffix-tail exclusion assumes full-canvas commits; ANY reduced-decode mode grows its
+   EOT tail incrementally (haiku w128 aborted at step 0: "114/114 end tokens, 180/294
+   masked" - all legitimate). FIX = GUARD v3, a structural generalization: an EOG token
+   is "scattered" (degenerate signal) ONLY if committed TEXT exists at a later position;
+   EOG runs bordering masks/undecoded space are tails in progress in every decode mode.
+   One backward pass; works for plain/kv/window uniformly. TRADE: the all-EOT flood
+   true-positive no longer aborts early - measured cost +1.8 s on the pathological
+   config (EOT-shrink contains it); 3 false-positive classes fixed for one cheap loss.
+2. Empty-scan termination: when the window's masks complete, the run ended with masks
+   beyond batch_last. Fix: empty scan + masks-beyond -> continue (the window SLIDES on
+   the recomputed frontier next step).
+3. Instrumentation answered the C1b question STRUCTURALLY: committed islands beyond
+   the window can never form (commits only come from decoded rows) - "max island
+   extension" is 0 by construction. C1b (row-map refactor) is therefore NOT needed for
+   island coverage; its only remaining motivation would be DPad-style stochastic
+   sampling, which is now low-priority.
+
+### Measured results
+- W sweep (code KPI, s=3): off 22.6 s/96 st; w64 6.1 s/60; w128 7.0 s/59; w256
+  degenerate-ish 12 steps (window ~= canvas -> pure path perturbation, pointless).
+- MULTI-SEED FINALS (3 seeds): off 73.3 s, w64 20.0 s = 3.67x - THE BEST single-config
+  result of the project so far (beats kv_block 32's 3.08x), on the plain square path
+  with no cache machinery.
+- Short-form: haiku w128 = 1.31 s/14 steps vs 0.34 s/8 off - the universal
+  content-length split, again.
+- BENCH GATE: win64 profile = 23/48 vs baseline 35/48 - small-canvas drafts collapse
+  (the 64-window restricts commits on a 190-token region). VERDICT: window ships
+  DEFAULT OFF, content-gated exactly like kv flags and tau: long generations only.
+- Fresh baseline re-committed (guard v3 changes some paths; 35/48 incl. m-tier).
+
+### Updated plan status
+- C1a: DONE (flag --diffusion-window; recommendation: 64 for >=384-token generations).
+- C1b: CLOSED (structurally unnecessary; see instrumentation finding).
+- C4/C5/C6: probes done (C4 verified, C6 corrected to semantic-only, C5 pending the
+  tokenize count) - implementation remains, now de-risked.
+- The recommendation table consolidates across layers: long-code generation wants
+  window 64 (3.67x) OR kv_block 32 (3.08x) - composition of the two is the obvious
+  next experiment when implementation resumes (currently mutually exclusive in v1).

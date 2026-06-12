@@ -282,6 +282,7 @@ int main(int argc, char ** argv) {
     diff_params.early_commit     = params.diffusion.early_commit;
     diff_params.kv_span          = params.diffusion.kv_span;
     diff_params.kv_anchor        = params.diffusion.kv_anchor;
+    diff_params.window           = params.diffusion.window;
     diff_params.remask_margin    = params.diffusion.remask_margin;
     diff_params.remask_budget    = params.diffusion.remask_budget;
 
