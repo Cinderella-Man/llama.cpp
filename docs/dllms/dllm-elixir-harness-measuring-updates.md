@@ -214,3 +214,55 @@ external wall as the only denominator (and the lib restamp fix ships with this w
 3. GenServer vs Agent for T3: NEITHER - both graded out empirically; the ceiling tier
    is vowels/shout/Stack. GenServer-class capability is measured implicitly by Stack
    (multi-function hole) at half the cost.
+
+
+## EMPIRICAL GRILLING ROUND 2 (2026-06-12): the acceptance test, executed for real
+
+The full 15-case x 3-seed suite was built as a probe script and run 4 times (Dream
+baseline x2, Dream kv_prefix-32, DiffuCoder baseline). Findings:
+
+### H. Repeatability: the stack is DETERMINISTIC per seed - gates recalibrated
+Two identical back-to-back Dream runs (45 paired case-seeds):
+- pass flips: ZERO (33/45 both runs, identical case-level outcomes)
+- passing-pair wall deltas: median 2.2%, max 8.1%
+Same-seed generation is reproducible end-to-end (seeded sampling incl. GPU chain).
+The planned noise tolerance (">=2 of 45 pass-units") protected against run-noise that
+DOES NOT EXIST. Calibrated gates:
+- identical-config rerun (instrument self-check): pass outcomes must match EXACTLY;
+  any flip = environment problem (power state, thermal, wrong binary), not noise.
+- config A/B: EVERY pass transition is a real behavioral change. Regression flags:
+  any pass LOST in P/H/I tiers (expected-stable tiers), or tier median wall +10%
+  (was 15%; max observed same-config delta is 8.1%). C/A-tier transitions are the
+  quality-movement signal, either direction.
+- Tier sanity on Dream baseline: P 18/18, H 9/9, I 6/6, C 0/9, A 0/3 - exactly the
+  designed profile.
+
+### I. The instrument's FIRST REAL VERDICT: kv_prefix-32 is a NET LOSS on this workload
+(and it overturns the earlier casual advice to default it in kintsugi)
+- Quality: zero pass transitions vs baseline (the Layer A EOG quarantine holds).
+- Wall, per case (median over passing seeds): p_swap -19%, p_double -5%, p_even -3%
+  (mild wins) BUT p_sum +607% (1.16 s -> 8.19 s), p_max +371%, p_reverse +31%; and the
+  failing C tier costs 2.2x more (median 5.0 s -> 11.3 s). Heal/infill unaffected
+  (Credence path never touches the GPU).
+- Root cause matches the Layer A guide sec 13.8: short answers on small canvases are
+  the EOT-shrink-dominated regime; warm forwards + EOG-quarantine cycles eat the cache
+  win. The 1.96x kv win was measured on LONG content (512-canvas module generation).
+- ACTION: kintsugi must NOT default kv_prefix; gate it on expected answer length
+  (e.g. only when n_gen >= 384) - and the bench should grow a LONG-form case before
+  that gating is tuned. Recorded as the bench's first decision-grade output.
+
+### J. DiffuCoder profile: same total, different SHAPE - tier expectations are PER-MODEL
+DiffuCoder baseline: 33/45 total (same as Dream!) but: PASSES c_vowels 3/3 (the string
+hole is partially Dream-specific), FAILS p_even 0/3 (!), P-tier median 2.7x slower
+(2846 vs 1056 ms), infill faster (146 vs 210 ms), aspirational fails cheaper (1.7 s vs
+3.1 s). Design consequences:
+- "expected pass/fail" tier labels are MODEL-SPECIFIC metadata, not global; baselines
+  are per-model; compare.exs pairs same-model runs only.
+- An aggregate pass-count alone (33 vs 33) would call these models EQUAL - the per-tier
+  per-case breakdown is the actual information. The old 4-case bench could never have
+  seen this.
+
+### K. Implementation shortcut
+The probe script (/tmp/suite_probe.exs) IS the v2 suite in miniature - the
+implementation lifts it into bench/cases.exs + bench/bench.exs with the JSONL/env/
+compare machinery from the design. All 15 cases and seeds are final as probed.
