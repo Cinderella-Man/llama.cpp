@@ -1324,6 +1324,9 @@ void diffusion_generate_block_ar(llama_context *          ctx,
     int32_t       n_steps = 0;
     bool          done    = false;
 
+    LOG_INF("block-ar: n_input=%d bd=%d sub=%d kv=%d thr=%.2f L_max=%d\n",
+            n_input, bd, sb, kv_on ? 1 : 0, thr, L_max);
+
     // cached mode: prefill the complete prompt blocks into the store, one WARM per
     // 32-aligned block (block-causality across the prompt is enforced by the feed
     // order; the all-allow mask only ever sees [earlier blocks | own block])

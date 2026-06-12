@@ -129,6 +129,83 @@ int main(int argc, char ** argv) {
     if (!ctx) { LOG_ERR("context creation failed (n_seq_max=8)\n"); return 1; }
     llama_set_causal_attn(ctx, false);
 
+    // PROBE7 (env PROBE_KV=1): fast-dllm E3 cached-vs-square logit equivalence.
+    // Builds a 96-token committed sequence, takes UNIFIED square logits as reference,
+    // then replays it as [WARM 0-32 | WARM 32-64 | DECODE 64-96] and compares the last
+    // block's logits row by row. Localizes any store/mask/offset bug instantly.
+    if (std::getenv("PROBE_KV")) {
+        const int   T  = 96;
+        const int   BD = 32;
+        std::vector<llama_token> toks = common_tokenize(vocab, std::string(
+            "Write Elixir code for the following task. Reply with ONLY a single elixir code "
+            "block, no explanation. Task: a module Rev with reverse/1 that reverses a list "
+            "without using Enum.reverse and a doubler and a tripler function too."), true, true);
+        while ((int) toks.size() < T) {
+            toks.push_back(toks[toks.size() % 40]);  // deterministic filler, all committed
+        }
+        toks.resize(T);
+
+        llama_batch pb = llama_batch_init(T, 0, 1);
+        auto fwd = [&](int from, int to) -> std::vector<float> {
+            pb.n_tokens = to - from;
+            for (int i = from; i < to; i++) {
+                pb.token[i - from]     = toks[i];
+                pb.pos[i - from]       = i;
+                pb.n_seq_id[i - from]  = 1;
+                pb.seq_id[i - from][0] = 0;
+                pb.logits[i - from]    = 1;
+            }
+            if (llama_decode(ctx, pb) != 0) {
+                return {};
+            }
+            const float * lg = llama_get_logits(ctx);
+            return std::vector<float>(lg, lg + (size_t) (to - from) * n_vocab);
+        };
+
+        llama_model * mm = const_cast<llama_model *>(model);
+
+        // reference: UNIFIED square over the whole sequence; keep rows of the last block
+        llama_diffusion_set_phase(mm, /*UNIFIED*/0, 0);
+        auto ref_all = fwd(0, T);
+        GGML_ASSERT(!ref_all.empty());
+
+        // cached replay: warm the first two blocks, decode the third
+        for (int b = 0; b + BD < T; b += BD) {
+            llama_diffusion_set_block(mm, b, T);
+            llama_diffusion_set_phase(mm, /*WARM*/1, b);
+            auto w = fwd(b, b + BD);
+            GGML_ASSERT(!w.empty());
+        }
+        llama_diffusion_set_phase(mm, /*DECODE*/2, T - BD);
+        auto dec = fwd(T - BD, T);
+        GGML_ASSERT(!dec.empty());
+
+        double md_all = 0;
+        int agree = 0;
+        for (int i = 0; i < BD; i++) {
+            const float * r = ref_all.data() + (size_t) (T - BD + i) * n_vocab;
+            const float * c = dec.data() + (size_t) i * n_vocab;
+            double md = 0;
+            int am_r = 0, am_c = 0;
+            for (int v = 0; v < n_vocab; v++) {
+                md = std::max(md, (double) std::fabs(c[v] - r[v]));
+                if (r[v] > r[am_r]) am_r = v;
+                if (c[v] > c[am_c]) am_c = v;
+            }
+            md_all = std::max(md_all, md);
+            agree += am_r == am_c;
+            LOG_INF("PROBE7 row %2d (pos %2d): max|dlogit| %.3e argmax %s\n",
+                    i, T - BD + i, md, am_r == am_c ? "agree" : "FLIP");
+        }
+        LOG_INF("PROBE7 cached-vs-square: max|dlogit| %.3e, argmax agree %d/%d\n", md_all, agree, BD);
+
+        llama_diffusion_set_phase(mm, /*UNIFIED*/0, 0);
+        llama_batch_free(pb);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 0;
+    }
+
     auto canvas_a = make_canvas(vocab, "Write a short poem about rivers.", 96);
     auto canvas_b = make_canvas(vocab, "Explain what a stack data structure is.", 64);
     const int La = (int) canvas_a.size(), Lb = (int) canvas_b.size();

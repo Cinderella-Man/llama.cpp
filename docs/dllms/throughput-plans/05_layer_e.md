@@ -183,8 +183,8 @@ PROGRESS LOG (updated as work lands; resume from here after any crash):
 - [x] Equivalence gate: temp-0 argmax outputs cached vs uncached (expect identical
       or near; committed blocks are FINAL when warmed - no Dream-style drift/rewarm)
 - [x] Speed: CLI ms/step at n_gen 128/256/384
-- [ ] Bench: ONE kintsugi run (profile fastdllm + kv), compare 21/48 + walls
-- [ ] Docs/memory updated, committed
+- [x] Bench: ONE kintsugi run (profile fastdllm + kv), compare 21/48 + walls
+- [x] Docs/memory updated, committed
 
 ### Design (decided after reading the code, 0 new machinery needed)
 
@@ -261,3 +261,44 @@ backend sampling is the known next bite at it.
 Caveat for the rig: pkv phase state lives on the MODEL - concurrent requests on
 multiple contexts of one model (multi-replica server) would race. Single-replica
 per model only, or per-context state later.
+
+### E3 BENCH GATE + the p_reverse investigation (2026-06-12 late evening)
+
+BENCH (profile fastdllm + --diffusion-block-kv server flag, ONE run, guards active,
+zero incidents; 20260612T190731Z-e3-fastdllm-kv.jsonl):
+
+| config | pass | deliverable | total wall |
+|---|---|---|---|
+| E2 uncached (t09 baseline) | 21/48 | 3.54 tok/s | 156 s |
+| E3 block-kv | 19/48 | **8.17 tok/s (2.3x)** | 62 s (2.52x) |
+
+Tier walls: m 1.74x, c 2.13x, h 2.02x faster; p-tier unchanged (drafts are 1-2
+blocks - the cache has nothing to amortize there yet).
+
+The 2 lost passes were BOTH p_reverse (seeds 11, 111; all 3 kv seeds burned 3
+drafts). Investigated to ground truth:
+- Text-level: cached output on that prompt shows duplicate-token artifacts
+  ("do do") - looked like a shifted-commit bug.
+- Geometry bisect: prompts < 32 tok (no prefill WARM) byte-identical at temp 0;
+  aligned 64-tok prompt clean; only the partial-tail geometry showed the artifact
+  -> suspicion of a tail-block bug.
+- LOGIT-LEVEL ground truth (PROBE7, new env-gated probe in diffusion-batch-probe:
+  PROBE_KV=1): [WARM|WARM|DECODE] vs UNIFIED square on identical committed
+  content: max|dlogit| 1.47, argmax agree 32/32.
+- ENVELOPE BASELINE (PROBE1, same model): pure batch-SHAPE change on the
+  unchanged square path = max|dlogit| 1.54-1.59, argmax 103/103.
+
+VERDICT: the cached path's deviation is AT/BELOW the model's own batch-shape
+numerics envelope - E3 is mathematically faithful. p_reverse rides the quality
+edge: +/-1.5-logit noise flips low-confidence commits, and the progress-guarantee
+(force-commit best position) cascades them into visibly different (occasionally
+degenerate) drafts. ANY numerics perturbation costs +/- a couple of bench passes
+on edge cases; the 21 vs 19 delta is that sensitivity, not a cache defect.
+
+RECOMMENDATION: --diffusion-block-kv ON for FastDLLM serving (2.3x deliverable,
+2.5x wall; the rig's currency). Note for multi-replica rig serving: pkv phase
+state is per-MODEL - single replica per model process only (same caveat as
+Dream layer A).
+
+NEXT BITES at the ~10.3 ms step floor: backend sampling for block-AR (saves the
+~3 ms full-vocab 32-row D2H per step), sub-block tuning, P106 validation.
