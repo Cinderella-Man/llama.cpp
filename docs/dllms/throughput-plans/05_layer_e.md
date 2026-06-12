@@ -406,16 +406,43 @@ sampling host-side from the K plain probs.
 x2 ~= tok/s x2. Three independent bench-gated experiments on top of E4 (kv+bs).
 
 PROGRESS LOG:
-- [ ] E5a sub-block sweep: sb 8 (reference) -> 16, 32. CLI shape probe (commits/
-      step from generated/steps, 2 prompts x temp 0.2), then bench the winner(s).
-- [ ] E5b threshold sweep: 0.9 -> 0.85, 0.8 (0.6 known-corrupt; the 0.8-0.9 edge
-      is unmeasured). Same protocol.
+- [x] E5a sub-block sweep: sb 8 (reference) -> 16, 32. Server shape probe, bench.
+- [x] E5b threshold sweep: 0.9 -> 0.85, 0.8. Same protocol.
 - [ ] E5c entropy-bound committer port (DG machinery, trained-in there - fail fast).
 - [ ] Docs/memory updated, committed
 
 GATE (07_layer_f.md): bench pass count holds 19/48-class (accept +-2 = the
 measured numerics band); walls + commits/step logged per config. KILL IF passes
 drop >2 at every setting (1.85 is then the model's honest rate).
-Method notes: CLI probes single-seed are SHAPE only (path-luck rule); verdicts
-come from the bench. Profiles are request params (sub_block / conf_threshold) on
-the same server process as the E4 runs.
+Method notes: probes ran THROUGH the server (CLI-vs-server GPU sharing rule),
+single-seed = SHAPE only; verdicts from the bench, same server process as E4.
+
+### E5a/E5b MEASURED (2026-06-13)
+
+Shape probes (server, temp 0.2, seed 3, kv+bs; steps for 448-tok stack prompt /
+commits-per-step incl. warm+AR steps):
+
+| config | stack steps | commits/step | genserver steps |
+|---|---|---|---|
+| sb8 thr0.9 (E4 reference) | 273 | 1.64 | 177 |
+| sb16 | 271 | 1.65 | 169 |
+| sb32 | **205** | **2.19** | 170 |
+| thr 0.85 | 250 | 1.79 | 161 |
+| thr 0.8 | 240 | 1.87 | 153 |
+| sb32 + thr 0.85 | 227 | 1.97 | - |
+
+BENCH (same process as the E4 runs; reference e4bs = 19/48, 9.24 tok/s):
+
+| profile | pass | deliverable | verdict |
+|---|---|---|---|
+| e5sb32 | 19/48 (p_reverse-11 GAINED, p_max-141 LOST) | 8.99 | pass-swap inside the numerics band, no deliverable gain |
+| e5t085 | 18/48 (p -1) | 9.54 | +3% for -1 pass: noise-level trade, no adoption |
+| e5t08 | 14/48 (p 5/18) | 8.38 | QUALITY CLIFF - killed |
+
+READING: the commit-rate lever is QUALITY-BOUND, exactly as 07_layer_f.md
+anticipated ("1.85 is the model's honest rate"). The threshold family maps the
+cliff: 0.9 is calibrated, 0.85 starts bleeding passes for ~nothing, 0.8 collapses
+p-tier. sb32's long-form step saving (1.32x wall on the 448-tok probe) does NOT
+transfer to the bench's short drafts - same content-length split as Dream's
+window-64/kv_block (Layers A/C): a knob for genuinely long output, not a default.
+DEFAULTS UNCHANGED: sb 8, thr 0.9.

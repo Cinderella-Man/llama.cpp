@@ -1304,10 +1304,18 @@ void diffusion_generate_block_ar(llama_context *          ctx,
     std::vector<std::pair<float, int32_t>> cand;
     cand.reserve(4096);
 
+    struct eb_cand {
+        float       h;
+        int32_t     pos;
+        llama_token tok;
+    };
+    std::vector<eb_cand> eb_pend;
+
     // sample the token for pos from the LAST forward (rows based at `base` = position
     // of row 0: 0 for the uncached square, blk_start for cached block forwards),
-    // returning the plain softmax prob of the sampled token as the commit confidence
-    auto predict = [&](int32_t pos, int32_t base, float & p_out) -> llama_token {
+    // returning the plain softmax prob of the sampled token as the commit confidence;
+    // h_out (optional) = entropy of the plain distribution (E5c accept rule)
+    auto predict = [&](int32_t pos, int32_t base, float & p_out, float * h_out = nullptr) -> llama_token {
         const int32_t r = pos - 1 - base;
         if (use_backend) {
             const float *       probs = llama_get_sampled_probs_ith(ctx, r);
@@ -1321,6 +1329,15 @@ void diffusion_generate_block_ar(llama_context *          ctx,
                 if (probs[j] > probs[am]) {
                     am = j;
                 }
+            }
+            if (h_out) {
+                double h = 0.0;
+                for (uint32_t j = 0; j < n_pr; j++) {
+                    if (probs[j] > 0.0f) {
+                        h -= (double) probs[j] * log((double) probs[j]);
+                    }
+                }
+                *h_out = (float) h;
             }
             if (temp > 0.0f) {
                 // tempered q_j ~ p_j^(1/temp) over the candidates; nucleus top_p over
@@ -1367,9 +1384,16 @@ void diffusion_generate_block_ar(llama_context *          ctx,
             }
         }
         if (temp <= 0.0f) {
-            double Z = 0.0;
+            double Z  = 0.0;
+            double S1 = 0.0;  // sum e^x * x, for H = ln Z - S1/Z
             for (int32_t v = 0; v < n_vocab; v++) {
-                Z += exp((double) row[v] - row[am]);
+                const double x = (double) row[v] - row[am];
+                const double e = exp(x);
+                Z  += e;
+                S1 += e * x;
+            }
+            if (h_out) {
+                *h_out = (float) (log(Z) - S1 / Z);
             }
             p_out = (float) (1.0 / Z);
             return am;
@@ -1380,10 +1404,17 @@ void diffusion_generate_block_ar(llama_context *          ctx,
         // position clears 0.9 at once and simultaneous shifted commits emit
         // adjacent-duplicate garbage; observed before this fix)
         double Z_plain = 0.0;
+        double S1      = 0.0;
         double Z_temp  = 0.0;
         for (int32_t v = 0; v < n_vocab; v++) {
-            Z_plain += exp((double) row[v] - row[am]);
-            Z_temp  += exp(((double) row[v] - row[am]) / temp);
+            const double x = (double) row[v] - row[am];
+            const double e = exp(x);
+            Z_plain += e;
+            S1      += e * x;
+            Z_temp  += exp(x / temp);
+        }
+        if (h_out) {
+            *h_out = (float) (log(Z_plain) - S1 / Z_plain);
         }
         cand.clear();
         for (int32_t v = 0; v < n_vocab; v++) {
@@ -1511,6 +1542,30 @@ void diffusion_generate_block_ar(llama_context *          ctx,
                 }
                 const int32_t fwd_base = kv_on ? blk_start : 0;
 
+                if (params.block_eb > 0.0f) {
+                    // E5c: accept by ascending entropy while the cumulative entropy
+                    // stays within the budget (DG-style); lowest-entropy position
+                    // always commits (progress guarantee)
+                    eb_pend.clear();
+                    for (int32_t i = s; i < e; i++) {
+                        if (output_tokens[i] != params.mask_token_id) {
+                            continue;
+                        }
+                        float p, h;
+                        const llama_token tok = predict(i, fwd_base, p, &h);
+                        eb_pend.push_back({ h, i, tok });
+                    }
+                    std::sort(eb_pend.begin(), eb_pend.end(),
+                              [](const auto & a, const auto & b) { return a.h < b.h; });
+                    double cum = 0.0;
+                    for (size_t j = 0; j < eb_pend.size(); j++) {
+                        if (j > 0 && cum + eb_pend[j].h > params.block_eb) {
+                            break;
+                        }
+                        output_tokens[eb_pend[j].pos] = eb_pend[j].tok;
+                        cum += eb_pend[j].h;
+                    }
+                } else {
                 // commit everything above thr in THIS sub-block; if nothing clears
                 // the bar, the max-prob position commits anyway (progress guarantee)
                 int32_t     n_committed = 0;
@@ -1534,6 +1589,7 @@ void diffusion_generate_block_ar(llama_context *          ctx,
                 }
                 if (n_committed == 0 && best_pos >= 0) {
                     output_tokens[best_pos] = best_tok;
+                }
                 }
 
                 // reference stop rule: EOG in the generated region with no mask before it

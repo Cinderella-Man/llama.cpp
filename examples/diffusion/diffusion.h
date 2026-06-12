@@ -95,6 +95,11 @@ struct diffusion_params {
     int32_t sub_block        = 0;      // Fast-dLLM v2 block-AR decode: sub-block size for the
                                        // left-to-right commit schedule (0 = 8, the reference).
 
+    float   block_eb         = 0.0f;   // E5c: block-AR alternative accept rule - per step, commit
+                                       // masked positions by ascending entropy while the cumulative
+                                       // entropy stays <= this bound (DG-style budget; replaces the
+                                       // conf_threshold rule). 0 = off.
+
     bool    block_kv         = false;  // Fast-dLLM v2 block-AR decode (E3): cache committed blocks'
                                        // KV in the model pkv store; forward only the active block
 
