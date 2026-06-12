@@ -42,6 +42,11 @@ defmodule Kintsugi.Bench.Runner do
     # Fast-dLLM v2 (block-AR): the commit threshold is the model's own scale -
     # 0.6 (Dream-tuned) floods adjacent commits into duplicate-token corruption
     "fastdllm" => %{"conf_threshold" => 0.9},
+    # E4 same-process A/B (05_layer_e.md): block-kv via request param instead of
+    # the --diffusion-block-kv server flag; e3kv = E3 configuration reproduced,
+    # e4bs = + backend (GPU) sampling for the block-AR loop
+    "e3kv" => %{"conf_threshold" => 0.9, "block_kv" => true, "backend_sampling" => false},
+    "e4bs" => %{"conf_threshold" => 0.9, "block_kv" => true, "backend_sampling" => true},
     # D4 hybrid: per-engine thresholds live INSIDE generate_hybrid (draft 0.9,
     # repair engine on its own defaults) - the profile stays empty on purpose
     "d4" => %{}
