@@ -266,3 +266,52 @@ hole is partially Dream-specific), FAILS p_even 0/3 (!), P-tier median 2.7x slow
 The probe script (/tmp/suite_probe.exs) IS the v2 suite in miniature - the
 implementation lifts it into bench/cases.exs + bench/bench.exs with the JSONL/env/
 compare machinery from the design. All 15 cases and seeds are final as probed.
+
+
+## EMPIRICAL GRILLING ROUND 3 (2026-06-12): restart boundaries, config plumbing, safety
+
+### L. Determinism boundary: OUTCOMES survive server restarts, WALLS do not
+Suite run again after a full server restart vs the original run: pass flips ZERO
+(33/45, identical case-level outcomes - committed baselines are valid across restarts).
+BUT wall deltas widen: median 4.5%, max +138% (p_double seed 42: 1652 -> 3939 ms,
+seed 142 +101%) - the marginal repair-cascade case takes a DIFFERENT path across
+restarts while still passing (plausible mechanism: cuBLAS algorithm selection varies
+per process; marginal logit ties at temp 0.2 break differently; within-process plans
+are stable, hence round-2's 8.1% max). CONSEQUENCES:
+- pass-exactness remains the cross-restart invariant (gate unchanged);
+- WALL comparisons are only tight WITHIN one server process - see finding M for why
+  that is now easy;
+- per-case wall gates use medians-of-3-seeds, never single case-seeds (a single
+  +138% case-seed across restarts is expected tail behavior).
+
+### M. Request-level config profiles VERIFIED - server restarts eliminated from A/B
+/health exposes NO sampling/diffusion defaults (fields probed: status, model, family,
+mask_token_id, mask_piece, canvas_length, n_ctx, n_ubatch, replicas) - so server-flag
+configs are invisible to metadata. The fix is also a simplification: kintsugi already
+sends full sampling config per request (@default_opts), and the per-request "kv_prefix"
+passthrough WORKS (probed on a no-kv server: kv absent = 650 ms engine time, kv_prefix
+32 = 1254 ms, different generation - the cache demonstrably engaged). Therefore:
+- bench config profiles = REQUEST PARAMETERS (incl. kv knobs); one server process
+  serves all profiles of a model; A/B runs share the process -> tight walls (finding L);
+- the runner records the profile itself as the config metadata (self-sufficient);
+- infill cases must pass temp/top_k/eps explicitly (today they fall to server
+  defaults - the one remaining server-default dependency, eliminated in cases.exs);
+- extending /health with the server's diffusion defaults stays a nice-to-have, no
+  longer load-bearing.
+
+### N. Safety + guard reads
+- Infinite-loop generated code: Kintsugi.Verifier.run kills the check subprocess at
+  the 10 s timeout and returns a clean error (probed with def loop, do: loop()).
+  Worst-case ceiling-tier cost is bounded; no hang risk.
+- Battery guard reads verified on this machine: ADP1/online = 1 on AC, BAT1/status
+  readable ("Full"). The on-battery refusal path itself remains UNTESTED (machine
+  was plugged throughout) - test once by unplugging before trusting the guard.
+
+### Grilling complete - what three rounds changed, in one paragraph
+The plan's shape survived; nearly every NUMBER and several mechanisms did not: tiers
+re-graded empirically (intuition wrong), one impossible check caught, two unhealable
+heal cases replaced, gates recalibrated twice (run-noise does not exist; restart-tail
+behavior does), the kv_prefix recommendation overturned by the instrument itself,
+per-model tier metadata introduced, and server-flag configs replaced by request-level
+profiles that make same-process A/B the standard. Implementation can now proceed with
+no unverified assumptions except the battery-refusal path.
