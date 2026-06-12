@@ -3950,6 +3950,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.diffusion.kv_window = value; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-tau-alpha"}, "F",
+        string_format("adaptive confidence threshold decay alpha (0 = fixed) (default: %.2f)", (double) params.diffusion.tau_alpha),
+        [](common_params & params, const std::string & value) { params.diffusion.tau_alpha = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         {"--diffusion-replicas"}, "N",
         string_format("diffusion-server: model replicas in one process, one per GPU (0 = one per GPU device) (default: %d)", params.diffusion.replicas),
         [](common_params & params, int value) { params.diffusion.replicas = value; }

@@ -685,6 +685,20 @@ void diffusion_generate(llama_context *          ctx,
                     size_t  best        = 0;
                     int32_t n_committed = 0;
 
+                    // Layer B1 adaptive threshold (Streaming-dLLM context_aware_threshold):
+                    // decay tau as masks deplete. r_mask denominator = GENERATION region of
+                    // the active window (NOT the scan width - non-kv scan includes the
+                    // prompt, which would deflate r_mask and over-decay tau at the start)
+                    float tau_eff = params.conf_threshold;
+                    if (params.tau_alpha > 0.0f) {
+                        const int32_t region_lo = kv_on ? kv_s : n_input;
+                        const int32_t region_hi = kv_on ? std::min(batch_last, cur_length) : cur_length;
+                        const float   r_mask    = region_hi > region_lo
+                            ? (float) mask_positions.size() / (float) (region_hi - region_lo)
+                            : 1.0f;
+                        tau_eff = params.conf_threshold * (1.0f - params.tau_alpha * (1.0f - r_mask));
+                    }
+
                     // Layer A EOG quarantine: stale cached K/V systematically INFLATE
                     // end-token confidence (low-information context -> EOT pathology) -
                     // observed as truncated outputs. Cached steps may commit text freely
@@ -701,7 +715,7 @@ void diffusion_generate(llama_context *          ctx,
                         if (confidences[i].first > confidences[best].first) {
                             best = i;
                         }
-                        if (confidences[i].first >= params.conf_threshold) {
+                        if (confidences[i].first >= tau_eff) {
                             const int32_t mask_idx = confidences[i].second;
                             if (eog_blocked(sampled_tokens[mask_idx])) {
                                 continue;

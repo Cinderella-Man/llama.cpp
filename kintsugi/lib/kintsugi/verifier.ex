@@ -25,6 +25,50 @@ defmodule Kintsugi.Verifier do
   end
 
   defp compile_quoted(code) do
+    case redefined_core_module(code) do
+      nil -> do_compile_quoted(code)
+      mod ->
+        {:error,
+         [%{line: 1, message: "candidate redefines already-loaded module #{mod} - rejected " <>
+              "(a generated `defmodule List` once clobbered the stdlib and killed the VM)",
+            severity: :error}]}
+    end
+  end
+
+  # generated code occasionally redefines core modules (observed: defmodule List under
+  # aggressive decoding) - compiling that into this VM destroys the runtime. Reject any
+  # candidate that defines a module which is ALREADY LOADED and not a kintsugi candidate.
+  defp redefined_core_module(code) do
+    with {:ok, ast} <- Code.string_to_quoted(code) do
+      {_, found} =
+        Macro.prewalk(ast, nil, fn
+          {:defmodule, _, [{:__aliases__, _, parts} | _]} = node, nil ->
+            mod = Module.concat(parts)
+
+            if Code.ensure_loaded?(mod) and not candidate_module?(mod) do
+              {node, inspect(mod)}
+            else
+              {node, nil}
+            end
+
+          node, acc ->
+            {node, acc}
+        end)
+
+      found
+    else
+      _ -> nil
+    end
+  end
+
+  defp candidate_module?(mod) do
+    case :code.which(mod) do
+      file when is_list(file) -> List.to_string(file) =~ "kintsugi_candidate"
+      _ -> false
+    end
+  end
+
+  defp do_compile_quoted(code) do
     {result, diagnostics} =
       Code.with_diagnostics(fn ->
         try do

@@ -63,6 +63,10 @@ struct diffusion_params {
     int32_t kv_rewarm        = 6;      // re-warm after this many cached steps (drift guard; swept 2026-06-12)
     int32_t kv_rewarm_commits = 0;     // re-warm after this many commits since last warm (0 = off;
                                        // drift tracks canvas CHANGES, not steps - often the better trigger)
+    float   tau_alpha        = 0.0f;   // Layer B1 adaptive threshold: tau_eff = conf_threshold *
+                                       // (1 - alpha*(1 - r_mask)), r_mask = remaining-mask fraction
+                                       // of the GENERATION region (0 = fixed threshold)
+
     int32_t kv_window        = 0;      // suffix lookahead window beyond the active block (0 = mode default:
                                        // prefix decodes the whole suffix, dual decodes the block only).
                                        // With W: decode/commit only [block_start, block_end + W) - distant

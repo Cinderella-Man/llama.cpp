@@ -126,6 +126,7 @@ static diffusion_params make_masked_params(const server_state & st, const json &
     dp.kv_rewarm        = req.value("kv_rewarm",      p.diffusion.kv_rewarm);
     dp.kv_rewarm_commits = req.value("kv_rewarm_commits", p.diffusion.kv_rewarm_commits);
     dp.kv_window        = req.value("kv_window",      p.diffusion.kv_window);
+    dp.tau_alpha        = req.value("tau_alpha",      p.diffusion.tau_alpha);
     dp.backend_sampling = req.value("backend_sampling", p.sampling.backend_sampling);
 
     const float   eps          = req.value("eps",          p.diffusion.eps);

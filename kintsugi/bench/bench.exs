@@ -21,7 +21,8 @@ Code.require_file("cases.exs", __DIR__)
 defmodule Kintsugi.Bench.Runner do
   @profiles %{
     "baseline" => %{},
-    "kvpfx32" => %{"kv_prefix" => 32}
+    "kvpfx32" => %{"kv_prefix" => 32},
+    "tau03" => %{"tau_alpha" => 0.3}
   }
 
   # full request params for infill cases - NO reliance on server defaults

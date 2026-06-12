@@ -405,6 +405,7 @@ struct common_params_diffusion {
     int32_t kv_rewarm     = 6;        // Layer A: re-warm after N cached steps
     int32_t kv_rewarm_commits = 0;    // Layer A: re-warm after N commits (0 = off)
     int32_t kv_window     = 0;        // Layer A: suffix lookahead window (0 = mode default)
+    float   tau_alpha     = 0.0f;     // Layer B1: adaptive threshold decay (0 = fixed)
 
     // entropy-bound decoder (DiffusionGemma canvas models); params default to GGUF metadata, then reference
     int32_t eb_mode          = 0;     // 0=auto (on for canvas models), 1=force on, 2=off
