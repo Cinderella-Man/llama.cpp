@@ -302,3 +302,53 @@ Dream layer A).
 
 NEXT BITES at the ~10.3 ms step floor: backend sampling for block-AR (saves the
 ~3 ms full-vocab 32-row D2H per step), sub-block tuning, P106 validation.
+
+## E4: backend (GPU) sampling for block-AR (started 2026-06-13; plan 07_layer_f.md)
+
+PROGRESS LOG (resume from here after any crash):
+- [ ] Design written (this section), committed
+- [ ] Loop: diffusion_generate_block_ar backend path + warmup fallback
+- [ ] Build clean, 14/14 sampler tests
+- [ ] Equivalence gate: temp-0 outputs backend vs CPU, 2-3 prompts (expect identical
+      or near - confidence renormalizes over top-k, see design)
+- [ ] Speed: CLI ms/step at n_gen 128/256/384, kv on, backend vs CPU sampling
+- [ ] Bench: same-process A/B (profiles e3kv / e4bs), compare vs E3 19/48 + 8.17 tok/s
+- [ ] Docs/memory updated, committed
+
+### Design (decided after re-reading the masked path + reference semantics)
+
+The 07_layer_f.md open question - "can the backend sampler chain express
+plain-softmax commit confidence exactly?" - dissolves once the chain is built
+WITHOUT temp/top_p: chain = top_k(K) -> dist(seed). dist's data->probs is then the
+PLAIN softmax over the top-K candidates (untempered - temp only enters via a temp
+sampler, which we omit), and the host replicates the reference sample_with_top_p
+over those K candidates:
+- temp <= 0: argmax over the K plain probs (top-1 of top-K == global argmax,
+  exact); confidence = its plain prob.
+- temp > 0: tempered q_j ~ p_j^(1/temp) over the K candidates, sort desc, nucleus
+  top_p over q, draw from the loop's own rng (CPU-path RNG semantics preserved);
+  confidence = PLAIN p_j of the sampled candidate (the de-temper lesson, by
+  construction - no de-temper math needed since probs were never tempered).
+The backend dist sampler's own sampled token is IGNORED (its RNG draw is paid but
+unused); the chain exists to deliver candidates + plain probs at k floats/row
+instead of 152k.
+
+KNOWN approximation: confidence renormalizes over the top-K set, not the full
+vocab - inflated by the tail mass beyond K (~1% at code positions with K=40). At
+thr 0.9 a near-boundary commit can fire one step early vs the CPU path; this is
+inside the E3-measured numerics envelope (+-1.5 logit batch-shape noise moves the
+same commits), gate = bench.
+
+Mechanics:
+- Backend chain attached via llama_set_sampler(ctx, 0, ...) when
+  params.backend_sampling && top_k > 0 (else CPU path, warn - mirroring the
+  masked path's eligibility rules; bench/CLI/server all pass top_k 40).
+- Warmup probe on the FIRST decode (sampled_ith(0) == NULL -> detach, redo the
+  decode for raw logits, fall back to CPU) - masked-path precedent verbatim.
+- forward_range returns success bool; CPU logits pointer kept only when
+  !use_backend. Row for pos = (pos-1) - batch_base unchanged.
+- AR-boundary predicts (kv finalize WARM doubles as the AR step) read the LAST
+  decode's sampled rows via _ith - same lifetime as the current ar_logits host
+  pointer (no decode intervenes between the WARM and the boundary predict).
+- With the sampler attached, needs_raw_logits goes false: the 32-row x 152k x 4 B
+  logits D2H disappears per step (the ~3 ms target of the 10.3 ms floor).
