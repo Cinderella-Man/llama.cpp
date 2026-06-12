@@ -500,6 +500,17 @@ null is 5070-on-AC-specific; launch-bound regimes (battery, Pascal Celeron rig)
 are where graphs paid 1.5x before - the rig-day GGML_CUDA_FORCE_GRAPHS A/B
 (p106 doc E3) is still owed and unaffected by this verdict.
 
+## Catalog-E6 partial: quant ladder for the block-AR model (2026-06-13)
+
+Catalog item E6 ("re-calibrate conf_threshold PER QUANT; parallel commits may be
+MORE sensitive to logit noise") applied to FastDLLM-1.5B, cheapest first: the E3
+p_reverse losses were measured numerics-edge flips, so LESS quant noise (Q8_0,
+1.63 GB - still fits the 6 GB rig next to nothing else, or the 3 GB P106-090
+does NOT hold it: Q4 stays the 3 GB option) may buy passes back, and IQ4_XS
+probes the down-ladder. Protocol: quantize from the on-disk F16, ONE bench per
+quant (e4bs profile, same process per pair where possible), CLI ms/step.
+Results below.
+
 ## LAYER E PART-1 CLOSURE (2026-06-13)
 
 07_layer_f.md PART 1 status:
