@@ -352,6 +352,24 @@ void diffusion_generate(llama_context *          ctx,
     int32_t kv_commits_since_warm = 0;
     int32_t kv_span_hint          = 0;  // B3: next block size detected at the last warm
     int32_t remask_total          = 0;  // B5: per-run remask cap (progress guarantee)
+
+    // Layer C4 in-run canvas growth: the canvas starts small and grows as the frontier
+    // approaches it, so the allocation (max_length) no longer sets the per-step cost.
+    // Square threshold path only - the kv modes re-derive block geometry from
+    // cur_length and the non-threshold schedules pre-compute transfer counts from the
+    // initial mask count.
+    const bool grow_on = params.gen_initial > 0 && !kv_on && !params.infill &&
+                         params.conf_threshold > 0.0f &&
+                         params.schedule == DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED &&
+                         params.cfg_scale <= 0.0f && !params.self_conditioning;
+    if (params.gen_initial > 0 && !grow_on) {
+        LOG_WRN("%s: gen_initial requested but unsupported here (needs conf_threshold>0, timestep "
+                "schedule, no kv/infill/cfg/self-conditioning) - starting at max_length\n", __func__);
+    }
+    if (grow_on) {
+        cur_length = std::min(params.max_length, n_input + params.gen_initial);
+    }
+    int32_t n_grows = 0;
     int32_t win_ext_max           = 0;  // C1a instrumentation: max window extension beyond
                                         // frontier+W forced by committed islands (C1b decision)
     int64_t win_rows_saved        = 0;  // C1a instrumentation: total rows pruned
@@ -380,6 +398,27 @@ void diffusion_generate(llama_context *          ctx,
                 if (!params.step_callback(
                         global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
                     break;
+                }
+            }
+
+            // Layer C4: grow the canvas when the frontier nears its end. A committed
+            // EOG means the answer is closing - never grow past it; the pre-filled
+            // masks beyond cur_length (init above) make growth just a bound raise.
+            if (grow_on && cur_length < params.max_length) {
+                const llama_vocab * gvocab   = llama_model_get_vocab(model);
+                int32_t             n_masked = 0;
+                bool                has_eog  = false;
+                for (int32_t i = n_input; i < cur_length && !has_eog; i++) {
+                    const llama_token t = output_tokens[i];
+                    if (t == params.mask_token_id) {
+                        n_masked++;
+                    } else if (llama_vocab_is_eog(gvocab, t) || t == llama_vocab_pad(gvocab)) {
+                        has_eog = true;
+                    }
+                }
+                if (!has_eog && n_masked < 8) {
+                    cur_length = std::min(params.max_length, cur_length + 64);
+                    n_grows++;
                 }
             }
 
@@ -1114,6 +1153,11 @@ void diffusion_generate(llama_context *          ctx,
     if (params.window > 0 && win_rows_saved > 0) {
         LOG_INF("diffusion window: %lld rows pruned total, max island extension %d (C1b decision metric)\n",
                 (long long) win_rows_saved, win_ext_max);
+    }
+
+    if (grow_on) {
+        LOG_INF("diffusion growth: started at %d, grew %d time(s), final active length %d (alloc %d)\n",
+                std::min(params.max_length, n_input + params.gen_initial), n_grows, cur_length, params.max_length);
     }
 
     int64_t time_end = ggml_time_us();

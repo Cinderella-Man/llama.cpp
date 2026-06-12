@@ -26,7 +26,12 @@ defmodule Kintsugi.Bench.Runner do
     "taub06" => %{"tau_alpha" => 0.6},
     "ec05" => %{"early_commit" => 0.5},
     "remask03" => %{"remask_margin" => 0.3},
-    "win64" => %{"window" => 64}
+    "win64" => %{"window" => 64},
+    "slim" => %{"slim_prompt" => true},
+    "mid" => %{"slim_prompt" => "mid"},
+    "grow" => %{"n_gen" => 384, "gen_initial" => 96},
+    "big384" => %{"n_gen" => 384},
+    "mh2" => %{"multi_hole" => 2}
   }
 
   # full request params for infill cases - NO reliance on server defaults

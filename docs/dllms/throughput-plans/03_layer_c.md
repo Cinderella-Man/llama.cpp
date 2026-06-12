@@ -177,11 +177,121 @@ square no-cache path takes any contiguous batch; rope uses batch.pos).
   DEFAULT OFF, content-gated exactly like kv flags and tau: long generations only.
 - Fresh baseline re-committed (guard v3 changes some paths; 35/48 incl. m-tier).
 
-### Updated plan status
+### Updated plan status (final, all phases measured)
 - C1a: DONE (flag --diffusion-window; recommendation: 64 for >=384-token generations).
 - C1b: CLOSED (structurally unnecessary; see instrumentation finding).
-- C4/C5/C6: probes done (C4 verified, C6 corrected to semantic-only, C5 pending the
-  tokenize count) - implementation remains, now de-risked.
-- The recommendation table consolidates across layers: long-code generation wants
-  window 64 (3.67x) OR kv_block 32 (3.08x) - composition of the two is the obvious
-  next experiment when implementation resumes (currently mutually exclusive in v1).
+- C4: DONE as engine feature (--diffusion-gen-initial / "gen_initial", default off);
+  REJECTED for kintsugi drafts (grow 27/48, big384 30/48 vs baseline 35/48 - canvas
+  geometry is a quality knob; n_gen 192 + redraft-doubling stays). See C4 section.
+- C5: REJECTED (slim 28/48, mid catastrophic; full wrapper stays). See C5 section.
+- C6: DONE as opt-in ("multi_hole"); pass-neutral and DORMANT on Dream bench
+  (parse cascades produce one diagnostic at a time). See C6 section.
+- Layer C net: ONE production win (C1a window 64 = 3.67x on long code), one engine
+  capability banked default-off (C4), two harness hypotheses cleanly refuted by the
+  bench (C5, C6-on-Dream). The recommendation table consolidates across layers:
+  long-code generation wants window 64 (3.67x) OR kv_block 32 (3.08x) - composition
+  of the two is the obvious next experiment (currently mutually exclusive in v1).
+
+### C5 prompt slimming: MEASURED, REJECTED (recovered from crashed sessions)
+Two sessions died mid-C5 (see crash post-mortem below); results recovered from
+kintsugi/bench/results/*c5-*.jsonl and the surviving working-tree diff (forge_wrapper
+variants in kintsugi.ex + slim/mid bench profiles).
+- Wrapper token counts (from the implementation comment, /tokenize-probed): full
+  wrapper 26 tokens -> slim 13; full templated prompt 58 -> 45 for a typical bench
+  task (~5% fewer rows/step on a 192-token draft). The saving is real but small.
+- BENCH GATE (48 cases): baseline 35/48, reproduced TWICE same-session (matches the
+  committed baseline exactly). slim ("Reply with only an ```elixir code block.")
+  = 28/48: p-tier 18->13, m-tier 2->0, wall 148 s -> 255 s (failed drafts cascade
+  into repairs). mid (full sentence, dropped "no explanation") = 8/18 p-tier at
+  truncation, IDENTICALLY in both runs - deterministic collapse, not noise.
+- VERDICT: REJECTED. Draft quality is extremely sensitive to wrapper phrasing; the
+  ~5% row saving cannot survive a 7-pass quality loss. The full 26-token wrapper
+  stays. CLOSED (do not revisit without a fundamentally different prompt strategy;
+  any retest must avoid the mid profile - see post-mortem).
+
+### C4 in-run canvas growth: IMPLEMENTED, MEASURED - growth REJECTED for drafts,
+### but it exposed a better flag-free policy (session 3, after recovery)
+Implemented as planned (--diffusion-gen-initial / server "gen_initial"; square
+threshold path only, +64 growth while masks < 8 and no committed EOG; pre-filled
+masks make growth a pure bound raise). Verification: baseline byte-identical with
+the flag off (deterministic AND threshold CLI refs), 14/14 sampler tests CPU+GPU,
+kv-gating warning fires, EOT-shrink composes (haiku: started 121, shrunk to 33, no
+guard abort), no mask leak (mask piece detokenizes to empty with special=false),
+growth fires when needed (gen_initial 48 counter: grew once 91->155, complete code).
+- KPI probes (server-side, 3 seeds, same session) split BOTH ways by content:
+  counter task: n_gen 384 baseline 1.66 s vs gi96 2.10 s (+25% - step inflation, 24
+  vs 15 steps; the small canvas commits slower). Stack task: baseline 5.53 s vs gi96
+  2.74 s (-50%). Single prompts cannot settle it; bench only.
+- KEY MECHANISM FINDING: allocation is already nearly FREE - n_gen 192 (1.72 s) ==
+  n_gen 384 (1.66 s) on the same task, because EOT-shrink collapses the canvas a few
+  steps in. The C4 premise ("the allocation sets per-step cost") is FALSE at HEAD;
+  EOT-shrink already harvested that win.
+- BENCH GATE grow (n_gen 384 + gen_initial 96): 27/48 vs baseline 35/48 - REJECTED
+  for drafts (p-tier 12/18 vs 18/18; the universal content-length split again: a
+  96-start draft is a worse draft, exactly like slim prompts and win64 drafts).
+- COROLLARY tested and ALSO REJECTED: "big384" (n_gen 384 flat, no growth) = 30/48
+  vs 35/48 - it breaks the same cases (p_sum 3/3 seeds, m_sumdoc 2) minus p_max. The
+  "allocation is free" finding holds for WALL but not QUALITY: the model sees the
+  mask count and plans against it; draft geometry is a quality knob and n_gen 192 is
+  the tuned spot. Failures are seed-deterministic collapses (1 s passes -> 10-28 s
+  repair cascades), the same signature as slim/mid.
+- C4 VERDICT: engine feature DONE and correct, ships DEFAULT OFF like window/kv;
+  kintsugi draft policy UNCHANGED (n_gen 192 + redraft-doubling stays). Remaining
+  plausible use: long generations (>=384 wanted tokens) where the stack-task probe
+  showed 2x - same content-gated family as window 64 / kv_block 32; composition with
+  window is the open experiment.
+
+### C6 multi-hole repair: IMPLEMENTED, MECHANISM VERIFIED - DORMANT on bench v2
+Implemented opt-in ("multi_hole" => cap, bench profile mh2; cap 2 per unresolved
+Q2): on a FRESH error (same-line streak 0), >= 2 semantic error diagnostics on
+distinct non-adjacent lines (line >= 2 - the header rule keeps line 1; check-script
+lines fall out via the > code-length filter; the rescued generic CompileError lands
+on line 0 and falls out too) get masked in ONE canvas - per-line tokenized hole
+sizes - one infill, one verify; broken results fall back to the single-hole ladder.
+- E2E probe (3 undefined helpers): fired as designed (history "multihole:[2, 4]",
+  one infill, 1.8 s vs 2.7 s single-hole on the same state).
+- BENCH GATE mh2: 35/48 == baseline, wall 146.7 s vs 145.5 s (noise), total repairs
+  62 == 62, ZERO per-case repair-count changes -> multi-hole NEVER FIRED across 48
+  cases. Dream-7B bench failures are PARSE-cascade dominated (the parser stops at
+  the first error, one diagnostic per round); semantic multiplicity - the C6
+  precondition - is absent from this model's real failure distribution. The offline
+  probe that motivated C6 (3 undefined fns -> 4 diagnostics) was synthetic.
+- VERDICT: ships as opt-in, default off, zero risk (pass-identical when dormant).
+  Re-check on DiffuCoder (different failure modes) before investing further; the
+  "fewer roundtrips on p_double cascades" expectation is REFUTED for Dream (those
+  cascades are parse errors, by construction outside C6's reach).
+
+### Verification record (this session)
+- 14/14 sampler tests CPU+GPU at HEAD and again (GPU) after the C4 engine change.
+- Baseline byte-identity with new flags off: deterministic CLI ref (eps schedule,
+  temp 0, seed 7) AND threshold-mode ref both byte-identical pre/post C4. At bench
+  level: mh2 run reproduced baseline walls per-case through the C4-modified binary.
+- C5 wrapper token counts confirmed via /tokenize: full 26, slim 13.
+- Mask piece detokenizes to empty (special=false) - C4's never-grown tail cannot
+  leak into response text (probed directly: no "<|mask|>" in grown outputs).
+- DG regression: satisfied structurally - git diff shows zero shared-engine changes
+  (src/, ggml/ untouched; diffusion_generate_entropy_bound byte-identical; DG
+  binaries rebuilt cleanly). No behavioral DG run needed this round.
+- Baselines: c5-baseline (35/48, 148 s) and c5-baseline2 (35/48, 145 s) from the
+  crashed sessions match the committed baseline - reproducibility across crash
+  boundaries confirmed.
+
+### Unresolved questions: ANSWERED
+1. C4 server default: 0 (off) - implemented; moot for kintsugi (growth rejected
+   for drafts entirely).
+2. C6 cap: 2 - implemented; hole-interaction risk unmeasurable on Dream bench
+   (never fires); revisit with DiffuCoder.
+3. C1a+kv mutual exclusion: kept for v1; window-x-kv composition remains the top
+   open experiment for long-code generation (3.67x vs 3.08x candidates).
+
+### Crash post-mortem (2026-06-12, two dead sessions)
+Both deaths occurred during C5 `mid`-profile bench runs, ~4-5 min into sustained
+back-to-back repair cascades (run 1: 285 s of cascades, died entering h_fib; run 2:
+259 s, died during the third c_stack). One crash took the whole machine down
+(reboot 15:14). The desktop shares the 8 GB GPU, so a driver hang/reset kills
+VSCode and the session with it. Normal bench runs (~150 s, natural idle gaps
+between requests) completed many times the same day without incident: the hazard is
+SUSTAINED pathological load (low-pass-rate profiles whose every task spirals into
+max-length repair loops), not any single case. Rules going forward: never re-run
+the C5 mid/slim profiles; write findings to disk before heavy GPU work; spot-check
+GPU temperature during long runs.

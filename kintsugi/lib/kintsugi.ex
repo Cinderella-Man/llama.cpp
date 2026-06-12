@@ -122,11 +122,9 @@ defmodule Kintsugi do
     max_repairs = Map.get(opts, "max_repairs", 4)
     check = Map.get(opts, "check")
 
-    prompt =
-      "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: " <>
-        instruction
+    prompt = forge_wrapper(opts) <> instruction
 
-    case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check"])) do
+    case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check", "slim_prompt", "multi_hole"])) do
       {:ok, %{"text" => text, "ms_total" => ms}} ->
         code =
           text |> extract_code() |> Autofix.run() |> normalize_draft() |> align_module_name(check)
@@ -145,6 +143,17 @@ defmodule Kintsugi do
         {:error, reason, %{drafts: 0, repairs: 0, ms_total: 0, credence_fixes: 0, history: []}}
     end
   end
+
+  # C5 prompt slimming: 13 fewer wrapper tokens (26 -> 13; full templated prompt
+  # 58 -> 45 for a typical bench task) = ~5% fewer rows/step on a 192-token draft.
+  # Opt-in per request; pass-rate gated by the bench (prompt changes shift drafts).
+  defp forge_wrapper(%{"slim_prompt" => true}), do: "Reply with only an ```elixir code block.\nTask: "
+
+  defp forge_wrapper(%{"slim_prompt" => "mid"}),
+    do: "Write Elixir code for the task. Reply with ONLY a single ```elixir code block.\n\nTask: "
+
+  defp forge_wrapper(_opts),
+    do: "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: "
 
   @doc """
   Plumbing: repair EXISTING code until it verifies (no drafting) - mask the broken
@@ -253,6 +262,75 @@ defmodule Kintsugi do
     end
   end
 
+  # C6: pick the lines for a multi-hole round. Semantic (compile) errors arrive as a
+  # LIST of diagnostics; parse errors stop the parser at one, so they never qualify.
+  # Adjacent lines stay one hole (interacting fills); the rescued generic CompileError
+  # ("cannot compile module ...") duplicates a precise diagnostic - skip it.
+  defp multi_hole_lines(code, diags, opts) do
+    cap = Map.get(opts, "multi_hole", 0)
+
+    if cap < 2 do
+      []
+    else
+      n_lines = code |> String.split("\n") |> length()
+
+      diags
+      |> Enum.filter(&(&1.severity == :error and is_integer(&1.line)))
+      |> Enum.reject(&String.starts_with?(&1.message, "cannot compile module"))
+      |> Enum.map(& &1.line)
+      |> Enum.filter(&(&1 >= 2 and &1 <= n_lines))
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.reduce([], fn ln, acc ->
+        case acc do
+          [prev | _] when ln - prev <= 1 -> acc
+          _ -> [ln | acc]
+        end
+      end)
+      |> Enum.reverse()
+      |> Enum.take(cap)
+    end
+  end
+
+  # C6: mask every target line in ONE canvas (the engine fills all mask runs in a
+  # single infill), one verify. Single fill attempt - the outer loop re-verifies and
+  # falls back to the single-hole ladder if holes remain broken.
+  defp repair_multi(eng, code, lines_to_mask, opts) do
+    lines = String.split(code, "\n")
+
+    canvas =
+      Enum.reduce(lines_to_mask, code, fn ln, acc ->
+        replaced = lines |> Enum.at(ln - 1, "") |> String.trim()
+
+        n =
+          case Engine.tokenize(eng, replaced) do
+            {:ok, tokens} -> max(length(tokens), 4) + 2
+            _ -> Masker.hole_size(replaced)
+          end
+
+        Masker.mask_line(acc, ln, eng.mask_piece, n)
+      end)
+
+    infill_opts =
+      Map.merge(
+        %{
+          "steps" => 16,
+          "conf_threshold" => Map.get(opts, "conf_threshold", 0.6),
+          "early_commit" => 0.5
+        },
+        Map.take(opts, ["temp", "top_k", "eps", "seed"])
+      )
+
+    case Engine.infill(eng, canvas, infill_opts) do
+      {:ok, %{"text" => raw, "ms_total" => ms}} ->
+        {text, _trace} = raw |> Autofix.run() |> Credence.Syntax.fix_with_trace([])
+        {:ok, text, ms}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   # -- internals -----------------------------------------------------------------------
 
   defp repair_until_ok(_eng, code, _opts, check, 0 = _budget, stats) do
@@ -300,6 +378,35 @@ defmodule Kintsugi do
           |> Map.update("seed", stats.repairs + 1, &(&1 + stats.repairs + 1))
           |> Map.put("window", same_line_streak)
 
+        # C6 multi-hole: independent SEMANTIC diagnostics (parse errors stop at one)
+        # on distinct non-adjacent lines fix in ONE canvas/infill/verify round. Only
+        # on a fresh error (streak 0) - escalation ladders stay single-hole.
+        multi_lines =
+          if same_line_streak == 0, do: multi_hole_lines(code, diags, opts), else: []
+
+        if length(multi_lines) >= 2 do
+          case repair_multi(eng, code, multi_lines, round_opts) do
+            {:ok, new_code, ms} ->
+              stats = %{
+                stats
+                | repairs: stats.repairs + 1,
+                  ms_total: stats.ms_total + ms,
+                  history:
+                    stats.history ++
+                      [{:repair, hd(multi_lines), "multihole:#{inspect(multi_lines)}"}]
+              }
+
+              repair_until_ok(eng, new_code, opts, check, budget - 1, stats)
+
+            {:error, _reason} ->
+              repair_single(eng, code, diags, round_opts, opts, check, budget, stats)
+          end
+        else
+          repair_single(eng, code, diags, round_opts, opts, check, budget, stats)
+        end
+  end
+
+  defp repair_single(eng, code, diags, round_opts, opts, check, budget, stats) do
         case repair(eng, code, diags, round_opts) do
           {:ok, new_code, ms} ->
             stats = %{

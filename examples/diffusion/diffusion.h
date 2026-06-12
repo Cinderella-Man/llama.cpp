@@ -87,6 +87,11 @@ struct diffusion_params {
                                        // non-EOG + 1); distant uncommitted masks are not decoded.
                                        // Commits scan the whole batch (no step inflation). 0 = off.
 
+    int32_t gen_initial      = 0;      // Layer C4 in-run canvas growth (square path): start the
+                                       // active canvas at n_input + N and grow by +64 while fewer
+                                       // than 8 masks remain and no EOG is committed; max_length
+                                       // stays the allocation. 0 = off (start at max_length).
+
     int32_t kv_anchor        = 3;      // Layer B4: with kv_window in PREFIX mode, always include the
                                        // last N canvas rows in the batch (the "final anchor" - the
                                        // model needs to see that the end exists; streaming-dllm

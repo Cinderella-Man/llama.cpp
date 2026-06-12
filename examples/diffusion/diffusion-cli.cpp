@@ -283,6 +283,7 @@ int main(int argc, char ** argv) {
     diff_params.kv_span          = params.diffusion.kv_span;
     diff_params.kv_anchor        = params.diffusion.kv_anchor;
     diff_params.window           = params.diffusion.window;
+    diff_params.gen_initial      = params.diffusion.gen_initial;
     diff_params.remask_margin    = params.diffusion.remask_margin;
     diff_params.remask_budget    = params.diffusion.remask_budget;
 
