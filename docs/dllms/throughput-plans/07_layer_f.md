@@ -202,6 +202,45 @@ real job: measure TRUE closed-loop acceptance (oracle is approximate in both
 directions) and end-to-end tok/s vs the same-process AR baseline.
 Drafts: /tmp/f2_drafts.jsonl (regenerate via the doc's recipe; bench prompts).
 
+### F2 STEP 2 v0 MEASURED (2026-06-13) - PARKED: closed-loop acceptance kills it
+
+Built llama-dflash (examples/diffusion/dflash.cpp): both models in one process
+(5.4 GB VRAM), drafts cross as TOKENS (shared Qwen2.5 vocab - no retokenization),
+verifier greedy walk + cache rollback per round, drafter stateless per round
+(re-prefills its pkv store; ~8 ms/32-block, minor at probe lengths). --ar mode =
+same-process pure-AR baseline. 8 bench cases, max 256 tokens, output IS the
+verifier's greedy decode by construction.
+
+| config | tok/s | accepted/round | drafted-token efficiency |
+|---|---|---|---|
+| AR baseline (Qwen2.5-7B greedy) | **54.8** | - | - |
+| dflash draft-len 32 | 26.1 | 5.79 | 18.1% (draft = 85% of wall) |
+| dflash draft-len 16 | **40.2** | 5.69 | 35.6% |
+| dflash draft-len 8  | 34.6 | 4.11 | 51.3% |
+
+THE ORACLE WAS OPTIMISTIC, AS WARNED: closed-loop acceptance is 5.7/round, not
+the oracle's 8-12. Mechanism: the oracle's first blocks scored the easy chat
+preamble ("Sure, I'd be happy to help...") at L=29-30; INSIDE code the drafter
+diverges from Qwen-7B every ~4-6 tokens. Re-drafting from corrected prefixes
+does not lift it (5.79 at dl 32 vs 5.69 at dl 16 - acceptance dies early and
+re-basing does not save it). Acceptance is capability-bound (1.5B vs 7B
+disagreement rate on code), not context-bound.
+
+Ceiling arithmetic for a PERFECT harness (persistent cross-call pkv, no attach,
+no re-prefill: ~8.6 steps x 8.4 ms + 12 ms verify per round of 6.7 tokens):
+~80 tok/s = 1.45x over AR - the maximum a multi-session engine effort could
+recover, on the laptop only (rig economics invert: drafting is compute-shaped,
+AR verify bandwidth-shaped). NOT worth it.
+
+DECISION: F2 PARKED. Off-the-shelf FastDLLM-1.5B cannot draft for Qwen2.5-7B at
+useful acceptance; DFlash-class wins require the trained context-conditioned
+drafter (their whole contribution, in retrospect). E1's reframing resolves the
+OTHER way: the drafter DOES need training either for standalone quality (bar:
+beat 21/42 at <= 1 GB) or for acceptance (bar: closed-loop L >= ~8-10) - both
+training-tier, both parked together. The llama-dflash tool stays in the tree:
+re-run it the day a trained/better drafter exists (one command, full closed-loop
+measurement).
+
 ## Unresolved questions (answer as they land)
 1. E4: can the backend sampler chain express plain-softmax commit confidence
    exactly? (If only approximately - is the approximation inside the numerics
