@@ -8,8 +8,8 @@ was filtered out for being small: the target is the sum of a thousand improvemen
 
 Provenance: deep-research workflow 2026-06-11 (108 agents, 26 primary sources, 25 claims
 adversarially verified 3-0 unless noted) merged with everything measured in this fork
-(docs/diffusion-gpu-sampling-plan.md, dllm-engine-improvements.md, dllm-elixir-harness.md,
-p106-mining-fleet.md). Each entry: what / expected gain / evidence / applies to / floor /
+(docs/dllms/diffusion-gpu-sampling-plan.md, docs/dllms/dllm-engine-improvements.md, docs/dllms/dllm-elixir-harness.md,
+docs/dllms/p106-mining-fleet.md). Each entry: what / expected gain / evidence / applies to / floor /
 effort / status.
 
 Honest calibration up front (verified head-to-heads): published headline multipliers
