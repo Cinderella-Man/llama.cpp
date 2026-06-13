@@ -1,0 +1,68 @@
+diff --git a/kintsugi/bench/bench.exs b/kintsugi/bench/bench.exs
+index 216aca3c2..05d5a0ff4 100644
+--- a/kintsugi/bench/bench.exs
++++ b/kintsugi/bench/bench.exs
+@@ -54,7 +54,10 @@ defmodule Kintsugi.Bench.Runner do
+     "e5eb10" => %{"conf_threshold" => 0.9, "block_kv" => true, "backend_sampling" => true, "block_eb" => 1.0},
+     # D4 hybrid: per-engine thresholds live INSIDE generate_hybrid (draft 0.9,
+     # repair engine on its own defaults) - the profile stays empty on purpose
+-    "d4" => %{}
++    "d4" => %{},
++    # G13 check-first prompting experiment: include the check in the draft prompt
++    "checkfirst" => %{"check_first" => true},
++    "checkfirst_nl" => %{"check_first" => "nl"}
+   }
+ 
+   # full request params for infill cases - NO reliance on server defaults
+diff --git a/kintsugi/lib/kintsugi.ex b/kintsugi/lib/kintsugi.ex
+index 2f265b212..b3363c229 100644
+--- a/kintsugi/lib/kintsugi.ex
++++ b/kintsugi/lib/kintsugi.ex
+@@ -225,9 +225,9 @@ defmodule Kintsugi do
+     max_repairs = Map.get(opts, "max_repairs", 4)
+     check = Map.get(opts, "check")
+ 
+-    prompt = forge_wrapper(opts) <> instruction
++    prompt = forge_wrapper(opts) <> instruction <> check_first_suffix(opts, check)
+ 
+-    case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check", "slim_prompt", "multi_hole", "win_route"])) do
++    case Engine.generate(eng, prompt, Map.drop(opts, ["max_repairs", "check", "slim_prompt", "multi_hole", "win_route", "check_first"])) do
+       {:ok, %{"text" => text, "ms_total" => ms}} ->
+         code =
+           text |> extract_code() |> Autofix.run() |> normalize_draft() |> align_module_name(check)
+@@ -258,6 +258,35 @@ defmodule Kintsugi do
+   defp forge_wrapper(_opts),
+     do: "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: "
+ 
++  # G13 check-first prompting (experiment, opt-in via opts["check_first"]): show the model
++  # the check (the test assertions) at draft time so it targets the right contract/behavior.
++  # Targets the SEMANTIC bottleneck without scaffold's structural constraint. "" when off or
++  # no check supplied.
++  defp check_first_suffix(opts, check) when is_binary(check) do
++    case opts["check_first"] do
++      v when v in [true, "true"] -> "\n\nThe code must pass these tests:\n" <> check
++      "nl" -> "\n\nFor example:\n" <> nl_check(check)
++      _ -> ""
++    end
++  end
++
++  defp check_first_suffix(_opts, _check), do: ""
++
++  # render the Elixir-assertion check as natural-language examples ("EXP = CALL" -> "CALL
++  # returns EXP") - a softer prompt than the raw match syntax
++  defp nl_check(check) do
++    check
++    |> String.split(";")
++    |> Enum.map(&String.trim/1)
++    |> Enum.reject(&(&1 == ""))
++    |> Enum.map_join("\n", fn part ->
++      case String.split(part, " = ", parts: 2) do
++        [exp, call] -> "- " <> call <> " returns " <> exp
++        _ -> "- " <> part
++      end
++    end)
++  end
++
+   @doc """
+   Plumbing: repair EXISTING code until it verifies (no drafting) - mask the broken
+   statement, let diffusion fill the hole, recompile. Used by generate/3 via forge/3;

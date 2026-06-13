@@ -1,0 +1,60 @@
+# Elixir subset grammar (P3 study). Goal: accept the shape of the bench reference
+# solutions (module + def/defp clauses, `, do:` one-liners and `do/end` blocks, pipes,
+# captures, sigils, pattern args, attributes) while rejecting structurally broken drafts
+# (missing `do`, `ends`, stray parens). It is deliberately permissive on EXPRESSIONS
+# (a CFG cannot enforce Elixir semantics) and strict on STRUCTURE (where syntax lives).
+# Char-level GBNF (llama.cpp): whitespace is explicit.
+
+root      ::= ws module ws
+
+module    ::= "defmodule" sp modname sp "do" modbody "end"
+modname   ::= upper alnum ("." upper alnum)*
+
+modbody   ::= ws (member ws)*
+member    ::= attribute | func
+
+# @doc "...", @spec foo(t) :: t, @moduledoc "..."
+attribute ::= "@" lower alnum sp expr
+
+func      ::= ("defp" | "def") sp fhead fbody
+fhead     ::= fname args?
+fname     ::= lower alnum ("?" | "!")?
+args      ::= "(" ws (expr (ws "," ws expr)*)? ws ")"
+fbody     ::= oneliner | block
+oneliner  ::= ws "," ws "do:" sp expr
+block     ::= sp "do" ws (expr ws)* "end"
+
+# --- expressions (permissive) ---
+expr      ::= unary (ws binop ws unary)*
+unary     ::= ("-" ws | "!" ws)? postfix
+postfix   ::= primary calltail*
+calltail  ::= "(" ws (expr (ws "," ws expr)*)? ws ")"
+
+primary   ::= number | string | atom | sigil | capture | list | tuple | map | paren | qualified | var
+
+qualified ::= modname "." fname
+var       ::= lower alnum ("?" | "!")?
+paren     ::= "(" ws expr ws ")"
+list      ::= "[" ws (expr (ws "," ws expr)* (ws "|" ws expr)?)? ws "]"
+tuple     ::= "{" ws (expr (ws "," ws expr)*)? ws "}"
+map       ::= "%{" ws (mapentry (ws "," ws mapentry)*)? ws "}"
+mapentry  ::= expr ws "=>" ws expr | lower alnum ":" sp expr
+
+# &1, &2, &(&1 in ~w(...))
+capture   ::= "&" (number | paren)
+
+# ~w(a e i o u), ~r/.../, ~s"..."
+sigil     ::= "~" lower sigbody
+sigbody   ::= "(" [^)]* ")" | "/" [^/]* "/" | "\"" [^"]* "\"" | "[" [^\]]* "]" | "{" [^}]* "}"
+
+binop     ::= "|>" | "++" | "--" | "<>" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "::" | ".." | "<" | ">" | "+" | "-" | "*" | "/" | "=" | "and" | "or" | "in"
+
+number    ::= "-"? [0-9] [0-9_]* ("." [0-9]+)?
+string    ::= "\"" [^"]* "\""
+atom      ::= ":" lower alnum
+
+upper     ::= [A-Z]
+lower     ::= [a-z_]
+alnum     ::= [a-zA-Z0-9_]*
+sp        ::= [ \t\r\n]+
+ws        ::= [ \t\r\n]*

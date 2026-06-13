@@ -1,0 +1,122 @@
+diff --git a/examples/diffusion/diffusion-server.cpp b/examples/diffusion/diffusion-server.cpp
+index bda780fdc..c573e60ee 100644
+--- a/examples/diffusion/diffusion-server.cpp
++++ b/examples/diffusion/diffusion-server.cpp
+@@ -173,6 +173,7 @@ static json handle_generate(server_state & st, server_replica & rep, const json
+     const bool        raw    = req.value("raw", false);
+     const bool        infill = req.value("infill", false);
+     const bool        want_conf = req.value("return_confidences", false);
++    const std::string grammar   = req.value("grammar", std::string());  // P4b: GBNF for infill decode
+ 
+     if (infill && st.canvas_length > 0) {
+         throw std::runtime_error("infill is not supported for canvas models yet");
+@@ -222,6 +223,7 @@ static json handle_generate(server_state & st, server_replica & rep, const json
+         diffusion_params dp = make_masked_params(st, req);
+         dp.infill     = infill;
+         dp.max_length = infill ? n_input : n_ub;
++        dp.grammar_str = grammar.empty() ? nullptr : grammar.c_str();
+         // "n_gen": generation-canvas length; every denoising step runs the FULL
+         // [prompt|canvas] through the model, so a right-sized canvas cuts the per-step
+         // forward cost roughly linearly (a 512-canvas one-liner wastes ~95% of each step)
+diff --git a/examples/diffusion/diffusion.cpp b/examples/diffusion/diffusion.cpp
+index 82aa5dd2d..cd2256df8 100644
+--- a/examples/diffusion/diffusion.cpp
++++ b/examples/diffusion/diffusion.cpp
+@@ -198,9 +198,13 @@ void diffusion_generate(llama_context *          ctx,
+ 
+     llama_set_causal_attn(ctx, false);
+ 
+-    int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    int32_t n_vocab = llama_vocab_n_tokens(vocab);
+ 
+     std::vector<llama_token_data> candidates(n_vocab);
++    std::vector<llama_token_data> gram_backup;       // P4b: frontier-grammar fallback buffer
++    bool                          grammar_disabled = false;  // P4b: latch off once the canvas
++                                                             // drifts outside the subset grammar
+     std::vector<llama_token_data> conf_candidates;
+     conf_candidates.reserve(params.max_length);
+     std::vector<float> conf_probs;
+@@ -742,6 +746,33 @@ void diffusion_generate(llama_context *          ctx,
+                         confidences.emplace_back(conf, (int32_t) i);
+                     }
+                 } else {
++                    // P4b: grammar-constrained decode at the committed-prefix frontier. Build a
++                    // fresh grammar sampler each step, accept the committed generated prefix
++                    // [gram_start, frontier), then mask the frontier position to grammar-valid
++                    // tokens. Generated region: [0,.) for infill (canvas is code), [n_input,.)
++                    // for from-scratch generation. gram == nullptr -> no behavior change.
++                    const int32_t   gram_start    = params.infill ? 0 : n_input;
++                    llama_sampler * gram          = nullptr;
++                    int32_t         gram_frontier = -1;
++                    if (params.grammar_str && !grammar_disabled && !mask_positions.empty()) {
++                        gram_frontier = mask_positions.front();
++                        gram          = llama_sampler_init_grammar(vocab, params.grammar_str, "root");
++                        if (gram) {
++                            try {
++                                for (int32_t i = gram_start; i < gram_frontier; i++) {
++                                    llama_sampler_accept(gram, output_tokens[i]);
++                                }
++                                gram_backup.resize(n_vocab);
++                            } catch (...) {
++                                // committed prefix drifted outside the subset grammar - latch
++                                // grammar off for the rest of the run, fall back to unconstrained
++                                llama_sampler_free(gram);
++                                gram             = nullptr;
++                                grammar_disabled = true;
++                            }
++                        }
++                    }
++
+                     for (size_t i = 0; i < mask_positions.size(); i++) {
+                         int32_t       pos        = mask_positions[i];
+                         const float * pos_logits = get_logits_for_pos(pos);
+@@ -763,6 +794,19 @@ void diffusion_generate(llama_context *          ctx,
+                             false,
+                         };
+ 
++                        if (gram && pos == gram_frontier) {
++                            std::copy(candidates.begin(), candidates.begin() + n_vocab, gram_backup.begin());
++                            llama_sampler_apply(gram, &cur_p);
++                            bool any = false;
++                            for (size_t j = 0; j < cur_p.size; j++) {
++                                if (cur_p.data[j].logit > -INFINITY) { any = true; break; }
++                            }
++                            if (!any) {  // dead grammar state: fall back to unconstrained sampling
++                                std::copy(gram_backup.begin(), gram_backup.end(), candidates.begin());
++                                cur_p = { candidates.data(), candidates.size(), -1, false };
++                            }
++                        }
++
+                         llama_sampler_apply(sampler, &cur_p);
+                         llama_token sampled_token = cur_p.data[cur_p.selected].id;
+ 
+@@ -784,6 +828,10 @@ void diffusion_generate(llama_context *          ctx,
+                         sampled_tokens[i] = sampled_token;
+                         confidences.emplace_back(conf, i);
+                     }
++
++                    if (gram) {
++                        llama_sampler_free(gram);
++                    }
+                 }
+ 
+                 if (params.conf_threshold > 0.0f) {
+diff --git a/examples/diffusion/diffusion.h b/examples/diffusion/diffusion.h
+index 3377e9548..9aac657c0 100644
+--- a/examples/diffusion/diffusion.h
++++ b/examples/diffusion/diffusion.h
+@@ -123,6 +123,13 @@ struct diffusion_params {
+                                          // hole-size learning / cost accounting; both decode paths)
+ 
+     int32_t max_length = 0;            // Maximum sequence length
++
++    const char * grammar_str = nullptr;  // P4b (experiment): GBNF grammar. When set AND in
++                                         // infill mode (canvas is pure code), the first masked
++                                         // position (the committed-prefix frontier) is
++                                         // constrained to grammar-valid tokens. Tractable
++                                         // frontier realization of grammar-constrained
++                                         // diffusion decode; nullptr = off (no behavior change).
+ };
+ 
+ void diffusion_generate(llama_context *          ctx,
