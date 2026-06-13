@@ -247,6 +247,25 @@ and MODEL (Layer E: a model that passes more, or streams fewer bytes/step) - bot
 already on the roadmap. F10 is the only engine item worth UN-parking, and only IF
 a future workload sends genuinely large repair canvases (it does not today).
 
+### The remaining cost IS the GPU forward - and its only levers are E/G
+
+After Probe 7, the per-step is provably 100% GPU forward (host work 0.06 ms).
+Levers on the forward itself, all OUT of Layer F scope:
+- Flash attention: already auto-ON for Dream (~7% per prior measurement); no win
+  left to capture (it is the default).
+- Small canvas (the kintsugi repair regime, ~25 ms/step at ~25 tok): weight-
+  bandwidth-bound (stream 4.7 GB Q4/step) + fixed launch overhead - only a
+  SMALLER model helps (E-tier: FastDLLM-1.5B, already integrated).
+- Large canvas (>=256 tok, ~130 ms/step): compute-bound (attention O(L^2) + lm_head
+  O(L)); canvas-reduction would help but the workload avoids it (EOT-shrink).
+- lm_head over prompt rows (catalog-F2): part of the GPU forward, ~25% of lm_head
+  rows on a draft, but lm_head is a small fraction of the 7B forward -> low single
+  digit %, and zero on infill. Not worth the encode() core surgery for Dream.
+None of these is an engine/system (Layer F) item that moves the kintsugi number.
+The hunt is complete: there is no hidden host-side waste, and the GPU forward is
+already near-optimally configured. Next headroom is E (smaller/better model) and
+G (fewer calls). LAYER F CLOSED for Dream-on-laptop.
+
 ## PART 1 - finish Layer E first (each is ~one session, no training)
 
 ### E4. Backend (GPU) sampling for block-AR  [DO FIRST - known machinery]
