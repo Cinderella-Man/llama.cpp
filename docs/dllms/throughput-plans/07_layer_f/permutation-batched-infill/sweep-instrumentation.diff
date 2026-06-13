@@ -1,0 +1,55 @@
+diff --git a/kintsugi/lib/kintsugi.ex b/kintsugi/lib/kintsugi.ex
+index 2f265b212..117a0398a 100644
+--- a/kintsugi/lib/kintsugi.ex
++++ b/kintsugi/lib/kintsugi.ex
+@@ -336,17 +336,27 @@ defmodule Kintsugi do
+     # exact, +2 and +40% before giving the outer loop a (possibly broken) best effort
+     variants = Enum.uniq([n_tokens, n_tokens + 2, round(n_tokens * 1.4)])
+ 
+-    try_hole_variants(eng, code, {from, to}, variants, infill_opts, 0, nil)
++    try_hole_variants(eng, code, {from, to}, variants, infill_opts, 0, nil, length(variants), 0)
+   end
+ 
+-  defp try_hole_variants(_eng, _code, _span, [], _opts, ms_acc, last) do
++  # KINTSUGI_SWEEP_TRACE=<path>: append "tried,total,outcome" per variant sweep so the
++  # exhaust rate (E[variants tried]) can be measured - gates the batched-variant lever
++  # (07_layer_f scrutiny: batched sweep wins only if E[tried] > ~1.67).
++  defp log_sweep(tried, total, outcome) do
++    case System.get_env("KINTSUGI_SWEEP_TRACE") do
++      nil -> :ok
++      path -> File.write!(path, "#{tried},#{total},#{outcome}\n", [:append])
++    end
++  end
++
++  defp try_hole_variants(_eng, _code, _span, [], _opts, ms_acc, last, total, tried) do
+     case last do
+-      nil -> {:error, :no_fill}
+-      text -> {:ok, text, ms_acc}
++      nil -> log_sweep(tried, total, "no_fill"); {:error, :no_fill}
++      text -> log_sweep(tried, total, "best_effort"); {:ok, text, ms_acc}
+     end
+   end
+ 
+-  defp try_hole_variants(eng, code, {from, to} = span, [n | rest], opts, ms_acc, _last) do
++  defp try_hole_variants(eng, code, {from, to} = span, [n | rest], opts, ms_acc, _last, total, tried) do
+     canvas = Masker.mask_lines(code, from, to, eng.mask_piece, n)
+ 
+     case Engine.infill(eng, canvas, opts) do
+@@ -356,12 +366,14 @@ defmodule Kintsugi do
+         {text, _trace} = raw |> Autofix.run() |> Credence.Syntax.fix_with_trace([])
+ 
+         case Verifier.compile(text) do
+-          :ok -> {:ok, text, ms_acc + ms}
+-          {:error, _} -> try_hole_variants(eng, code, span, rest, opts, ms_acc + ms, text)
++          :ok -> log_sweep(tried + 1, total, "ok"); {:ok, text, ms_acc + ms}
++          {:error, _} -> try_hole_variants(eng, code, span, rest, opts, ms_acc + ms, text, total, tried + 1)
+         end
+ 
+       {:error, reason} ->
+-        if rest == [], do: {:error, reason}, else: try_hole_variants(eng, code, span, rest, opts, ms_acc, nil)
++        if rest == [],
++          do: (log_sweep(tried + 1, total, "engine_err"); {:error, reason}),
++          else: try_hole_variants(eng, code, span, rest, opts, ms_acc, nil, total, tried + 1)
+     end
+   end
+ 

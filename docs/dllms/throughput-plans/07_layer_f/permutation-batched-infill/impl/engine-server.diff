@@ -1,0 +1,460 @@
+diff --git a/examples/diffusion/diffusion-server.cpp b/examples/diffusion/diffusion-server.cpp
+index bda780fdc..a0a14287f 100644
+--- a/examples/diffusion/diffusion-server.cpp
++++ b/examples/diffusion/diffusion-server.cpp
+@@ -351,6 +351,74 @@ static json handle_generate(server_state & st, server_replica & rep, const json
+     return res;
+ }
+ 
++// POST /infill_batch  (07_layer_f batched variant-sweep)
++//
++// request:  {"canvases": [str, ...] (each a canvas with mask-piece markers; 1..4),
++//            same masked infill knobs as /generate: "seed","steps","conf_threshold",
++//            "early_commit","temp","top_k","top_p","eps","algorithm","backend_sampling"}
++// response: {"results": [{"text","steps_done","degenerate","n_prompt_tokens"}, ...],
++//            "ms_total": float (shared batched wall), "family": "masked"}
++static json handle_infill_batch(server_state & st, server_replica & rep, const json & req) {
++    if (st.canvas_length > 0 || st.block_ar) {
++        throw std::runtime_error("infill_batch requires a masked diffusion model");
++    }
++    if (!req.contains("canvases") || !req["canvases"].is_array() || req["canvases"].empty()) {
++        throw std::runtime_error("infill_batch requires a non-empty \"canvases\" array");
++    }
++    const json &  arr  = req["canvases"];
++    const int32_t N    = (int32_t) arr.size();
++    const int32_t n_ub = (int32_t) st.params.n_ubatch;
++    if (N > 4) {
++        throw std::runtime_error("at most 4 canvases per infill_batch");
++    }
++
++    std::vector<std::vector<llama_token>> toks(N);
++    std::vector<std::vector<llama_token>> outs(N);
++    std::vector<const llama_token *>      inp(N);
++    std::vector<llama_token *>            outp(N);
++    std::vector<int32_t>                  n_input(N), n_generated(N, 0), steps(N, 0);
++    bool                                  degb[4] = { false, false, false, false };
++
++    for (int32_t i = 0; i < N; i++) {
++        const std::string canvas = arr[i].get<std::string>();
++        toks[i]    = common_tokenize(rep.vocab, canvas, /*add special*/ true, /*parse special*/ true);
++        n_input[i] = (int32_t) toks[i].size();
++        if (n_input[i] <= 0 || n_input[i] > n_ub) {
++            throw std::runtime_error("canvas empty or longer than n_ubatch");
++        }
++        inp[i] = toks[i].data();
++        outs[i].assign(n_input[i], 0);
++        outp[i] = outs[i].data();
++    }
++
++    diffusion_params dp = make_masked_params(st, req);
++    dp.infill             = true;
++    dp.output_confidences = nullptr;
++
++    const int64_t t0 = ggml_time_us();
++    diffusion_generate_infill_batch(rep.ctx, inp.data(), outp.data(), n_input.data(), N, dp,
++                                    n_generated.data(), steps.data(), degb);
++    const double ms = (ggml_time_us() - t0) / 1000.0;
++
++    json results = json::array();
++    for (int32_t i = 0; i < N; i++) {
++        const int32_t ng = n_generated[i] > 0 ? n_generated[i] : n_input[i];
++        outs[i].resize(ng);
++        json r;
++        r["text"]            = common_detokenize(rep.vocab, outs[i], false);
++        r["steps_done"]      = steps[i];
++        r["degenerate"]      = degb[i];
++        r["n_prompt_tokens"] = n_input[i];
++        results.push_back(r);
++    }
++
++    json out;
++    out["results"]  = results;
++    out["ms_total"] = ms;
++    out["family"]   = "masked";
++    return out;
++}
++
+ int main(int argc, char ** argv) {
+     ggml_time_init();
+ 
+@@ -442,6 +510,16 @@ int main(int argc, char ** argv) {
+                 st.params.n_ctx    = std::max((int32_t) st.params.n_ctx,    st.params.n_batch);
+             }
+ 
++            // 07_layer_f batched infill: up to 4 concurrent infill canvases per decode
++            // (the 3-variant sweep + margin). n_ctx is PARTITIONED across seqs
++            // (n_ctx_seq = n_ctx / n_seq_max), so keep n_ctx >= n_seq_max * n_ubatch to
++            // leave every seq a full ubatch of positions. Masked /generate still uses seq 0.
++            if (st.canvas_length <= 0 && !st.block_ar) {
++                ctx_params.n_seq_max = 4;
++                st.params.n_ctx = std::max<int32_t>(st.params.n_ctx,
++                                                    (int32_t) ctx_params.n_seq_max * (int32_t) st.params.n_ubatch);
++            }
++
+             ctx_params.n_ctx           = st.params.n_ctx;
+             ctx_params.n_batch         = st.params.n_batch;
+             ctx_params.n_ubatch        = st.params.n_ubatch;
+@@ -561,6 +639,26 @@ int main(int argc, char ** argv) {
+         res.set_content(out.dump(), "application/json");
+     });
+ 
++    svr.Post("/infill_batch", [&](const httplib::Request & req, httplib::Response & res) {
++        const json body = json::parse(req.body);
++
++        const size_t     ri  = st.acquire_replica();
++        server_replica & rep = *st.replicas[ri];
++
++        json out;
++        try {
++            std::lock_guard<std::mutex> lock(rep.mu);
++            out = handle_infill_batch(st, rep, body);
++        } catch (...) {
++            st.release_replica(ri);
++            throw;
++        }
++        st.release_replica(ri);
++
++        out["replica"] = ri;
++        res.set_content(out.dump(), "application/json");
++    });
++
+     const std::string host = st.params.hostname.empty() ? "127.0.0.1" : st.params.hostname;
+     const int         port = st.params.port > 0 ? st.params.port : 8089;
+ 
+diff --git a/examples/diffusion/diffusion.cpp b/examples/diffusion/diffusion.cpp
+index 82aa5dd2d..fd75652e6 100644
+--- a/examples/diffusion/diffusion.cpp
++++ b/examples/diffusion/diffusion.cpp
+@@ -1186,6 +1186,299 @@ void diffusion_generate(llama_context *          ctx,
+     n_generated = params.max_length;
+ }
+ 
++// 07_layer_f permutation: denoise N independent infill canvases in one batched decode.
++// Mirrors diffusion_generate's INFILL config exactly (square no-cache; for infill
++// max_length==n_input so EOT-shrink is a no-op and the per-canvas row count is constant).
++void diffusion_generate_infill_batch(llama_context *             ctx,
++                                     const llama_token * const * input_tokens,
++                                     llama_token * const *       output_tokens,
++                                     const int32_t *             n_input,
++                                     int32_t                     n_canvas,
++                                     const diffusion_params &    params,
++                                     int32_t *                   n_generated,
++                                     int32_t *                   out_steps_done,
++                                     bool *                      out_degenerate) {
++    for (int32_t c = 0; c < n_canvas; c++) {
++        n_generated[c] = 0;
++        if (out_steps_done) out_steps_done[c] = 0;
++        if (out_degenerate) out_degenerate[c] = false;
++    }
++    if (!ctx || n_canvas <= 0 || !params.infill ||
++            params.schedule != DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED) {
++        return;
++    }
++
++    const llama_model * model = llama_get_model(ctx);
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    std::mt19937        rng(params.seed);  // only used by RANDOM algorithm (inactive here)
++
++    // Same backend-sampling gate as diffusion_generate. This batched path REQUIRES backend
++    // sampling (per-seq samplers); without it, fall back to correct sequential decode.
++    bool use_backend = params.backend_sampling && params.cfg_scale <= 0.0f && !params.add_gumbel_noise &&
++                       !params.self_conditioning && !params.suppress_mask_token && params.top_k > 0;
++    if (!use_backend) {
++        for (int32_t c = 0; c < n_canvas; c++) {
++            diffusion_params dp = params;
++            dp.max_length         = n_input[c];
++            dp.output_confidences = nullptr;
++            bool    deg = false;
++            int32_t st  = 0;
++            dp.out_degenerate = &deg;
++            dp.out_steps_done = &st;
++            int32_t ng = 0;
++            diffusion_generate(ctx, input_tokens[c], output_tokens[c], n_input[c], dp, ng);
++            n_generated[c] = ng;
++            if (out_steps_done)  out_steps_done[c]  = st;
++            if (out_degenerate)  out_degenerate[c]  = deg;
++        }
++        return;
++    }
++
++    llama_set_causal_attn(ctx, false);
++
++    struct canvas_state {
++        llama_token * out        = nullptr;  // output_tokens[c]
++        int32_t       len        = 0;        // n_input[c] == max_length (constant; no shrink for infill)
++        bool          done       = false;
++        int32_t       batch_off  = 0;        // submission offset this step
++        llama_sampler * sampler  = nullptr;  // backend sampler bound to seq_id = c
++    };
++    std::vector<canvas_state> S(n_canvas);
++
++    int64_t total_cap = 0;
++    for (int32_t c = 0; c < n_canvas; c++) {
++        const int32_t len = n_input[c];
++        // a canvas with no mask tokens has nothing to do
++        const bool has_mask =
++            std::find(input_tokens[c], input_tokens[c] + len, params.mask_token_id) != input_tokens[c] + len;
++        std::copy(input_tokens[c], input_tokens[c] + len, output_tokens[c]);
++        S[c].out  = output_tokens[c];
++        S[c].len  = len;
++        S[c].done = (len <= 0) || !has_mask;
++        if (S[c].done) {
++            n_generated[c] = len;  // already filled (no masks)
++        }
++        total_cap += len;
++
++        // per-seq backend sampler: identical chain + identical seed as the single-canvas
++        // path, so seq c's RNG trajectory matches running canvas c alone (bit-exact).
++        llama_sampler * bs = llama_sampler_chain_init(llama_sampler_chain_default_params());
++        llama_sampler_chain_add(bs, llama_sampler_init_top_k(params.top_k));
++        if (params.top_p < 1.0f) {
++            llama_sampler_chain_add(bs, llama_sampler_init_top_p(params.top_p, 1));
++        }
++        if (params.temperature > 0.0f) {
++            llama_sampler_chain_add(bs, llama_sampler_init_temp(params.temperature));
++        }
++        llama_sampler_chain_add(bs, llama_sampler_init_dist(params.seed));
++        if (!llama_set_sampler(ctx, c, bs)) {
++            // backend sampling could not be attached for this seq: abort to the safe path
++            llama_sampler_free(bs);
++            for (int32_t k = 0; k < c; k++) {
++                llama_set_sampler(ctx, k, nullptr);
++                llama_sampler_free(S[k].sampler);
++            }
++            diffusion_params dp = params;
++            for (int32_t cc = 0; cc < n_canvas; cc++) {
++                dp.max_length = n_input[cc];
++                int32_t ng = 0; bool deg = false; int32_t stp = 0;
++                dp.out_degenerate = &deg; dp.out_steps_done = &stp; dp.output_confidences = nullptr;
++                diffusion_generate(ctx, input_tokens[cc], output_tokens[cc], n_input[cc], dp, ng);
++                n_generated[cc] = ng;
++                if (out_steps_done) out_steps_done[cc] = stp;
++                if (out_degenerate) out_degenerate[cc] = deg;
++            }
++            return;
++        }
++        S[c].sampler = bs;
++    }
++
++    LOG_INF("diffusion: batched infill, %d canvases, sampling on the backend\n", n_canvas);
++
++    llama_batch batch = llama_batch_init((int32_t) total_cap, 0, 1);
++
++    std::vector<std::pair<float, int32_t>> confidences;
++    std::vector<llama_token>               sampled_tokens;
++    std::vector<int32_t>                   mask_positions;
++
++    for (int32_t step = 0; step < params.steps; step++) {
++        // build one batch from all still-active canvases (seq_id = canvas index, kept
++        // stable so each seq's sampler RNG stays continuous as others drop out)
++        batch.n_tokens = 0;
++        bool any_active = false;
++        for (int32_t c = 0; c < n_canvas; c++) {
++            if (S[c].done) {
++                continue;
++            }
++            any_active       = true;
++            S[c].batch_off   = batch.n_tokens;
++            for (int32_t i = 0; i < S[c].len; i++) {
++                const int32_t r    = batch.n_tokens++;
++                batch.token[r]     = S[c].out[i];
++                batch.pos[r]       = i;
++                batch.n_seq_id[r]  = 1;
++                batch.seq_id[r][0] = c;
++                batch.logits[r]    = 1;
++            }
++        }
++        if (!any_active) {
++            break;
++        }
++
++        if (llama_decode(ctx, batch) != 0) {
++            LOG_ERR("%s: batched decode failed at step %d\n", __func__, step);
++            break;
++        }
++
++        for (int32_t c = 0; c < n_canvas; c++) {
++            if (S[c].done) {
++                continue;
++            }
++            if (out_steps_done) {
++                out_steps_done[c]++;
++            }
++            const int32_t off = S[c].batch_off;
++            auto row_for = [&](int32_t pos) -> int32_t {
++                return off + (params.shift_logits ? std::max(pos - 1, 0) : pos);
++            };
++
++            mask_positions.clear();
++            for (int32_t i = 0; i < S[c].len; i++) {
++                if (S[c].out[i] == params.mask_token_id) {
++                    mask_positions.push_back(i);
++                }
++            }
++            if (mask_positions.empty()) {
++                S[c].done      = true;
++                n_generated[c] = S[c].len;
++                continue;
++            }
++
++            confidences.clear();
++            sampled_tokens.assign(mask_positions.size(), 0);
++            for (size_t i = 0; i < mask_positions.size(); i++) {
++                const int32_t     pos = mask_positions[i];
++                const int32_t     row = row_for(pos);
++                const llama_token tok = llama_get_sampled_token_ith(ctx, row);
++                GGML_ASSERT(tok != LLAMA_TOKEN_NULL);
++
++                float conf = 0.0f;
++                if (params.algorithm == DIFFUSION_ALGORITHM_RANDOM) {
++                    conf = std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
++                } else {
++                    const float *       probs   = llama_get_sampled_probs_ith(ctx, row);
++                    const uint32_t      n_probs = llama_get_sampled_probs_count_ith(ctx, row);
++                    const llama_token * cands   = llama_get_sampled_candidates_ith(ctx, row);
++                    const uint32_t      n_cands = llama_get_sampled_candidates_count_ith(ctx, row);
++                    GGML_ASSERT(probs != nullptr && cands != nullptr && n_probs == n_cands);
++                    uint32_t sel = 0;
++                    for (uint32_t j = 0; j < n_cands; j++) {
++                        if (cands[j] == tok) { sel = j; break; }
++                    }
++                    const float temp_undo =
++                        (params.conf_threshold > 0.0f && params.temperature > 0.0f) ? params.temperature : 1.0f;
++                    conf = calculate_confidence_detempered(probs, n_probs, sel, params.algorithm, temp_undo, rng);
++                }
++                sampled_tokens[i] = tok;
++                confidences.emplace_back(conf, (int32_t) i);
++            }
++
++            // commit: every position clearing conf_threshold, else the single most confident
++            size_t  best        = 0;
++            int32_t n_committed = 0;
++            for (size_t i = 0; i < confidences.size(); i++) {
++                if (confidences[i].first > confidences[best].first) {
++                    best = i;
++                }
++                if (confidences[i].first >= params.conf_threshold) {
++                    const int32_t mask_idx = confidences[i].second;
++                    S[c].out[mask_positions[mask_idx]] = sampled_tokens[mask_idx];
++                    n_committed++;
++                }
++            }
++            if (n_committed == 0) {
++                const int32_t mask_idx = confidences[best].second;
++                S[c].out[mask_positions[mask_idx]] = sampled_tokens[mask_idx];
++            }
++
++            // Prophet early-commit (Layer B2): when every remaining mask's top1-top2 gap
++            // clears the bar, commit all and finish this canvas.
++            if (params.early_commit > 0.0f) {
++                float min_gap = 1.0f;
++                for (int32_t pos : mask_positions) {
++                    if (S[c].out[pos] != params.mask_token_id) {
++                        continue;  // committed earlier this step
++                    }
++                    const int32_t row = row_for(pos);
++                    const float * pr  = llama_get_sampled_probs_ith(ctx, row);
++                    const size_t  n   = llama_get_sampled_probs_count_ith(ctx, row);
++                    const float   gap = (pr && n >= 2) ? pr[0] - pr[1] : 0.0f;
++                    min_gap = std::min(min_gap, gap);
++                    if (min_gap < params.early_commit) {
++                        break;
++                    }
++                }
++                if (min_gap >= params.early_commit) {
++                    for (size_t i = 0; i < mask_positions.size(); i++) {
++                        const int32_t pos = mask_positions[i];
++                        if (S[c].out[pos] == params.mask_token_id) {
++                            S[c].out[pos] = sampled_tokens[i];
++                        }
++                    }
++                    S[c].done      = true;
++                    n_generated[c] = S[c].len;
++                    continue;
++                }
++            }
++
++            // degeneracy guard: scattered end-token flood with real positions still masked
++            {
++                int32_t n_committed_total = 0;
++                int32_t n_committed_eog   = 0;
++                int32_t n_masked          = 0;
++                bool    seen_text_after   = false;
++                for (int32_t i = S[c].len - 1; i >= 0; i--) {
++                    const llama_token t = S[c].out[i];
++                    if (t == params.mask_token_id) {
++                        n_masked++;
++                        continue;
++                    }
++                    n_committed_total++;
++                    if (llama_vocab_is_eog(vocab, t) || t == llama_vocab_pad(vocab)) {
++                        if (seen_text_after) {
++                            n_committed_eog++;
++                        }
++                    } else {
++                        seen_text_after = true;
++                    }
++                }
++                const int32_t n_gen = S[c].len;  // infill: whole canvas is the generated region
++                if (n_committed_total > 8 &&
++                        n_committed_eog > 0.9f * n_committed_total &&
++                        n_masked        > 0.2f * n_gen) {
++                    if (out_degenerate) {
++                        out_degenerate[c] = true;
++                    }
++                    S[c].done      = true;
++                    n_generated[c] = S[c].len;  // return the (degenerate) best-effort fill
++                    continue;
++                }
++            }
++            // (EOT-shrink is a no-op for infill: max_length == n_input, so cur_length stays len)
++        }
++    }
++
++    // any canvas that hit the step cap with masks remaining still returns its best-effort fill
++    for (int32_t c = 0; c < n_canvas; c++) {
++        if (n_generated[c] == 0) {
++            n_generated[c] = S[c].len;
++        }
++        llama_set_sampler(ctx, c, nullptr);
++        llama_sampler_free(S[c].sampler);
++    }
++    llama_batch_free(batch);
++}
++
+ // Fast-dLLM v2 block-AR decode (see diffusion.h). Reference: modeling.py generate()
+ // of Efficient-Large-Model/Fast_dLLM_v2_1.5B - semantics replicated exactly, minus
+ // the KV caches (v1 re-forwards [0..block_end) each step; the fast-dllm graph builds
+diff --git a/examples/diffusion/diffusion.h b/examples/diffusion/diffusion.h
+index 3377e9548..8b0436b05 100644
+--- a/examples/diffusion/diffusion.h
++++ b/examples/diffusion/diffusion.h
+@@ -132,6 +132,28 @@ void diffusion_generate(llama_context *          ctx,
+                         const diffusion_params & params,
+                         int32_t &                n_generated);
+ 
++// Batched multi-canvas INFILL (07_layer_f permutation: batched variant-sweep). Denoise
++// N independent infill canvases in ONE batched decode per step - on tiny canvases the
++// per-step forward is weight-bandwidth-bound, so batching amortizes the weight stream
++// (measured 1.96x free at 32 tok on Dream-7B/5070). Square no-cache path only; mirrors
++// diffusion_generate's infill config (timestep schedule, conf_threshold, Prophet
++// early_commit, degeneracy guard, backend sampling) PER-SEQ so each canvas's trajectory
++// is bit-identical to running it alone (each seq gets its own seed-identical sampler).
++// Canvas c: input_tokens[c][0..n_input[c]) is the canvas (must contain mask tokens);
++// output_tokens[c] (capacity >= n_input[c]) receives the fill; n_generated[c] = n_input[c]
++// on success, 0 on failure. out_steps_done / out_degenerate are [n_canvas] or nullptr.
++// Requires the context's n_seq_max >= n_canvas. Falls back to sequential diffusion_generate
++// when backend sampling is unavailable (correct, no batching gain).
++void diffusion_generate_infill_batch(llama_context *             ctx,
++                                     const llama_token * const * input_tokens,
++                                     llama_token * const *       output_tokens,
++                                     const int32_t *             n_input,
++                                     int32_t                     n_canvas,
++                                     const diffusion_params &    params,
++                                     int32_t *                   n_generated,
++                                     int32_t *                   out_steps_done,
++                                     bool *                      out_degenerate);
++
+ // Fast-dLLM v2 (arXiv:2509.26328) block-AR decode: the canvas grows one block_length
+ // block at a time (semi-autoregressive); within a block, sub_block spans commit left
+ // to right by confidence threshold (always at least the argmax). Attention is

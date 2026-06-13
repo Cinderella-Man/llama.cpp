@@ -282,6 +282,22 @@ G (fewer calls). LAYER F CLOSED for Dream-on-laptop.
 > SPENT" -> "Layer F has one live surgery-gated lever (~+6-12%) the closure
 > mis-measured." The rest of the catalog-F round (host work 0.06ms, F9/F10/F11,
 > per-step cost model) re-verified and stands - see 07_layer_f/VERIFICATION.md.
+>
+> IMPLEMENTED + MEASURED (the lever was BUILT end-to-end and the +6-12% projection
+> tested): diffusion_generate_infill_batch (multi-seq infill engine fn, N=1
+> byte-identical to diffusion_generate), POST /infill_batch (n_seq_max=4), harness
+> batched try_hole_variants + "batchsweep" profile. A/B verdict: **NET FLAT-TO-
+> NEGATIVE** (byte-gate 6.45->6.40 flat; hole-gate 6.41->5.82, -9%). The projection
+> failed for two reasons the per-step model missed: (1) real sweep canvases are
+> 50-60 tok - the WEAK 1.2-1.35x amortization zone, not the 32-tok 1.96x zone (the
+> surrounding code dominates the canvas even when the hole is small); (2) multi-seq
+> GPU floating-point reduction-order noise breaks Prophet early-commit (one near-tie
+> position fails the all-mask gap every step), dragging batched variants to the
+> 16-step cap so they run MORE steps than the sequential short-circuit. So even the
+> one lever the scrutiny kept alive is, on the real workload, dead: **Layer F engine
+> is SPENT for Dream-on-laptop by CONSTRUCTION now, not just analysis.** Code kept
+> opt-in/default-OFF for re-measurement under a different model/quant/early-commit
+> rule. Full writeup: 07_layer_f/permutation-batched-infill/impl/RESULT.md.
 
 ## PART 1 - finish Layer E first (each is ~one session, no training)
 

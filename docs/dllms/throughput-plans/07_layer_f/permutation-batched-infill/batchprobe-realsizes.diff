@@ -1,0 +1,32 @@
+diff --git a/examples/diffusion/diffusion-batch-probe.cpp b/examples/diffusion/diffusion-batch-probe.cpp
+index 365ae1b23..215534726 100644
+--- a/examples/diffusion/diffusion-batch-probe.cpp
++++ b/examples/diffusion/diffusion-batch-probe.cpp
+@@ -383,6 +383,27 @@ int main(int argc, char ** argv) {
+         LOG_INF("  K=%d: batched %7.2f ms vs sequential %7.2f ms -> %.2fx\n", K, batched, sequential, sequential / batched);
+     }
+ 
++    // PERMUTATION PROBE (07_layer_f batched-infill scrutiny): K=3 amortization at the
++    // REAL tiny-infill canvas sizes (workload wall-weighted mean ~41 tok). Decides the
++    // batched-variant-sweep projection (the 3-variant sweep is K=3).
++    LOG_INF("PROBE3c batched-3 amortization at real infill sizes:\n");
++    for (int sz : { 32, 40, 48, 64, 96 }) {
++        auto cv = make_canvas(vocab, "x", sz - 1);
++        std::vector<std::vector<llama_token>> copies(3, cv);
++        double acc = 0;
++        for (int it = 0; it < 19; it++) { double m = 0; forward_batched(ctx, copies, n_vocab, &m); if (it >= 3) acc += m; }
++        const double batched = acc / 16.0;
++        acc = 0;
++        for (int it = 0; it < 19; it++) {
++            double tot = 0;
++            for (int k = 0; k < 3; k++) { double m = 0; forward_batched(ctx, { cv }, n_vocab, &m); tot += m; }
++            if (it >= 3) acc += tot;
++        }
++        const double sequential = acc / 16.0;
++        LOG_INF("  size=%d tok (canvas %d): batched-3 %7.2f ms vs 3-sequential %7.2f ms -> %.2fx free\n",
++                sz, (int) cv.size(), batched, sequential, sequential / batched);
++    }
++
+     // ---- 4. commits-per-step histogram of a real threshold decode -----------------
+     LOG_INF("PROBE4 commits-per-step (threshold 0.6, 3 prompts x seed 3):\n");
+     const char * prompts[] = {

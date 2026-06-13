@@ -1,0 +1,103 @@
+diff --git a/kintsugi/bench/bench.exs b/kintsugi/bench/bench.exs
+index 216aca3c2..71e4a9edb 100644
+--- a/kintsugi/bench/bench.exs
++++ b/kintsugi/bench/bench.exs
+@@ -54,7 +54,10 @@ defmodule Kintsugi.Bench.Runner do
+     "e5eb10" => %{"conf_threshold" => 0.9, "block_kv" => true, "backend_sampling" => true, "block_eb" => 1.0},
+     # D4 hybrid: per-engine thresholds live INSIDE generate_hybrid (draft 0.9,
+     # repair engine on its own defaults) - the profile stays empty on purpose
+-    "d4" => %{}
++    "d4" => %{},
++    # 07_layer_f batched variant-sweep: decode the {n,n+2,1.4n} hole variants in ONE
++    # batched infill (needs the /infill_batch server endpoint + n_seq_max>=4 build)
++    "batchsweep" => %{"batch_sweep" => true}
+   }
+ 
+   # full request params for infill cases - NO reliance on server defaults
+diff --git a/kintsugi/lib/kintsugi.ex b/kintsugi/lib/kintsugi.ex
+index 2f265b212..b17f79087 100644
+--- a/kintsugi/lib/kintsugi.ex
++++ b/kintsugi/lib/kintsugi.ex
+@@ -336,7 +336,57 @@ defmodule Kintsugi do
+     # exact, +2 and +40% before giving the outer loop a (possibly broken) best effort
+     variants = Enum.uniq([n_tokens, n_tokens + 2, round(n_tokens * 1.4)])
+ 
+-    try_hole_variants(eng, code, {from, to}, variants, infill_opts, 0, nil)
++    # 07_layer_f batched variant-sweep (opt-in via "batch_sweep"; OFF by default).
++    # MEASURED VERDICT: net flat-to-negative on the bench (see permutation-batched-infill/
++    # impl/RESULT.md). The bandwidth amortization (1.3-1.96x per forward on tiny canvases)
++    # is cancelled by two production realities: (1) real sweep canvases are 50-60 tok, the
++    # WEAK-amortization zone (1.2-1.35x), not the 32-tok 1.96x zone; (2) multi-seq GPU
++    # batching adds floating-point reduction-order noise that breaks Prophet early-commit
++    # (one near-tie position fails the all-commit gap every step), dragging batched variants
++    # to the step cap so they run MORE steps than the sequential short-circuit. Kept as a
++    # correct, opt-in path (bit-identical at N=1; pass count holds) for re-measurement if a
++    # future model/quant/early-commit rule changes the convergence dynamics.
++    if Map.get(opts, "batch_sweep", false) and length(variants) >= 2 do
++      batched_hole_variants(eng, code, {from, to}, variants, infill_opts)
++    else
++      try_hole_variants(eng, code, {from, to}, variants, infill_opts, 0, nil)
++    end
++  end
++
++  # Batched path: build every variant canvas, decode them together, compile-check in the
++  # SAME order (exact, +2, +40%) and return the first that compiles - else best effort.
++  # Size gate: above ~64 tok/canvas batching is flat, so a too-large sweep falls back to
++  # the short-circuit ladder (which avoids paying for variants it never needs).
++  @batch_sweep_gate_bytes 230
++  defp batched_hole_variants(eng, code, {from, to} = span, variants, opts) do
++    canvases = Enum.map(variants, &Masker.mask_lines(code, from, to, eng.mask_piece, &1))
++
++    if Enum.any?(canvases, &(byte_size(&1) > @batch_sweep_gate_bytes)) do
++      try_hole_variants(eng, code, span, variants, opts, 0, nil)
++    else
++      case Engine.infill_batch(eng, canvases, opts) do
++        {:ok, results, ms} ->
++          # one shared batched wall is billed once (the win); pick first compiling
++          pick_first_compiling(results, ms)
++
++        {:error, _} ->
++          try_hole_variants(eng, code, span, variants, opts, 0, nil)
++      end
++    end
++  end
++
++  defp pick_first_compiling(results, ms) do
++    texts =
++      Enum.map(results, fn r ->
++        raw = Map.get(r, "text", "")
++        {text, _trace} = raw |> Autofix.run() |> Credence.Syntax.fix_with_trace([])
++        text
++      end)
++
++    case Enum.find(texts, fn text -> Verifier.compile(text) == :ok end) do
++      nil -> if texts == [], do: {:error, :no_fill}, else: {:ok, List.last(texts), ms}
++      text -> {:ok, text, ms}
++    end
+   end
+ 
+   defp try_hole_variants(_eng, _code, _span, [], _opts, ms_acc, last) do
+diff --git a/kintsugi/lib/kintsugi/engine.ex b/kintsugi/lib/kintsugi/engine.ex
+index ae06abc19..89b53c1b1 100644
+--- a/kintsugi/lib/kintsugi/engine.ex
++++ b/kintsugi/lib/kintsugi/engine.ex
+@@ -48,6 +48,19 @@ defmodule Kintsugi.Engine do
+     generate(eng, canvas, Map.merge(%{"infill" => true}, opts))
+   end
+ 
++  @doc """
++  Batched infill (07_layer_f): fill N canvases (1..4) in ONE batched decode. On tiny
++  canvases the per-step forward is weight-bandwidth-bound, so batching amortizes the
++  weight stream (measured up to 2.3x free). Returns `{:ok, results}` where results is a
++  list aligned to `canvases`, each `%{"text","steps_done","degenerate","n_prompt_tokens"}`.
++  """
++  def infill_batch(%__MODULE__{} = eng, canvases, opts \\ %{}) when is_list(canvases) do
++    case post(eng.base_url <> "/infill_batch", Map.put(opts, "canvases", canvases)) do
++      {:ok, %{"results" => results} = resp} -> {:ok, results, Map.get(resp, "ms_total", 0)}
++      other -> other
++    end
++  end
++
+   def tokenize(%__MODULE__{} = eng, content) do
+     case post(eng.base_url <> "/tokenize", %{"content" => content}) do
+       {:ok, %{"tokens" => tokens}} -> {:ok, tokens}
