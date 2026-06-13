@@ -1,0 +1,22 @@
+diff --git a/examples/diffusion/diffusion.cpp b/examples/diffusion/diffusion.cpp
+index 82aa5dd2d..858fa59b4 100644
+--- a/examples/diffusion/diffusion.cpp
++++ b/examples/diffusion/diffusion.cpp
+@@ -623,6 +623,17 @@ void diffusion_generate(llama_context *          ctx,
+                 return logits + (size_t) get_row_for_pos(pos) * n_vocab;
+             };
+ 
++            // PROBE 7 (07_layer_f.md): env-gated sync to prove llama_decode is async.
++            // llama_decode submits the GPU forward and returns; without this sync the
++            // CPU first WAITS for the forward inside the sampling timer below (at the
++            // first llama_get_sampled_* accessor), mis-attributing GPU-forward wait as
++            // "sampling time". With DIFF_SYNC_AFTER_DECODE set, the wait is charged to
++            // the decode region and "sampling time per step" collapses to ~0.
++            static const bool diff_sync_after_decode = getenv("DIFF_SYNC_AFTER_DECODE") != nullptr;
++            if (diff_sync_after_decode) {
++                llama_synchronize(ctx);
++            }
++
+             int64_t time_start_sampling = ggml_time_us();
+ 
+             mask_positions.clear();

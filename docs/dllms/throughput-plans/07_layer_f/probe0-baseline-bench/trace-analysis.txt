@@ -1,0 +1,15 @@
+total trace lines        : 421  (doc: 421 engine calls)
+DRAFT calls (incl warmup): 58
+DRAFT calls (excl warmup): 57  (doc: 58)
+INFILL calls             : 363  (doc: 363)
+
+DRAFT   | calls  57 | wall   51.9s (doc 52.1s) | median  635.5ms (doc 637)
+INFILL  | calls 363 | wall   73.8s (doc 73.8s) | median  109.7ms (doc 111)
+engine wall (all lines)  : 125.9s
+engine wall (excl warmup): 125.7s  (doc: 125.9s)
+DRAFT share              : 41%  (doc: 41%)
+INFILL share             : 59%  (doc: 59%)
+
+INFILL ms dist: min 32 p10 40 median 110 p90 556 max 955
+   doc        : min 32  p10 40  median 111 p90 554 max 958
+DRAFT prompt tokens: median 63 max 75  (doc: median 63, max 75)

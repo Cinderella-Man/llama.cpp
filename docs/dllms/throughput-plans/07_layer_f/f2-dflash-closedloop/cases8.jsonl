@@ -1,0 +1,8 @@
+{"id": "p_double", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Doubler with a function double/1 that doubles a number"}
+{"id": "p_even", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Parity with even?/1 returning true for even integers"}
+{"id": "p_sum", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Sums with a function sum_list/1 that sums a list of numbers recursively"}
+{"id": "p_reverse", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Rev with reverse/1 that reverses a list without using Enum.reverse"}
+{"id": "p_max", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Lists with max_of/1 returning the largest number in a non-empty list"}
+{"id": "p_swap", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Pairs with swap/1 turning {a, b} into {b, a}"}
+{"id": "m_sumdoc", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Acc with sum_to/1 that computes the sum 1+2+...+n recursively, including a @doc comment and a @spec"}
+{"id": "c_stack", "user": "Write Elixir code for the following task. Reply with ONLY a single ```elixir code block, no explanation.\n\nTask: a module Stack with push/2, pop/1 returning {value, rest}, and size/1, implemented on a list"}
