@@ -119,6 +119,9 @@ struct diffusion_params {
     bool *  out_degenerate = nullptr;  // [out, optional] set when threshold decoding aborted because end
                                        // tokens flooded the canvas while masked positions remained
 
+    int32_t * out_steps_done = nullptr;  // [out, optional] denoising steps actually run (for harness
+                                         // hole-size learning / cost accounting; both decode paths)
+
     int32_t max_length = 0;            // Maximum sequence length
 };
 

@@ -73,9 +73,46 @@ defmodule Kintsugi.Engine do
     req = {String.to_charlist(url), [], ~c"application/json", JSON.encode!(payload)}
 
     case :httpc.request(:post, req, [timeout: @generate_timeout_ms], body_format: :binary) do
-      {:ok, {{_, 200, _}, _, body}} -> {:ok, JSON.decode!(body)}
-      {:ok, {{_, status, _}, _, body}} -> {:error, {status, safe_error(body)}}
-      {:error, reason} -> {:error, reason}
+      {:ok, {{_, 200, _}, _, body}} ->
+        decoded = JSON.decode!(body)
+        trace(url, payload, decoded)
+        {:ok, decoded}
+
+      {:ok, {{_, status, _}, _, body}} ->
+        {:error, {status, safe_error(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # F-layer probe (docs/dllms/throughput-plans/07_layer_f.md): env-gated request trace.
+  # KINTSUGI_TRACE=<path> appends one JSONL line per /generate so cross-request
+  # redundancy (F9 prompt reuse / F10 canvas-delta) can be measured from real bench
+  # traffic. No behavior change when unset.
+  defp trace(url, payload, decoded) do
+    case System.get_env("KINTSUGI_TRACE") do
+      nil ->
+        :ok
+
+      path ->
+        if String.ends_with?(url, "/generate") do
+          line =
+            JSON.encode!(%{
+              "infill" => Map.get(payload, "infill", false),
+              "prompt" => Map.get(payload, "prompt", ""),
+              "n_gen" => Map.get(payload, "n_gen"),
+              "seed" => Map.get(payload, "seed"),
+              "conf_threshold" => Map.get(payload, "conf_threshold"),
+              "ms_total" => Map.get(decoded, "ms_total"),
+              "n_prompt_tokens" => Map.get(decoded, "n_prompt_tokens"),
+              "text" => Map.get(decoded, "text", "")
+            })
+
+          File.write!(path, line <> "\n", [:append])
+        end
+
+        :ok
     end
   end
 

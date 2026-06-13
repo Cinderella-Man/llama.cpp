@@ -1164,6 +1164,9 @@ void diffusion_generate(llama_context *          ctx,
     total_time += time_end - time_start;
 
     n_steps_done = std::max(n_steps_done, 1);
+    if (params.out_steps_done) {
+        *params.out_steps_done = n_steps_done;
+    }
 
     LOG_INF("\ntotal time: %0.2fms, steps: %d, time per step: %0.2fms, sampling time per step: %0.2fms\n",
             total_time / 1000.0,
@@ -1653,6 +1656,10 @@ void diffusion_generate_block_ar(llama_context *          ctx,
     if (backend_sampler) {
         llama_set_sampler(ctx, 0, nullptr);
         llama_sampler_free(backend_sampler);
+    }
+
+    if (params.out_steps_done) {
+        *params.out_steps_done = n_steps;
     }
 
     llama_batch_free(batch);

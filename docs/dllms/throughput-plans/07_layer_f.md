@@ -17,7 +17,205 @@ RULES (unchanged): one bench at a time; bench guards stay on; write findings to
 the doc BEFORE heavy GPU work; every claim goes through bench v2 or a probe with
 numbers in this file.
 
+> NAMING COLLISION (read first): this file's PART 1/PART 2 below use F1/F2/F3 for
+> the FastDLLM post-E3 follow-ups (seed racing / DFlash pairing / MTP). The
+> THROUGHPUT CATALOG (dllm-throughput-catalog.md) Layer F uses F1..F11 for
+> engine/system items (CUDA graphs, encode logits-flags, prompt/canvas caching,
+> ...). The 2026-06-13 catalog-F planning round below uses CATALOG numbering and
+> is prefixed "catalog-F" everywhere to disambiguate. The two namespaces do NOT
+> map onto each other.
+
 ---
+
+## CATALOG-F PLANNING ROUND (2026-06-13) - engine/system layer, kintsugi-first
+
+Scope (user-confirmed): the catalog's Layer F engine/system items as they serve
+the Dream + FastDLLM kintsugi workload. Flagship candidate was catalog-F10
+(cross-request canvas cache). DG-specific items (catalog-F3/F4/F5) and rig-day
+F8 parked unless DG/rig becomes an active target.
+
+### Probe 0: the kintsugi-Dream wall decomposition (the input to ALL F decisions)
+
+Method: env-gated request trace added to kintsugi Engine.post (KINTSUGI_TRACE=path
+-> one JSONL line per /generate: infill?, prompt, n_gen, seed, ms_total,
+n_prompt_tokens, text). Ran the full 48-case x 3-seed bench (Dream-7B Q4_K_M,
+5070 AC, baseline profile) = 35/48, 6.46 tok/s deliverable, 421 engine calls,
+125.9 s engine wall (147 s bench wall; the ~21 s gap is Credence/runner/verify).
+Trace at /tmp/ktrace.jsonl; analysis inline below.
+
+| class  | calls | engine wall | share | median ms |
+|--------|-------|-------------|-------|-----------|
+| DRAFT  |  58   | 52.1 s      | 41%   | 637       |
+| INFILL | 363   | 73.8 s      | 59%   | 111       |
+
+Infill ms distribution: min 32, p10 40, median 111, p90 554, max 958.
+Draft prompt tokens: median 63, max 75 (n_gen default 192 -> ~255-tok canvas;
+prompt ~25% of each forward).
+
+### Probe 1: infill wall vs canvas size (the F10 "cacheable compute" number)
+
+Controlled infill, 4-mask hole, fixed code context of N filler lines (server
+direct, seeds 3/13/23, median):
+- ~23 prompt tok  -> 133 ms
+- ~292 prompt tok -> 782 ms   (120-line case 500'd: canvas > ubatch 512)
+=> ~2.3 ms/token ABOVE an ~80 ms fixed floor. The UNCHANGED code (not the hole)
+dominates a large repair; small repairs are floor-bound.
+
+### Probe 2: cross-request redundancy (F9 prompt reuse / F10 canvas delta)
+
+- F9: 58 draft calls, only 11 UNIQUE prompts; 47 calls re-send a seen prompt
+  (the 3-redraft cascade on failing cases), 51.9 s of the 52.1 s draft wall.
+- F10: 354 consecutive-infill pairs, char-overlap median 0.92 / p90 0.98;
+  208/354 (59%) are >90% identical (hole-variant sweeps {n,n+2,1.4n} + repair
+  retries on the same code).
+
+### What the data says about each catalog-F item (VERDICTS)
+
+- **catalog-F9 (cross-request prompt cache): DEAD.** Three independent blockers,
+  all measured/established: (a) prompt is only ~25% of each forward (63/255 tok);
+  (b) Dream is BIDIRECTIONAL - no exactly-static prefix KV exists (Layer A sec 1),
+  so any prompt cache is approximate; (c) the approximate version IS kv_prefix,
+  which Layer A measured as a NET LOSS on small canvases (bench +38% p-tier).
+  F9 only persists that net-loss cache across requests - it cannot beat a thing
+  that already loses. The 47 redrafted prompts are real redundancy but live on
+  the wrong (small, bidirectional) canvas to exploit.
+- **catalog-F10 (cross-request canvas cache): MARGINAL, ceiling ~10%, structurally
+  hard.** Headroom exists ONLY on large repair canvases (p90 554 ms+, the ~2.3
+  ms/tok regime) which come from FAILING cases; production median repair (111 ms)
+  is floor-bound and uncacheable. The 59%-identical pairs are hole-VARIANT sweeps,
+  but variants change mask COUNT -> shift the suffix's absolute positions -> rope
+  KV differs -> naive position-keyed caching misaligns. The only clean F10 slice
+  is same-position REPAIR-ROUND re-decodes (failed compile -> new seed, identical
+  canvas geometry), a small subset. Needs A2 (dLLM-Cache feature caching) which
+  was never built precisely because code workloads cache worst (HumanEval 1.36x).
+  Best-case capture ~10% of bench wall for a whole new cross-request subsystem.
+- **catalog-F2 (encode logits-flags fix): NOT a kintsugi-Dream item.** encode()
+  forces output_all=true (llama-context.cpp:1531) + n_outputs=n_tokens (:1566) =
+  lm_head over every row. But needs_raw_logits already skips the D2H COPY under
+  backend sampling (:1595); the remaining win is the lm_head COMPUTE over prompt
+  rows, marginal at Dream's 152k vocab / 63-tok prompts, and ZERO on infill
+  (n_input==max_length there, all rows are output). It was a DiffusionGemma item
+  (262k vocab, 2.3 GB compute buffer). Park unless DG is an active target.
+- **catalog-F6/F7/F11 (CUDA graphs / host overlap / step-loop micro): marginal.**
+  E6 already measured CUDA graphs = ZERO on 5070/AC (GPU-bound; launches hidden).
+  Host overlap/micro are single-digit-% and do not touch the deliverable headline.
+
+### Probe 3: per-step cost mechanics (CORRECTS an earlier wrong assumption)
+
+Initially inferred (from tiny-repair timings) that Dream-7B per-step is
+weight-bandwidth-bound and canvas-INDEPENDENT. DIRECT MEASUREMENT REFUTED IT.
+Full-canvas steps (thr 0.95, canvas-filling prompt so EOT-shrink can't collapse
+it), 40 steps, per-step avg:
+- 64-canvas:  65 ms   | 128-canvas: 101 ms | 256-canvas: 130 ms | 448: 125 ms
+=> per-step ~= ~15 ms floor + ~0.4 ms/token. CANVAS-DEPENDENT (attention O(L^2) +
+FFN/lm_head O(L) over the canvas rows). Lesson recorded: never infer the cost
+model from one canvas size; sweep it. CONSEQUENCE: canvas-reduction F-items
+(window, kv-cache, F10) are NOT architecturally dead - they have real headroom on
+LARGE canvases. The kintsugi workload is small-canvas-dominated BY DESIGN
+(EOT-shrink collapses drafts; repairs are 60-150 tok), which is precisely why
+Layer A measured kv-cache as a net loss HERE. Workload-mismatched, not impossible.
+
+Step-count mechanics (small canvas, the kintsugi regime):
+- repair, 3-mask hole: 4 steps; 6-mask: 7 steps; 12-mask: 13 steps (thr 0.9).
+- WITH early_commit 0.5 (Prophet, already adopted on the repair path): a 12-mask
+  hole collapses to 4 steps. Repairs are ALREADY near-optimal on step count.
+- threshold sweep on a 12-mask repair (early_commit on): thr 0.9/0.7/0.5 ~= 4
+  steps/146 ms; thr 0.3 -> 2 steps/80 ms but quality-risky. No free win.
+
+### Probe 4: backend sampling HURTS tiny repairs (attach overhead)
+
+Per-request, diffusion_generate builds+attaches+detaches a fresh backend sampler
+chain (llama_set_sampler), forcing a sched re-reserve. On few-step repairs this
+overhead exceeds the sampling saving:
+- 3-mask hole: backend ON 109 ms vs OFF 87 ms (+23 ms)
+- 6-mask hole: ON 197 vs OFF 160 (+37 ms)
+- 12-mask hole: ON 364 vs OFF 383 (-19 ms, backend finally wins)
+Crossover ~10-12 masks. Production repair median is 111 ms (~3-6 mask regime) =
+the LOSING regime. BANKABLE (small, free): route small infills (<= ~8 masks) to
+CPU sampling, OR (better, the gpu-sampling-plan.md deferred item) attach the
+sampler ONCE at context creation so backend wins at every size. Est. ~3-5% of
+bench wall; noisy, workload-dependent - measure before banking.
+
+### Probe 5: the draft "wide-canvas tax" (no free win - quality-bound)
+
+A 71-char "double" answer still costs 493 ms = 8 steps x 62 ms: the 192-canvas
+(~255 tok) runs wide steps before/without aggressive EOT-shrink. Right-sizing to
+~64 tok would give ~28 ms/step (~224 ms), BUT Layer C measured every draft-canvas
+reduction (gen_initial, big384, slim, window) as a BENCH REGRESSION - canvas
+width is a quality knob (the model plans its answer to fit the visible canvas;
+stub adaptation). So the wide-canvas tax is REAL but unrecoverable without losing
+draft quality. Confirmed dead, fresh data.
+
+### Bankable engine deliverable found: expose steps_done in /generate
+
+The server response lacks the step count (only ms_total). The harness needs it
+for G8 (hole-size learning -> cut the 3-variant sweep that is 59% of infill
+calls). diffusion_generate already computes n_steps_done; plumb it out as an
+out-param + "steps_done" in the response. Trivial, zero-risk, enables a real
+HARNESS lever (fewer calls). The single clean engine-side item this round yields.
+
+### Probe 6: global backend-sampling A/B (kills the "route to CPU" idea as global)
+
+Full bench, server --no-backend-sampling vs default:
+- backend ON:  35/48, 6.46 tok/s, 147 s (the baseline)
+- backend OFF: 33/48, 4.34 tok/s, 186 s  (-2 pass, -33% deliverable, +27% wall)
+Backend ON is correct globally - the draft + large-repair savings dwarf the
+tiny-repair attach penalty (Probe 4). The CPU-routing win exists ONLY for the
+small-infill subset and would need surgical per-call gating for a ~3-5% sliver
+while risking the draft gains. NOT worth a flag. (attach-once-at-creation remains
+the only clean way to capture it without the downside - a real but modest item.)
+
+### THE STRATEGIC FINDING (why this matters)
+
+The deliverable metric bleeds on FAILING cases (c-tier 0/9 @ ~8 s, a-tier 0/3 @
+~2.9 s, m-tier 1/3) burning draft+repair cascades that never converge - a MODEL
+CAPABILITY problem. No engine cache changes the pass count, and the cacheable
+redundancy sits on small/bidirectional canvases where every prior caching
+experiment (Layer A) already showed no win. Catalog Layer F (engine/system) is
+therefore largely SPENT for Dream-on-laptop, the same verdict Layers B/C/D
+reached about their own headroom. The remaining real lever against the
+failing-case wall is HARNESS-side (Layer G): early-abort of hopeless drafts
+(catalog G7), semantic repair cache (G4), fewer sweep variants (G8 hole-size
+learning) - none of which are engine work.
+
+### CATALOG-F VERDICT (2026-06-13, after 6 probes + 2 full benches)
+
+The engine cost model, measured not assumed:
+  per-step ~= 15 ms + 0.4 ms/token (canvas-dependent);
+  wall = sum over calls of (warmup + n_steps x per_step);
+  per-request fixed overhead is small once amortized (>=7 steps);
+  backend sampling ON is globally correct (OFF = -2 pass, -33% deliverable).
+Every term's lever lives OUTSIDE the engine:
+  - n_steps: already minimized (threshold + Prophet on repairs; Layer B);
+  - per_step: canvas-bound, but kintsugi keeps canvases small by design
+    (EOT-shrink + tiny repairs) so there is little to cut, and draft-canvas
+    reduction is quality-bound (Layer C, rejected);
+  - calls: the 3-variant hole sweep + 3-redraft cascade dominate - HARNESS (G);
+  - pass count: model capability - MODEL (E).
+
+ITEM-BY-ITEM (catalog numbering):
+| item | verdict | basis |
+| F2 encode logits-flags | PARK (DG-only) | D2H already skipped; compute marginal at 152k vocab; zero on infill |
+| F6 CUDA graphs | CLOSED null | E6: zero on AC; Probe-0 reconfirms |
+| F7 host overlap | PARK | single-digit %, doesn't touch deliverable |
+| F9 cross-req prompt cache | DEAD | prompt 25% of forward; Dream bidirectional; kv_prefix already net-loss small-canvas |
+| F10 cross-req canvas cache | PARK (~10% ceiling) | headroom only on large failing-case repairs; variant sweeps shift positions; needs unbuilt A2 |
+| F11 step-loop micro | PARK | microseconds |
+
+TWO bankable engine deliverables (small, real, low-risk):
+1. Expose steps_done in /generate (trivial) - unblocks G8 hole-size learning,
+   which cuts the 3-variant sweep (59% of infill calls). The one clean win.
+2. Attach the backend sampler ONCE at context creation (gpu-sampling-plan.md
+   deferred item) - removes per-request re-reserve, makes backend sampling win at
+   every repair size (Probe 4). ~3-5% ceiling; do only if #1's harness work shows
+   the repair path still matters after variant-cutting.
+
+CONCLUSION: catalog Layer F engine/system work is SPENT for the Dream-on-laptop
+kintsugi workload (same shape as the B/C/D closures). Bank deliverable #1; treat
+#2 as optional. The real post-E headroom is HARNESS (Layer G: kill wasted calls)
+and MODEL (Layer E: a model that passes more, or streams fewer bytes/step) - both
+already on the roadmap. F10 is the only engine item worth UN-parking, and only IF
+a future workload sends genuinely large repair canvases (it does not today).
 
 ## PART 1 - finish Layer E first (each is ~one session, no training)
 

@@ -212,6 +212,7 @@ static json handle_generate(server_state & st, server_replica & rep, const json 
     std::vector<llama_token> output_tokens(n_ub);
     std::vector<float>       confidences;
     bool                     degenerate = false;
+    int32_t                  steps_done = 0;
 
     json res;
     const int64_t t0 = ggml_time_us();
@@ -232,7 +233,8 @@ static json handle_generate(server_state & st, server_replica & rep, const json 
             confidences.assign(dp.max_length, -1.0f);
             dp.output_confidences = confidences.data();
         }
-        dp.out_degenerate = &degenerate;
+        dp.out_degenerate  = &degenerate;
+        dp.out_steps_done  = &steps_done;
 
         int32_t n_generated = 0;
         if (st.block_ar) {
@@ -345,6 +347,7 @@ static json handle_generate(server_state & st, server_replica & rep, const json 
     res["ms_total"]        = (ggml_time_us() - t0) / 1000.0;
     res["degenerate"]      = degenerate;
     res["n_prompt_tokens"] = n_input;
+    res["steps_done"]      = steps_done;
     return res;
 }
 
