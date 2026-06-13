@@ -266,6 +266,23 @@ The hunt is complete: there is no hidden host-side waste, and the GPU forward is
 already near-optimally configured. Next headroom is E (smaller/better model) and
 G (fewer calls). LAYER F CLOSED for Dream-on-laptop.
 
+> SCRUTINY ADDENDUM (2026-06-13, second-pass red-team; data in
+> throughput-plans/07_layer_f/permutation-batched-infill/). One factual claim
+> behind the F1/batching closure is REFUTED: "the 5070 has no spare arithmetic at
+> these shapes / pp batching flat" holds at 103-192 tok (measured 1.0x) but is
+> FALSE at the real tiny-infill canvas sizes - batched-3 is 1.96x free at 32 tok,
+> 1.79x at 40 tok (Dream-7B, batch-probe PROBE3c). 75% of infill wall lives at
+> 0-64 tok. This opens a LIVE, LOSSLESS (bit-exact, 35/48 holds) engine lever -
+> batched variant-sweep infill - projected +6-12% deliverable, and it attacks the
+> failing-case wall where harness G8 cannot (no winning hole-size to predict when
+> the repair fundamentally fails; 75% of sweeps end best_effort, E[variants
+> tried]=2.151). The strategic conclusion (real headroom is E+G) is WEAKENED not
+> overturned: this is an engine lever, but modest, surgery-gated (square no-cache
+> infill multi-seq; see BUILD-SPEC.md), and best paired with G8. "Layer F engine
+> SPENT" -> "Layer F has one live surgery-gated lever (~+6-12%) the closure
+> mis-measured." The rest of the catalog-F round (host work 0.06ms, F9/F10/F11,
+> per-step cost model) re-verified and stands - see 07_layer_f/VERIFICATION.md.
+
 ## PART 1 - finish Layer E first (each is ~one session, no training)
 
 ### E4. Backend (GPU) sampling for block-AR  [DO FIRST - known machinery]
