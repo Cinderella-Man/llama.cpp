@@ -178,7 +178,37 @@ failing-case wall is HARNESS-side (Layer G): early-abort of hopeless drafts
 (catalog G7), semantic repair cache (G4), fewer sweep variants (G8 hole-size
 learning) - none of which are engine work.
 
-### CATALOG-F VERDICT (2026-06-13, after 6 probes + 2 full benches)
+### Probe 7: the "sampling time/step" metric is a RED HERRING (host work is ~0)
+
+Chased a promising-looking lead: the diffusion loop's logged "sampling time per
+step" was 58 ms (threshold) to 155 ms (schedule) on a 256-canvas - and looked
+like host-side per-position readback overhead (each masked position calls 5
+syncing `llama_get_sampled_*_ith`, each a full ggml_backend_sched_synchronize).
+HYPOTHESIS: ~600 us/position of redundant syncs; fix by syncing once + nosync
+reads.
+
+BUILT IT, MEASURED IT, IT WAS WRONG. Decisive test (env DIFF_SYNC_AFTER_DECODE:
+one llama_synchronize right after llama_decode, before the sampling timer):
+sampling time/step 154.94 ms -> **0.06 ms**, per-step total UNCHANGED at 160 ms.
+ROOT CAUSE: llama_decode is ASYNC. The decode submits the GPU forward and
+returns; the first synchronize() inside the sampling-timer region (the first
+_ith call) is where the CPU actually WAITS for the ~155 ms GPU forward. The
+"sampling time" was 100% mis-attributed GPU-forward wait; true host sampling
+(readback loop + confidence) is 0.06 ms/step.
+CONSEQUENCES:
+- The nosync-accessor idea saves NOTHING (the redundant idle-stream syncs are
+  ~us; the real time is the single unavoidable GPU-forward wait). Reverted; no
+  API added.
+- Per-step IS the GPU forward (canvas-bound, Probe 3 confirmed from the other
+  side). There is no host-side waste to reclaim anywhere in the step loop.
+- LESSON for future probing: llama_decode is async - any "host" timer that
+  contains the first post-decode sync is really measuring GPU-forward wait. The
+  diffusion-batch-probe.cpp header already warned this (bug #1 there); it bit
+  again. Always sync-after-decode before attributing host vs device time.
+- Layer F micro-tier (F7 host overlap, F11 step-loop micro) is therefore DEAD on
+  arrival: there is no meaningful host work to overlap or shave (~0.06 ms/step).
+
+### CATALOG-F VERDICT (2026-06-13, after 7 probes + 2 full benches)
 
 The engine cost model, measured not assumed:
   per-step ~= 15 ms + 0.4 ms/token (canvas-dependent);
@@ -197,10 +227,10 @@ ITEM-BY-ITEM (catalog numbering):
 | item | verdict | basis |
 | F2 encode logits-flags | PARK (DG-only) | D2H already skipped; compute marginal at 152k vocab; zero on infill |
 | F6 CUDA graphs | CLOSED null | E6: zero on AC; Probe-0 reconfirms |
-| F7 host overlap | PARK | single-digit %, doesn't touch deliverable |
+| F7 host overlap | DEAD | Probe 7: host work is 0.06 ms/step - nothing to overlap |
 | F9 cross-req prompt cache | DEAD | prompt 25% of forward; Dream bidirectional; kv_prefix already net-loss small-canvas |
 | F10 cross-req canvas cache | PARK (~10% ceiling) | headroom only on large failing-case repairs; variant sweeps shift positions; needs unbuilt A2 |
-| F11 step-loop micro | PARK | microseconds |
+| F11 step-loop micro | DEAD | Probe 7: host step is 0.06 ms; per-step is pure GPU forward |
 
 TWO bankable engine deliverables (small, real, low-risk):
 1. Expose steps_done in /generate (trivial) - unblocks G8 hole-size learning,
