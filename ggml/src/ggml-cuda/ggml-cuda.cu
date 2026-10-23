@@ -4662,7 +4662,14 @@ static void ggml_cuda_profile_record(ggml_cuda_profile_graph & pg, const size_t 
         CUDA_CHECK(cudaEventCreate(&ev));
         pg.events.push_back(ev);
     }
-    CUDA_CHECK(cudaEventRecordWithFlags(pg.events[k], stream, cudaEventRecordExternal));
+    // under stream capture only an external event-record node records at every graph launch
+    cudaStreamCaptureStatus status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+        CUDA_CHECK(cudaEventRecordWithFlags(pg.events[k], stream, cudaEventRecordExternal));
+    } else {
+        CUDA_CHECK(cudaEventRecord(pg.events[k], stream));
+    }
 }
 
 static void ggml_cuda_profile_write(ggml_cuda_profile_state * prof, ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
