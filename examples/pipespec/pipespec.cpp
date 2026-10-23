@@ -33,6 +33,10 @@
 //   --pipe-trace FILE       one line per sampled token: microseconds since the first submit, guesses in flight, outcome
 //   --pipe-backend-greedy   greedy sampling on the GPU (llama_set_sampler) in both modes: only the token id comes back
 //                           instead of the logits; the logits hashes then hash the token ids
+//   --pipe-race K           race K samples of the request (sequences 0..K-1 share the prompt's KV, seeds seed..seed+K-1)
+//                           until one of them emits --pipe-race-stop (default "</think>"), then continue that one alone;
+//                           plain mode decodes the samples round robin, pipe mode keeps one token of each in flight
+//                           (needs host sampling; the context gets K sequences and a unified KV cache)
 
 #include "arg.h"
 #include "chat.h"
@@ -51,6 +55,7 @@
 #include <deque>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -74,6 +79,8 @@ struct pipe_job {
     std::string out;
     std::string state_out;
     std::string trace;
+    int         race     = 0;
+    std::string race_stop = "</think>";
 };
 
 static bool job_set(pipe_job & j, const std::string & k, const std::string & v) {
@@ -92,6 +99,8 @@ static bool job_set(pipe_job & j, const std::string & k, const std::string & v) 
     else if (k == "out")       { j.out       = v; }
     else if (k == "state_out") { j.state_out = v; }
     else if (k == "trace")     { j.trace     = v; }
+    else if (k == "race")      { j.race      = atoi(v.c_str()); }
+    else if (k == "race_stop") { j.race_stop = v; }
     else {
         return false;
     }
@@ -104,7 +113,8 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
         {"--pipe-name", "name"}, {"--pipe-mode", "mode"}, {"--pipe-guess", "guess"}, {"--pipe-depth", "depth"},
         {"--pipe-copy-min", "copy_min"}, {"--pipe-miss", "miss"}, {"--pipe-oracle", "oracle"},
         {"--pipe-prompt", "prompt"}, {"--pipe-spec", "spec"}, {"--pipe-probe", "probe"}, {"--pipe-out", "out"},
-        {"--pipe-state-out", "state_out"}, {"--pipe-trace", "trace"},
+        {"--pipe-state-out", "state_out"}, {"--pipe-trace", "trace"}, {"--pipe-race", "race"},
+        {"--pipe-race-stop", "race_stop"},
     };
     int j = 1;
     for (int i = 1; i < argc; i++) {
@@ -252,12 +262,22 @@ struct job_result {
     std::vector<uint64_t>    hashes; // logits hash of each sampled token
 };
 
+// one token of one sequence through llama_decode
+static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq) {
+    int32_t        n_seq   = 1;
+    llama_seq_id   sid     = seq;
+    llama_seq_id * sids[1] = { &sid };
+    int8_t         out     = 1;
+    const llama_batch b = { 1, &tok, nullptr, &pos, &n_seq, sids, &out };
+    return llama_decode(ctx, b) == 0;
+}
+
 static bool run_job(const pipe_job & job, common_params & params, llama_model * model, llama_context * ctx,
                     const std::map<std::string, job_result> & done_jobs, job_result & res) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
     llama_memory_t      mem     = llama_get_memory(ctx);
-    const llama_seq_id  seq     = 0;
+    llama_seq_id        seq     = 0;  // the sequence that is generated (the race's winner)
 
     llama_memory_clear(mem, false);
 
@@ -278,7 +298,14 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     const int n_prompt  = (int) inp.size();
     const int n_predict = job.n_predict;
 
-    if (n_prompt + n_predict + job.depth + 8 + job.probe > (int) llama_n_ctx(ctx)) {
+    const int n_race = std::max(1, job.race);
+    if (n_race > (int) llama_n_seq_max(ctx)) {
+        LOG_ERR("%s: %s: race of %d needs as many sequences, the context has %u\n", __func__, job.name.c_str(), n_race,
+                llama_n_seq_max(ctx));
+        return false;
+    }
+
+    if (n_prompt + n_race*(n_predict + job.depth + 8) + job.probe > (int) llama_n_ctx(ctx)) {
         LOG_ERR("%s: %s: prompt (%d) + n_predict (%d) do not fit the context (%d)\n", __func__, job.name.c_str(),
                 n_prompt, n_predict, llama_n_ctx(ctx));
         return false;
@@ -307,7 +334,14 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         llama_batch_free(batch);
     }
 
-    row_sampler smpl(params.sampling, n_vocab);
+    // one sampler per raced sample, seeds seed, seed + 1, ...
+    std::vector<std::unique_ptr<row_sampler>> smpls;
+    for (int s = 0; s < n_race; s++) {
+        common_params_sampling sp = params.sampling;
+        sp.seed = params.sampling.seed + s;
+        smpls.emplace_back(new row_sampler(sp, n_vocab));
+    }
+    row_sampler * smpl = smpls[0].get();
 
     auto & gen    = res.gen;
     auto & hashes = res.hashes;
@@ -315,7 +349,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     hashes.clear();
 
     auto take = [&](const float * logits) {
-        const llama_token id = smpl.sample(logits);
+        const llama_token id = smpl->sample(logits);
         gen.push_back(id);
         hashes.push_back(fnv1a(logits, sizeof(float)*n_vocab));
         return id;
@@ -326,14 +360,155 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         return id;
     };
 
-    if (g_backend_greedy) {
+    // stats
+    int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0;
+
+    // race: K samples of the request, one sequence each, until one emits the stop text
+    int      race_winner = -1;
+    int      race_tokens = 0;
+    uint64_t race_hash   = 0;
+
+    if (n_race > 1) {
+        if (g_backend_greedy) {
+            LOG_ERR("%s: a race needs host sampling\n", __func__);
+            return false;
+        }
+
+        std::vector<std::vector<llama_token>> rgen(n_race);
+        std::vector<std::vector<uint64_t>>    rhash(n_race);
+
+        // the stop text as one token if it is one, otherwise matched on the detokenized output
+        const auto        stop_toks = common_tokenize(ctx, job.race_stop, false, true);
+        const llama_token stop_id   = stop_toks.size() == 1 ? stop_toks[0] : LLAMA_TOKEN_NULL;
+        std::vector<std::string> tail(n_race);
+
+        auto rtake = [&](int s, const float * logits) {
+            const llama_token id = smpls[s]->sample(logits);
+            rgen[s].push_back(id);
+            rhash[s].push_back(fnv1a(logits, sizeof(float)*n_vocab));
+            race_tokens++;
+            return id;
+        };
+        // true if sample s is done: the stop text, end of generation or the token limit
+        auto race_over = [&](int s, llama_token id) {
+            if (llama_vocab_is_eog(vocab, id) || (int) rgen[s].size() >= n_predict) {
+                return true;
+            }
+            if (stop_id != LLAMA_TOKEN_NULL) {
+                return id == stop_id;
+            }
+            tail[s] += common_token_to_piece(ctx, id);
+            if (tail[s].size() > 256) {
+                tail[s].erase(0, tail[s].size() - 256);
+            }
+            return tail[s].size() >= job.race_stop.size() &&
+                   tail[s].compare(tail[s].size() - job.race_stop.size(), std::string::npos, job.race_stop) == 0;
+        };
+
+        // every sample starts from the prompt: its cells are shared, and each samples its first token from its logits
+        for (int s = 1; s < n_race; s++) {
+            llama_memory_seq_cp(mem, 0, s, -1, -1);
+        }
+        {
+            const float * logits = llama_get_logits_ith(ctx, -1);
+            for (int s = 0; s < n_race && race_winner < 0; s++) {
+                if (race_over(s, rtake(s, logits))) {
+                    race_winner = s;
+                }
+            }
+        }
+
+        if (job.mode == "plain") {
+            // round robin, one token of one sample per llama_decode
+            while (race_winner < 0) {
+                for (int s = 0; s < n_race && race_winner < 0; s++) {
+                    const llama_pos pos = n_prompt + (llama_pos) rgen[s].size() - 1;
+                    if (!decode_one(ctx, rgen[s].back(), pos, s)) {
+                        LOG_ERR("%s: decode failed at pos %d of sample %d\n", __func__, pos, s);
+                        return false;
+                    }
+                    n_submit++;
+                    if (race_over(s, rtake(s, llama_get_logits_ith(ctx, -1)))) {
+                        race_winner = s;
+                    }
+                }
+            }
+        } else if (race_winner < 0) {
+            // one token of every sample in flight, staggered through the cards; the same submission order as the
+            // round robin above, so the same KV cells
+            const int n_slots = llama_pipe_n_slots(ctx);
+            if (n_slots < n_race + 1) {
+                LOG_ERR("%s: a race of %d needs at least %d slots, the context has %d\n", __func__, n_race, n_race + 1, n_slots);
+                return false;
+            }
+            struct rentry { int slot; int s; };
+            std::deque<rentry> fifo;
+            int next_slot = 0;
+            auto rsubmit = [&](int s) {
+                for (;;) {
+                    const int sl = next_slot;
+                    next_slot = (next_slot + 1) % n_slots;
+                    bool used = false;
+                    for (const auto & e : fifo) {
+                        used = used || e.slot == sl;
+                    }
+                    if (used) {
+                        continue;
+                    }
+                    const llama_pos pos = n_prompt + (llama_pos) rgen[s].size() - 1;
+                    if (llama_pipe_submit(ctx, sl, rgen[s].back(), pos, s) != 0) {
+                        LOG_ERR("%s: llama_pipe_submit failed at pos %d of sample %d\n", __func__, pos, s);
+                        return false;
+                    }
+                    fifo.push_back({ sl, s });
+                    n_submit++;
+                    return true;
+                }
+            };
+            for (int s = 0; s < n_race; s++) {
+                if (!rsubmit(s)) {
+                    return false;
+                }
+            }
+            while (race_winner < 0) {
+                const rentry e = fifo.front();
+                fifo.pop_front();
+                if (race_over(e.s, rtake(e.s, llama_pipe_get_logits(ctx, e.slot)))) {
+                    race_winner = e.s;
+                    break;
+                }
+                if (!rsubmit(e.s)) {
+                    return false;
+                }
+            }
+            // the other samples' tokens still in flight finish and are ignored
+            llama_pipe_drain(ctx);
+        }
+
+        // keep the winner, drop the others (their cells, the shared prompt keeps the winner's id)
+        for (int s = 0; s < n_race; s++) {
+            if (s != race_winner) {
+                llama_memory_seq_rm(mem, s, -1, -1);
+            }
+        }
+
+        std::vector<uint64_t> all;
+        for (int s = 0; s < n_race; s++) {
+            all.push_back(fnv1a(rgen[s].data(), rgen[s].size()*sizeof(llama_token)));
+            all.push_back(fnv1a(rhash[s].data(), rhash[s].size()*sizeof(uint64_t)));
+        }
+        race_hash = fnv1a(all.data(), all.size()*sizeof(uint64_t));
+
+        seq    = race_winner;
+        smpl   = smpls[seq].get();
+        gen    = rgen[seq];
+        hashes = rhash[seq];
+    } else if (g_backend_greedy) {
         take_id(llama_get_sampled_token_ith(ctx, -1));
     } else {
         take(llama_get_logits_ith(ctx, -1));
     }
 
-    // stats
-    int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0;
     double depth_sum = 0.0;
     int    depth_n   = 0;
 
@@ -348,11 +523,8 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 
     if (job.mode == "plain") {
         while (!done()) {
-            llama_token id  = gen.back();
-            llama_pos   pos = n_prompt + (int) gen.size() - 1;
-            llama_batch b = llama_batch_get_one(&id, 1);
-            b.pos = &pos;
-            if (llama_decode(ctx, b) != 0) {
+            const llama_pos pos = n_prompt + (int) gen.size() - 1;
+            if (!decode_one(ctx, gen.back(), pos, seq)) {
                 LOG_ERR("%s: decode failed at pos %d\n", __func__, pos);
                 return false;
             }
@@ -390,6 +562,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             }
         }
 
+        // the drafter keeps one state (its index 0) for whichever sequence is generated
         common_speculative * spec = nullptr;
         if (job.guess == "spec") {
             params.speculative.types = common_speculative_types_from_names({ job.spec });
@@ -441,7 +614,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 
         if (spec) {
             std::vector<llama_token> prompt_tgt(hist.begin(), hist.end() - 1);
-            common_speculative_begin(spec, seq, prompt_tgt);
+            common_speculative_begin(spec, 0, prompt_tgt);
         }
 
         // history including the guesses in flight
@@ -480,11 +653,11 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             if (job.guess == "spec") {
                 if (chain.empty() && win.size() == 1) {
                     if (chain_live) {
-                        common_speculative_accept(spec, seq, chain_hits);
+                        common_speculative_accept(spec, 0, chain_hits);
                     }
                     std::vector<llama_token> prompt_tgt(hist.begin(), hist.end() - 1);
                     std::vector<llama_token> draft;
-                    common_speculative_get_draft_params(spec, seq) = {
+                    common_speculative_get_draft_params(spec, 0) = {
                         /* .drafting = */ true,
                         /* .n_max    = */ std::max(1, n_predict - (int) gen.size()),
                         /* .pos0     = */ (llama_pos) (hist.size() - 1),
@@ -628,11 +801,8 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         // continue with the prompt's first tokens: their logits read every KV cell that is still visible
         std::vector<uint64_t> ph;
         for (int i = 0; i < job.probe; i++) {
-            llama_token id  = inp[i % n_prompt];
-            llama_pos   pos = n_prompt + (llama_pos) gen.size() - 1 + i;
-            llama_batch b = llama_batch_get_one(&id, 1);
-            b.pos = &pos;
-            if (llama_decode(ctx, b) != 0) {
+            const llama_pos pos = n_prompt + (llama_pos) gen.size() - 1 + i;
+            if (!decode_one(ctx, inp[i % n_prompt], pos, seq)) {
                 LOG_ERR("%s: probe decode failed\n", __func__);
                 return false;
             }
@@ -649,12 +819,12 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     const int n_gen = (int) gen.size();
     LOG_INF("PIPESPEC name=%s mode=%s guess=%s depth=%d n_prompt=%d n_gen=%d t_gen=%.3f tok_s=%.3f submits=%d guesses=%d "
             "hits=%d misses=%d wasted=%d avg_inflight_guesses=%.3f tokens=%016" PRIx64 " logits=%016" PRIx64 " state=%016" PRIx64
-            " probe=%016" PRIx64 "\n",
+            " probe=%016" PRIx64 " race=%d winner=%d race_tokens=%d race_hash=%016" PRIx64 "\n",
             job.name.c_str(), job.mode.c_str(), job.mode == "plain" ? "-" : job.guess.c_str(), job.mode == "plain" ? 0 : job.depth,
             n_prompt, n_gen, t_gen, (n_gen - 1)/t_gen, n_submit, n_guess, n_hit, n_miss, n_wasted,
             depth_n ? depth_sum/depth_n : 0.0,
             fnv1a(gen.data(), gen.size()*sizeof(llama_token)), fnv1a(hashes.data(), hashes.size()*sizeof(uint64_t)),
-            h_state, h_probe);
+            h_state, h_probe, n_race, race_winner, race_tokens, race_hash);
 
     return true;
 }
@@ -704,10 +874,17 @@ int main(int argc, char ** argv) {
     }
 
     int depth_max = -1;
+    int race_max  = 1;
     for (const auto & j : jobs) {
         if (j.mode == "pipe") {
             depth_max = std::max(depth_max, j.depth);
         }
+        race_max = std::max(race_max, j.race);
+    }
+    if (race_max > 1) {
+        // raced samples share the prompt's cells
+        params.n_parallel = std::max(params.n_parallel, race_max);
+        params.kv_unified = true;
     }
 
     llama_backend_init();
@@ -736,7 +913,7 @@ int main(int argc, char ** argv) {
     }
 
     if (depth_max >= 0) {
-        const int n = n_slots > 0 ? n_slots : 2*(depth_max + 1);
+        const int n = n_slots > 0 ? n_slots : std::max(2*(depth_max + 1), 2*race_max);
         if (llama_pipe_init(ctx, n) != 0) {
             LOG_ERR("%s: llama_pipe_init failed\n", __func__);
             return 1;
