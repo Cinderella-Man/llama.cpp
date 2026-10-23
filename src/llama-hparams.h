@@ -233,6 +233,9 @@ struct llama_hparams {
     float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;
 
+    // screened output head: candidates that get exact logits from the output tensor (see output_screen)
+    uint32_t output_screen_top_m = 256;
+
     // Additional scale factors (Granite/Granite MoE)
     float f_residual_scale  = 0.0f;
     float f_embedding_scale = 0.0f;
