@@ -6,7 +6,8 @@
 // 6.1 (Pascal with dp4a). On small Pascal cards such as the 5-SM P106-090, mul_mat_vec_q runs out of instruction issue
 // and load throughput long before memory bandwidth; these kernels give each row a lane group sized to the row width, let
 // several rows share one load of the activations, load several weight blocks per lane with coalesced wide loads and keep
-// the addressing out of the loop.
+// the addressing out of the loop. They compute the activation block sums in FP32 from the int8 values instead of reading
+// the FP16 sum of block_q8_1, so activations whose blocks add up past FP16's range stay finite.
 //
 // Takes the same arguments as mul_mat_vec_q_switch_type (strides in blocks, Q8_1 activations) and returns true if it
 // ran the product; false leaves it to mul_mat_vec_q. GGML_CUDA_MMVQ_PASCAL: 0 off, 1 compute capability 6.1 only
@@ -17,3 +18,6 @@ bool ggml_cuda_mmvq_pascal(
         int64_t nchannels_x, int64_t nchannels_y, int64_t nchannels_dst, int64_t stride_channel_x, int64_t stride_channel_y,
         int64_t stride_channel_dst, int64_t nsamples_x, int64_t nsamples_dst, int64_t stride_sample_x, int64_t stride_sample_y,
         int64_t stride_sample_dst, cudaStream_t stream);
+
+// Whether the kernels run on a device of compute capability cc under GGML_CUDA_MMVQ_PASCAL.
+bool ggml_cuda_mmvq_pascal_active(int cc);

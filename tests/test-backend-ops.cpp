@@ -1293,6 +1293,20 @@ struct test_case {
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
+    // false reports the test as not supported on the tested backend, for properties only some backends promise
+    virtual bool supported_by(ggml_backend_t backend) {
+        GGML_UNUSED(backend);
+        return true;
+    }
+
+    // true replaces the reference backend's result for node t (its copy on that backend) by ref, computed on the host,
+    // for inputs that the reference backend itself can't handle
+    virtual bool host_reference(const ggml_tensor * t, std::vector<float> & ref) {
+        GGML_UNUSED(t);
+        GGML_UNUSED(ref);
+        return false;
+    }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1427,6 +1441,10 @@ struct test_case {
                 }
             }
         }
+        if (supported && !supported_by(backend1)) {
+            supported = false;
+            unsupported_str = std::string(ggml_backend_name(backend1));
+        }
 
         if (!supported) {
             test_result result(unsupported_str, current_op_name, vars(), "test",
@@ -1511,6 +1529,7 @@ struct test_case {
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
+            ud->tc->host_reference(t2, f2);
 
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
@@ -5711,6 +5730,125 @@ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A8";
+    }
+};
+
+// Products whose activations hold a few channels large enough that a block of 32 sums to more than FP16's 65504, as the
+// expert down-projection inputs of Flint's last layers do. The Pascal single-token kernels (mmvq-pascal.cu) keep the
+// block sums in FP32, so their result must stay finite; the test runs only where they are active. It is checked against
+// a double-precision product of the dequantized weights and the activations, computed on the host, because the CPU
+// backend's own Q8_1 activations (used for Q4_1) store the same FP16 sums. With n > 1 the product runs llama.cpp's
+// batched kernels, which still read the FP16 sums for several types, so only n = 1 is registered.
+struct test_mul_mat_large_act : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int n_mats; // 0: MUL_MAT, else MUL_MAT_ID with n_used of n_mats matrices and one activation row per used matrix
+    const int n_used;
+    const float big;  // magnitude of the large channels
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, m, n, k, n_mats, n_used, big);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool supported_by(ggml_backend_t backend) override {
+        return backend_has_feature(backend, "MMVQ_PASCAL");
+    }
+
+    test_mul_mat_large_act(ggml_type type_a = GGML_TYPE_Q4_0, int64_t m = 2048, int64_t n = 1, int64_t k = 512,
+            int n_mats = 0, int n_used = 1, float big = 2.5e5f)
+        : type_a(type_a), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), big(big) {
+            GGML_ASSERT(k % 256 == 0);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out;
+        if (n_mats == 0) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+            ggml_set_name(a, "a");
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(b, "b");
+            out = ggml_mul_mat(ctx, a, b);
+        } else {
+            ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(as, "as");
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ggml_set_name(ids, "ids");
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+            ggml_set_name(b, "b");
+            out = ggml_mul_mat_id(ctx, as, b, ids);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> ids(n_used * n);
+                for (int64_t j = 0; j < n; ++j) {
+                    for (int i = 0; i < n_used; ++i) {
+                        ids[j*n_used + i] = (int32_t) ((7*i + 3 + 11*j) % n_mats);
+                    }
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t);
+                std::vector<float> row(k);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    ggml_backend_tensor_get(t, row.data(), r*t->nb[1], k*sizeof(float));
+                    // a large channel alone in its block, and a whole block of large values of one sign
+                    row[(40 + 64*r) % k] = r % 2 ? -big : big;
+                    const int64_t i0 = 32 * ((3 + 5*r) % (k/32));
+                    for (int64_t i = i0; i < i0 + 32; ++i) {
+                        row[i] = (r % 2 ? big : -big) / 24.0f;
+                    }
+                    ggml_backend_tensor_set(t, row.data(), r*t->nb[1], k*sizeof(float));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool host_reference(const ggml_tensor * t, std::vector<float> & ref) override {
+        if (t->op != GGML_OP_MUL_MAT && t->op != GGML_OP_MUL_MAT_ID) {
+            return false;
+        }
+        const ggml_tensor * a = t->src[0];
+        const ggml_tensor * b = t->src[1];
+        std::vector<uint8_t> a_data(ggml_nbytes(a));
+        ggml_backend_tensor_get(a, a_data.data(), 0, a_data.size());
+        std::vector<float> b_data(ggml_nelements(b));
+        ggml_backend_tensor_get(b, b_data.data(), 0, b_data.size()*sizeof(float));
+        std::vector<int32_t> ids(n_used * n, 0);
+        if (n_mats > 0) {
+            ggml_backend_tensor_get(t->src[2], ids.data(), 0, ids.size()*sizeof(int32_t));
+        }
+
+        const int rows = n_mats == 0 ? 1 : n_used; // activation rows per token
+        std::vector<float> w(k);
+        ref.assign(ggml_nelements(t), 0.0f);
+        for (int64_t j = 0; j < n; ++j) {
+            for (int e = 0; e < rows; ++e) {
+                const uint8_t * mat = a_data.data() + (n_mats == 0 ? 0 : ids[j*n_used + e]*a->nb[2]);
+                const float   * x   = b_data.data() + (j*rows + e)*k;
+                for (int64_t i = 0; i < m; ++i) {
+                    ggml_get_type_traits(type_a)->to_float(mat + i*a->nb[1], w.data(), k);
+                    double sum = 0.0;
+                    for (int64_t c = 0; c < k; ++c) {
+                        sum += (double) w[c] * x[c];
+                    }
+                    ref[(j*rows + e)*m + i] = (float) sum;
+                }
+            }
+        }
+        return true;
     }
 };
 
@@ -11383,6 +11521,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 32, 6, true));
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1024, 2048, false, 1, 1, false,
                                                             false, true, false, { 1, 1 }));
+        // activations whose blocks sum past FP16's range, as the inputs of Flint's expert down-projections in layers
+        // 46-48: the routed experts, the shared expert and a 4096-wide row
+        test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, 1, 512, 32, 6));
+        test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, 1, 1024));
+        test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, 1, 4096));
     }
 
     // gpt-oss issue with Vulkan mmq_id
