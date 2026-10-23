@@ -586,6 +586,13 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    pipe_drain();
+    for (auto & slot : pipe_slots) {
+        if (slot.ev_out) {
+            ggml_backend_event_free(slot.ev_out);
+        }
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1595,6 +1602,272 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+//
+// pipelined single-token decoding
+//
+
+static void ubatch_prepare_reserve(
+              llama_ubatch                            & ubatch,
+              uint32_t                                  n_outputs,
+        const std::map<llama_seq_id, llama_sampler *> & samplers,
+              uint32_t                                  n_outputs_max_per_seq);
+
+int32_t llama_context::pipe_init(int32_t n_slots) {
+    if (!memory || cparams.embeddings || !cparams.causal_attn) {
+        LLAMA_LOG_ERROR("%s: pipelined decoding needs a causal decoder context with a memory module\n", __func__);
+        return -1;
+    }
+    if (!sampling.samplers.empty()) {
+        LLAMA_LOG_ERROR("%s: backend sampling is not supported by pipelined decoding\n", __func__);
+        return -1;
+    }
+    if (n_slots < 1) {
+        return -1;
+    }
+    if (model.hparams.n_swa > 0 && cparams.n_ubatch < (uint32_t) n_slots) {
+        // the sliding-window cache keeps n_swa + n_ubatch cells and reuses the oldest one; with fewer spare cells than
+        // tokens in flight a guess could overwrite a cell that a token re-decoded after a wrong guess still attends to
+        LLAMA_LOG_ERROR("%s: n_ubatch (%u) must be at least the number of slots (%d) for a sliding-window model\n",
+                __func__, cparams.n_ubatch, n_slots);
+        return -1;
+    }
+
+    synchronize();
+    pipe_drain();
+
+    sched_reserve();
+
+    for (auto & slot : pipe_slots) {
+        if (slot.ev_out) {
+            ggml_backend_event_free(slot.ev_out);
+        }
+    }
+    pipe_slots.clear();
+    pipe_slots.resize(n_slots);
+
+    const int64_t n_vocab   = model.vocab.n_tokens();
+    const size_t  max_nodes = gf_res_reserve->get_max_nodes();
+
+    // pinned host memory of the output device, as for the regular output buffer
+    ggml_backend_buffer_type_t buft_out = ggml_backend_cpu_buffer_type();
+    {
+        auto * output_dev = model.dev_output();
+        auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+        if (output_dev_host_buft) {
+            buft_out = output_dev_host_buft;
+        }
+    }
+
+    // reserve every slot's compute buffers with a one-token graph over the full memory (the largest n_kv)
+    llama_memory_context_ptr mctx = memory->init_full();
+    if (!mctx) {
+        LLAMA_LOG_ERROR("%s: failed to initialize the memory module\n", __func__);
+        return -1;
+    }
+
+    const auto save_n_outputs = this->n_outputs;
+    this->n_outputs = 1;
+
+    size_t size_total = 0;
+
+    for (auto & slot : pipe_slots) {
+        slot.sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(slot.sched.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_caller_sync(slot.sched.get(), true);
+
+        slot.res.reset(new llm_graph_result(max_nodes));
+
+        llama_batch_allocr balloc_reserve(model.hparams.n_pos_per_embd());
+        llama_ubatch ubatch = balloc_reserve.ubatch_reserve(1, 1);
+
+        ubatch_prepare_reserve(ubatch, 1, sampling.samplers, cparams.n_outputs_max_per_seq);
+
+        auto gparams = graph_params(slot.res.get(), ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+        gparams.sched = slot.sched.get();
+
+        slot.res->reset();
+
+        auto * gf = model.build_graph(gparams);
+        if (!gf || !ggml_backend_sched_reserve(slot.sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers of a slot\n", __func__);
+            this->n_outputs = save_n_outputs;
+            pipe_slots.clear();
+            return -1;
+        }
+        slot.res->reset();
+        slot.res_valid = false;
+
+        for (auto * backend : backend_ptrs) {
+            size_total += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+        }
+
+        slot.buf_out.reset(ggml_backend_buft_alloc_buffer(buft_out, n_vocab*sizeof(float)));
+        if (!slot.buf_out) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the output buffer of a slot\n", __func__);
+            this->n_outputs = save_n_outputs;
+            pipe_slots.clear();
+            return -1;
+        }
+        slot.logits = (float *) ggml_backend_buffer_get_base(slot.buf_out.get());
+    }
+
+    this->n_outputs = save_n_outputs;
+
+    LLAMA_LOG_INFO("%s: %d slots, compute buffers %.2f MiB in total, %d splits per token\n", __func__,
+            n_slots, size_total/1024.0/1024.0, ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()));
+
+    return 0;
+}
+
+int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos pos, llama_seq_id seq_id) {
+    if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size()) {
+        LLAMA_LOG_ERROR("%s: invalid slot %d\n", __func__, i_slot);
+        return -1;
+    }
+
+    auto & slot = pipe_slots[i_slot];
+
+    // the slot's scheduler runs with caller_sync: its previous evaluation must be complete before it is reused
+    if (slot.busy) {
+        ggml_backend_event_synchronize(slot.ev_out);
+        slot.busy = false;
+    }
+
+    llama_token  tok  = token;
+    llama_pos    p    = pos;
+    int32_t      n_sq = 1;
+    llama_seq_id sid  = seq_id;
+    llama_seq_id * sids[1] = { &sid };
+    int8_t       out  = 1;
+
+    const llama_batch batch = { 1, &tok, nullptr, &p, &n_sq, sids, &out };
+
+    llama_batch_compat compat(this, batch);
+
+    if (!balloc->init(*compat.batch_ext, model.vocab, false)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return -1;
+    }
+
+    // handle any pending shifts/copies
+    memory_update(false);
+
+    llama_memory_context_ptr mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to find a memory slot for pos %d\n", __func__, pos);
+        return 1;
+    }
+
+    const auto & ubatch = mctx->get_ubatch();
+
+    if (!mctx->apply()) {
+        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        return -2;
+    }
+
+    const auto save_n_outputs = this->n_outputs;
+    this->n_outputs = 1;
+
+    auto gparams = graph_params(slot.res.get(), ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+    gparams.sched = slot.sched.get();
+
+    ggml_cgraph * gf = slot.res->get_gf();
+
+    if (!(slot.res_valid && !graph_reuse_disable && slot.res->can_reuse(gparams))) {
+        slot.res->reset();
+        slot.res_valid = false;
+
+        ggml_backend_sched_reset(slot.sched.get());
+
+        gf = model.build_graph(gparams);
+        if (!gf || !ggml_backend_sched_alloc_graph(slot.sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to build or allocate the graph\n", __func__);
+            this->n_outputs = save_n_outputs;
+            memory->seq_rm(seq_id, pos, -1);
+            return -2;
+        }
+
+        slot.res_valid = true;
+    }
+
+    this->n_outputs = save_n_outputs;
+
+    slot.res->set_inputs(&ubatch);
+
+    // same thread settings as graph_compute() uses for a single token
+    if (backend_cpu != nullptr) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (set_threadpool_fn) {
+            set_threadpool_fn(backend_cpu, threadpool);
+        }
+    }
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads);
+    }
+    copy_experts.reset();
+
+    const auto status = ggml_backend_sched_graph_compute_async(slot.sched.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: graph compute failed with status %d\n", __func__, status);
+        memory->seq_rm(seq_id, pos, -1);
+        return -3;
+    }
+
+    ggml_tensor * t_logits = slot.res->get_logits();
+    GGML_ASSERT(t_logits != nullptr);
+
+    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(slot.sched.get(), t_logits);
+    GGML_ASSERT(backend_res != nullptr);
+
+    ggml_backend_tensor_get_async(backend_res, t_logits, slot.logits, 0, model.vocab.n_tokens()*sizeof(float));
+
+    ggml_backend_dev_t dev_res = ggml_backend_get_device(backend_res);
+    if (slot.ev_out == nullptr || slot.ev_dev != dev_res) {
+        if (slot.ev_out) {
+            ggml_backend_event_free(slot.ev_out);
+        }
+        slot.ev_out = ggml_backend_event_new(dev_res);
+        slot.ev_dev = dev_res;
+    }
+
+    if (slot.ev_out) {
+        ggml_backend_event_record(slot.ev_out, backend_res);
+    } else {
+        // the output device has no events: wait for the logits now
+        ggml_backend_synchronize(backend_res);
+    }
+
+    slot.busy = slot.ev_out != nullptr;
+
+    return 0;
+}
+
+float * llama_context::pipe_get_logits(int32_t i_slot) {
+    if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size()) {
+        return nullptr;
+    }
+
+    auto & slot = pipe_slots[i_slot];
+
+    if (slot.busy) {
+        ggml_backend_event_synchronize(slot.ev_out);
+        slot.busy = false;
+    }
+
+    return slot.logits;
+}
+
+void llama_context::pipe_drain() {
+    for (auto & slot : pipe_slots) {
+        if (slot.busy) {
+            ggml_backend_event_synchronize(slot.ev_out);
+            slot.busy = false;
+        }
+    }
+}
+
 int llama_context::encode(const llama_batch_ext & batch_inp) {
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1844,6 +2117,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    // a regular decode may reserve or update the memory module: let pipelined evaluations finish first
+    pipe_drain();
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
@@ -4646,6 +4922,26 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_pipe_init(llama_context * ctx, int32_t n_slots) {
+    return ctx->pipe_init(n_slots);
+}
+
+int32_t llama_pipe_n_slots(const llama_context * ctx) {
+    return ctx->pipe_n_slots();
+}
+
+int32_t llama_pipe_submit(llama_context * ctx, int32_t slot, llama_token token, llama_pos pos, llama_seq_id seq_id) {
+    return ctx->pipe_submit(slot, token, pos, seq_id);
+}
+
+float * llama_pipe_get_logits(llama_context * ctx, int32_t slot) {
+    return ctx->pipe_get_logits(slot);
+}
+
+void llama_pipe_drain(llama_context * ctx) {
+    ctx->pipe_drain();
 }
 
 //

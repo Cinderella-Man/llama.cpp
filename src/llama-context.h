@@ -262,6 +262,16 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    //
+    // pipelined single-token decoding (experimental, see llama_pipe_* in llama.h)
+    //
+
+    int32_t pipe_init(int32_t n_slots);
+    int32_t pipe_n_slots() const { return (int32_t) pipe_slots.size(); }
+    int32_t pipe_submit(int32_t i_slot, llama_token token, llama_pos pos, llama_seq_id seq_id);
+    float * pipe_get_logits(int32_t i_slot);
+    void    pipe_drain();
+
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -416,6 +426,24 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // one in-flight single-token evaluation of pipelined decoding: its own scheduler (inputs, inter-device copies and
+    // compute buffers), its own graph (and therefore its own CUDA graphs), and a pinned buffer for its logits.
+    // slots share only the weights and the memory module; every device runs the queued evaluations in submission order
+    struct pipe_slot {
+        ggml_backend_sched_ptr  sched;
+        llm_graph_result_ptr    res;
+        bool                    res_valid = false; // res holds a graph allocated on sched
+
+        ggml_backend_event_t    ev_out  = nullptr; // recorded after the logits copy
+        ggml_backend_dev_t      ev_dev  = nullptr;
+        ggml_backend_buffer_ptr buf_out;
+        float *                 logits  = nullptr;
+
+        bool                    busy    = false;   // submitted and not yet waited for
+    };
+
+    std::vector<pipe_slot> pipe_slots;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
