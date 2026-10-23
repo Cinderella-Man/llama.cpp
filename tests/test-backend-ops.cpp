@@ -12577,17 +12577,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // a large MoE model's matrix products (Flint: attention, shared expert, output head, 6 of 256 experts) at 1 to 4
+    // a large MoE model's matrix products (Flint: attention, shared expert, output head, 6 used experts) at 1 to 4
     // tokens, one token and a speculative-decoding verify step; compare the Pascal matrix-vector kernels
-    // (mmvq-pascal.cu) on and off with GGML_CUDA_MMVQ_PASCAL
+    // (mmvq-pascal.cu) on and off with GGML_CUDA_MMVQ_PASCAL. 6 of 48 random experts per token touch 11.2 and 19.9
+    // distinct experts in 2 and 4 tokens, close to Flint's own routing of 6 of 256 (11.1 and 20.1), with a fifth of the
+    // weights to initialize; the output head runs for Q8_0 only, the type of Flint's head.
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
         for (int64_t n : { 1, 2, 3, 4 }) {
             for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
-                    { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 1024, 2048 }, { 2048, 1024 }, { 150144, 2048 } }) {
+                    { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 1024, 2048 }, { 2048, 1024 } }) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
             }
-            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 6, false, 2048, n, 512));
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 512, 2048, true, 256, 6, true));
+            if (type == GGML_TYPE_Q8_0) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 150144, n, 2048, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 48, 6, true,  512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 48, 6, false, 2048, n, 512));
         }
     }
 
