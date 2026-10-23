@@ -1114,6 +1114,16 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Screened output head (models with an output_screen tensor, a cheaper copy of the output head): the screen ranks
+    // all tokens, the output head computes exact logits for its top M, and every other token gets -INFINITY. Greedy
+    // decoding and top-k sampling with k <= M (top-k applied first) give the same tokens as the full head whenever
+    // the true top-k is among the candidates; logprobs, grammars, logit biases and perplexity need the full head.
+    // It applies to batches with one output row. Off by default; LLAMA_SCREEN_HEAD=1 turns it on at context creation.
+    LLAMA_API void     llama_set_screen_head(struct llama_context * ctx, bool enable);
+    LLAMA_API bool     llama_get_screen_head(const struct llama_context * ctx);
+    // number of candidates the model's output_screen is made for, 0 if the model has none
+    LLAMA_API uint32_t llama_model_screen_head_m(const struct llama_model * model);
+
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
