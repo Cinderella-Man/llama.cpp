@@ -11513,7 +11513,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // shared expert), and an odd row count; these reach the full-width paths of the Pascal matrix-vector kernels
     // (mmvq-pascal.cu) that the small cases above don't
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0,
-                            GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
+                            GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K }) {
         for (int64_t n : { 1, 2, 3, 4 }) {
             for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                     { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 2048, 1024 }, { 6144, 2048 }, { 2048, 6144 }, { 4097, 2048 } }) {
@@ -12582,7 +12582,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // (mmvq-pascal.cu) on and off with GGML_CUDA_MMVQ_PASCAL. 6 of 48 random experts per token touch 11.2 and 19.9
     // distinct experts in 2 and 4 tokens, close to Flint's own routing of 6 of 256 (11.1 and 20.1), with a fifth of the
     // weights to initialize; the output head runs for Q8_0 only, the type of Flint's head.
-    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS,
+                            GGML_TYPE_Q6_K }) {
         for (int64_t n : { 1, 2, 3, 4 }) {
             for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                     { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 1024, 2048 }, { 2048, 1024 } }) {
