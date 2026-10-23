@@ -674,6 +674,33 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
+
+        // screened output head from a side file (LLAMA_SCREEN_HEAD_FILE=<gguf with output_screen.weight>): the
+        // tensor joins the model's like one of an extra split, so a screen can be added to a GGUF without rewriting it
+        if (const char * screen_file = getenv("LLAMA_SCREEN_HEAD_FILE"); screen_file && *screen_file) {
+            struct gguf_init_params screen_params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &ctx,
+            };
+            gguf_context_ptr ctx_gguf { gguf_init_from_file(screen_file, screen_params) };
+            if (!ctx_gguf) {
+                throw std::runtime_error(format("%s: failed to load the screen file %s", __func__, screen_file));
+            }
+            files.emplace_back(new llama_file(screen_file, "rb", use_direct_io));
+            contexts.emplace_back(ctx);
+
+            ggml_tensor * cur = ggml_get_tensor(ctx, "output_screen.weight");
+            if (cur == nullptr) {
+                throw std::runtime_error(format("%s: no output_screen.weight in %s", __func__, screen_file));
+            }
+            if (weights_map.find(cur->name) != weights_map.end()) {
+                throw std::runtime_error(format("%s: the model already has output_screen.weight", __func__));
+            }
+            n_elements += ggml_nelements(cur);
+            n_bytes    += ggml_nbytes(cur);
+            weights_map.emplace(cur->name, llama_tensor_weight(files.back().get(), (uint16_t) (files.size() - 1), ctx_gguf.get(), cur));
+            LLAMA_LOG_INFO("%s: output_screen.weight (%s) from %s\n", __func__, ggml_type_name(cur->type), screen_file);
+        }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {

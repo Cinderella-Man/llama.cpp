@@ -1400,6 +1400,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
+    ml.get_key(LLM_KV_OUTPUT_SCREEN_TOP_M,     hparams.output_screen_top_m, false);
     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
     ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
@@ -1856,6 +1857,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
+        }
+        // screened output head (optional): same shape as the output tensor, usually in a cheaper type
+        if (output && !output_screen) {
+            output_screen = create_tensor(tn(LLM_TENSOR_OUTPUT_SCREEN, "weight"), {output->ne[0], output->ne[1]}, TENSOR_NOT_REQUIRED);
         }
         // output scales
         if (output && output->type == GGML_TYPE_NVFP4) {
@@ -3329,6 +3334,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+
+    // screened output head (if enabled and the model has one)
+    llm->build_screen_head(output, output_screen,
+            params.cparams.screen_head_m ? params.cparams.screen_head_m : hparams.output_screen_top_m);
 
     // add the LM head (if the context outputs logits)
     llm->build_logits();

@@ -740,6 +740,9 @@ struct llama_model {
     struct ggml_tensor * output_norm_enc = nullptr;
 
 
+    // screened output head: a cheaper copy of the output tensor that picks the candidates (optional)
+    struct ggml_tensor * output_screen = nullptr;
+
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;

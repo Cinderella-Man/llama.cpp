@@ -131,6 +131,14 @@ enum common_sampler_type {
     COMMON_SAMPLER_TYPE_ADAPTIVE_P  = 12,
 };
 
+// screened output head (models with an output_screen tensor; see llama_set_screen_head): whether sampling with these
+// parameters picks the same tokens from screened logits (exact for the top m candidates, -INFINITY elsewhere) as from
+// the full head whenever the true top-k is among the candidates; why = the reason when it does not
+bool common_sampling_screen_head_ok(const struct common_params_sampling & p, uint32_t m, std::string * why = nullptr);
+
+// LLAMA_SCREEN_HEAD=1 asks for the screened output head (llama_context turns it on at creation)
+bool common_screen_head_requested();
+
 // dimensionality reduction methods, used by cvector-generator
 enum dimre_method {
     DIMRE_METHOD_PCA,
