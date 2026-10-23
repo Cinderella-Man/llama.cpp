@@ -16,6 +16,7 @@ template <> struct mmvqp_traits<GGML_TYPE_Q5_0>   { static constexpr int bs = si
 template <> struct mmvqp_traits<GGML_TYPE_Q8_0>   { static constexpr int bs = sizeof(block_q8_0);   static constexpr int na = 1; };
 template <> struct mmvqp_traits<GGML_TYPE_Q5_K>   { static constexpr int bs = sizeof(block_q5_K);   static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_IQ4_XS> { static constexpr int bs = sizeof(block_iq4_xs); static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_Q6_K>   { static constexpr int bs = sizeof(block_q6_K);   static constexpr int na = QK_K / QK8_1; };
 
 constexpr __host__ __device__ int mmvqp_gcd(const int a, const int b) {
     return b == 0 ? a : mmvqp_gcd(b, a % b);
@@ -125,7 +126,7 @@ static __device__ __forceinline__ uint32_t mmvqp_u16_at(const uint32_t * w, cons
 template <int NA>
 struct mmvqp_act {
     int   u[NA][8];
-    int   t[NA][8];  // Q5_0 only: t[j] = bytes a[j], a[8 + j], a[16 + j], a[24 + j] of the block
+    int   t[NA][8];  // Q5_0: t[j] = bytes a[j], a[8 + j], a[16 + j], a[24 + j]; Q6_K: t[0], t[1] = 32 x the sums of a[0..15], a[16..31]
     float d[NA];     // d8 (Q8_0, Q5_K, IQ4_XS) or d8 / 16 (4- and 5-bit legacy types)
     float s[NA];     // with S = d8 * the sum of the int8 values: S (Q4_1, Q5_K), -8 * S (Q4_0), -16 * S (Q5_0)
 };
@@ -192,6 +193,18 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
         } else if constexpr (type == GGML_TYPE_Q5_K) {
             a.d[b] = d8;
             a.s[b] = S;
+        } else if constexpr (type == GGML_TYPE_Q6_K) {
+            int s0 = 0;
+            int s1 = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                s0 = ggml_cuda_dp4a(0x01010101, a.u[b][k], s0);
+                s1 = ggml_cuda_dp4a(0x01010101, a.u[b][k + 4], s1);
+            }
+            a.t[b][0] = s0 << 5;
+            a.t[b][1] = s1 << 5;
+            a.d[b] = d8;
+            a.s[b] = 0.0f;
         } else if constexpr (type == GGML_TYPE_IQ4_XS) {
             // word k of the codes holds weights 4k..4k+3 (low nibbles) and 4k+16..4k+19 (high nibbles); the table
             // lookup returns them as (4k, 4k+16, 4k+1, 4k+17) and (4k+2, 4k+18, 4k+3, 4k+19)
@@ -283,6 +296,40 @@ static __device__ __forceinline__ float mmvqp_dot_iq4_xs(const uint32_t * w, con
     return fmaf(mmvqp_h2f_lo(w[0]), sumf, acc);
 }
 
+// One Q6_K super-block as 53 words (4-byte aligned here): ql words 0..31, qh words 32..47, scale words 48..51, d in the
+// low half of word 52; activation blocks a0..a0+7. Sub-block s = 4h + k takes the low (k < 2) or high nibbles of ql
+// words 16h + 8(k & 1) + j and bits 2k, 2k + 1 of qh words 32 + 8h + j, with scales[2s] for its first 16 weights and
+// scales[2s + 1] for the others.
+template <int NA>
+static __device__ __forceinline__ float mmvqp_dot_q6_K(const uint32_t * w, const mmvqp_act<NA> & a, const int a0, float acc) {
+    float sumf = 0.0f;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        const int h = s >> 2;
+        const int k = s & 3;
+        int isum0 = 0;
+        int isum1 = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint32_t ql = w[16*h + 8*(k & 1) + j];
+            const uint32_t qh = w[32 + 8*h + j];
+            const uint32_t lo = k < 2 ? ql & 0x0F0F0F0F : (ql >> 4) & 0x0F0F0F0F;
+            const uint32_t hi = k == 0 ? (qh << 4) & 0x30303030 : k == 1 ? (qh << 2) & 0x30303030
+                              : k == 2 ? qh & 0x30303030 : (qh >> 2) & 0x30303030;
+            if (j < 4) {
+                isum0 = ggml_cuda_dp4a((int) (lo | hi), a.u[a0 + s][j], isum0);
+            } else {
+                isum1 = ggml_cuda_dp4a((int) (lo | hi), a.u[a0 + s][j], isum1);
+            }
+        }
+        const uint32_t sw  = w[48 + (s >> 1)];
+        const int      sc0 = (int) (int8_t) (sw >> (16 * (s & 1)));
+        const int      sc1 = (int) (int8_t) (sw >> (16 * (s & 1) + 8));
+        sumf = fmaf(a.d[a0 + s], (float) (sc0 * (isum0 - a.t[a0 + s][0]) + sc1 * (isum1 - a.t[a0 + s][1])), sumf);
+    }
+    return fmaf(mmvqp_h2f_lo(w[52]), sumf, acc);
+}
+
 // C weight blocks (raw words) times the matching activation blocks, added to acc.
 template <ggml_type type, int C>
 static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvqp_act<C * mmvqp_traits<type>::na> & a, float acc) {
@@ -294,6 +341,8 @@ static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvq
             acc = mmvqp_dot_q5_K(w + o/4, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_IQ4_XS) {
             acc = mmvqp_dot_iq4_xs(w + o/4, a, 8*b, acc);
+        } else if constexpr (type == GGML_TYPE_Q6_K) {
+            acc = mmvqp_dot_q6_K(w, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_Q4_1) {
             const uint32_t dm = mmvqp_word_at(w, o);
             const int isum = mmvqp_q4_isum16(mmvqp_word_at(w, o + 4), mmvqp_word_at(w, o + 8), mmvqp_word_at(w, o + 12),
@@ -355,6 +404,8 @@ static constexpr mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate)
             return { 1, 1, true };
         case GGML_TYPE_IQ4_XS:
             return gate ? mmvqp_shape{ 1, 1, false } : mmvqp_shape{ 1, 1, true };
+        case GGML_TYPE_Q6_K:
+            return { 1, 1, true };
         default:
             GGML_ABORT("fatal error");
     }
