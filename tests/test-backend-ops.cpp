@@ -5737,8 +5737,9 @@ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
 // expert down-projection inputs of Flint's last layers do. The Pascal single-token kernels (mmvq-pascal.cu) keep the
 // block sums in FP32, so their result must stay finite; the test runs only where they are active. It is checked against
 // a double-precision product of the dequantized weights and the activations, computed on the host, because the CPU
-// backend's own Q8_1 activations (used for Q4_1) store the same FP16 sums. With n > 1 the product runs llama.cpp's
-// batched kernels, which still read the FP16 sums for several types, so only n = 1 is registered.
+// backend's own Q8_1 activations (used for Q4_1) store the same FP16 sums. The kernels take up to 4 tokens; with more,
+// the product runs llama.cpp's batched kernels, which still read the FP16 sums for several types, so only n <= 4 is
+// registered.
 struct test_mul_mat_large_act : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -11507,25 +11508,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // one-token products at the shapes of a large MoE model (Flint: hidden 2048, 32 x 128 query heads, 4 x 128 KV
-    // heads, 256 experts of width 512 with 6 used, a 1024-wide shared expert), and an odd row count; these reach the
-    // full-width paths of the Pascal matrix-vector kernels (mmvq-pascal.cu) that the small cases above don't
+    // products of 1 to 4 tokens (one token, and a speculative-decoding verify step) at the shapes of a large MoE model
+    // (Flint: hidden 2048, 32 x 128 query heads, 4 x 128 KV heads, 256 experts of width 512 with 6 used, a 1024-wide
+    // shared expert), and an odd row count; these reach the full-width paths of the Pascal matrix-vector kernels
+    // (mmvq-pascal.cu) that the small cases above don't
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0,
                             GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
-        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
-                { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 2048, 1024 }, { 6144, 2048 }, { 2048, 6144 }, { 4097, 2048 } }) {
-            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, { 1, 1 }, { 1, 1 }));
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 2048, 1024 }, { 6144, 2048 }, { 2048, 6144 }, { 4097, 2048 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 6, true,  512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 6, false, 2048, n, 512));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 512, 2048, true, 32, 6, true));
+            // activations whose blocks sum past FP16's range, as the inputs of Flint's expert down-projections in
+            // layers 46-48: the routed experts, the shared expert and a 4096-wide row
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, n, 512, 32, 6));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, n, 4096));
         }
-        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 6, true,  512, 1, 2048));
-        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 6, false, 2048, 1, 512));
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 32, 6, true));
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1024, 2048, false, 1, 1, false,
                                                             false, true, false, { 1, 1 }));
-        // activations whose blocks sum past FP16's range, as the inputs of Flint's expert down-projections in layers
-        // 46-48: the routed experts, the shared expert and a 4096-wide row
-        test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, 1, 512, 32, 6));
-        test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, 1, 1024));
-        test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, 1, 4096));
+        for (int64_t n : { 2, 3, 4 }) {
+            // the routed + shared expert launch, and tokens that pick the same expert more than once (mostly expert
+            // 0), so that one expert serves more than 4 entries of a step
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 256));
+        }
     }
 
     // gpt-oss issue with Vulkan mmq_id
@@ -12565,6 +12576,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // a large MoE model's matrix products (Flint: attention, shared expert, output head, 6 of 256 experts) at 1 to 4
+    // tokens, one token and a speculative-decoding verify step; compare the Pascal matrix-vector kernels
+    // (mmvq-pascal.cu) on and off with GGML_CUDA_MMVQ_PASCAL
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 1024, 2048 }, { 2048, 1024 }, { 150144, 2048 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 6, false, 2048, n, 512));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 512, 2048, true, 256, 6, true));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
