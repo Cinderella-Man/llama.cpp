@@ -15,6 +15,9 @@
 //     are 32 bits wide and strided.
 //   - 4-bit codes are unpacked with masks only: dp4a on (q & 0x0F0F0F0F) and an unsigned-by-signed dp4a on
 //     (q & 0xF0F0F0F0), combined as (lo << 4) + hi, with the factor 1/16 moved into the activation scale.
+//   - Q5_K and IQ4_XS take one 256-weight super-block per lane. Q5_K's activation sums (for its mins) are computed once
+//     per super-block and shared by all rows; IQ4_XS looks its 4-bit indices up with __byte_perm in a table held in
+//     registers, with the activations pre-permuted into the order the lookup produces.
 //   - Q5_0's fifth bits stay where they are: a block's sum splits into sum(nibble * a) + 16 * sum(bit * a), and
 //     (qh >> j) & 0x01010101 holds the fifth bits of weights j, 8 + j, 16 + j and 24 + j, so the activations are
 //     regrouped the same way once per block (two 4 x 4 byte transposes), shared by all rows.
@@ -26,11 +29,14 @@
 
 namespace {
 
+// Bytes and Q8_1 activation blocks per weight block.
 template <ggml_type type> struct mmvqp_traits;
-template <> struct mmvqp_traits<GGML_TYPE_Q4_0> { static constexpr int bs = sizeof(block_q4_0); };
-template <> struct mmvqp_traits<GGML_TYPE_Q4_1> { static constexpr int bs = sizeof(block_q4_1); };
-template <> struct mmvqp_traits<GGML_TYPE_Q5_0> { static constexpr int bs = sizeof(block_q5_0); };
-template <> struct mmvqp_traits<GGML_TYPE_Q8_0> { static constexpr int bs = sizeof(block_q8_0); };
+template <> struct mmvqp_traits<GGML_TYPE_Q4_0>   { static constexpr int bs = sizeof(block_q4_0);   static constexpr int na = 1; };
+template <> struct mmvqp_traits<GGML_TYPE_Q4_1>   { static constexpr int bs = sizeof(block_q4_1);   static constexpr int na = 1; };
+template <> struct mmvqp_traits<GGML_TYPE_Q5_0>   { static constexpr int bs = sizeof(block_q5_0);   static constexpr int na = 1; };
+template <> struct mmvqp_traits<GGML_TYPE_Q8_0>   { static constexpr int bs = sizeof(block_q8_0);   static constexpr int na = 1; };
+template <> struct mmvqp_traits<GGML_TYPE_Q5_K>   { static constexpr int bs = sizeof(block_q5_K);   static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_IQ4_XS> { static constexpr int bs = sizeof(block_iq4_xs); static constexpr int na = QK_K / QK8_1; };
 
 constexpr __host__ __device__ int mmvqp_gcd(const int a, const int b) {
     return b == 0 ? a : mmvqp_gcd(b, a % b);
@@ -117,8 +123,8 @@ template <int NA>
 struct mmvqp_act {
     int   u[NA][8];
     int   t[NA][8];  // Q5_0 only: t[j] = bytes a[j], a[8 + j], a[16 + j], a[24 + j] of the block
-    float d[NA];     // d8 (Q8_0) or d8 / 16 (4- and 5-bit types)
-    float s[NA];     // s8 (Q4_1), -8 * s8 (Q4_0) or -16 * s8 (Q5_0)
+    float d[NA];     // d8 (Q8_0, Q5_K, IQ4_XS) or d8 / 16 (4- and 5-bit legacy types)
+    float s[NA];     // s8 (Q4_1), -8 * s8 (Q4_0), -16 * s8 (Q5_0), or d8 * the sum of the int8 values (Q5_K)
 };
 
 // 4 x 4 byte transpose: out[j] = bytes j of x0, x1, x2, x3.
@@ -158,6 +164,30 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             a.s[b] = -16.0f * s8;
             mmvqp_transpose4(a.u[b][0], a.u[b][2], a.u[b][4], a.u[b][6], a.t[b] + 0);
             mmvqp_transpose4(a.u[b][1], a.u[b][3], a.u[b][5], a.u[b][7], a.t[b] + 4);
+        } else if constexpr (type == GGML_TYPE_Q5_K) {
+            // the mins term needs the sum of the quantized activations, as vec_dot_q5_K_q8_1 computes it
+            int sum = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                sum = ggml_cuda_dp4a(0x01010101, a.u[b][k], sum);
+            }
+            a.d[b] = d8;
+            a.s[b] = d8 * (float) sum;
+        } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+            // word k of the codes holds weights 4k..4k+3 (low nibbles) and 4k+16..4k+19 (high nibbles); the table
+            // lookup returns them as (4k, 4k+16, 4k+1, 4k+17) and (4k+2, 4k+18, 4k+3, 4k+19)
+            int p[8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                p[2*k + 0] = (int) __byte_perm(a.u[b][k], a.u[b][k + 4], 0x5140);
+                p[2*k + 1] = (int) __byte_perm(a.u[b][k], a.u[b][k + 4], 0x7362);
+            }
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                a.u[b][k] = p[k];
+            }
+            a.d[b] = d8;
+            a.s[b] = 0.0f;
         } else {
             a.d[b] = d8 * 0.0625f;
             a.s[b] = s8;
@@ -181,14 +211,71 @@ static __device__ __forceinline__ int mmvqp_q4_isum16(
     return (lo << 4) + hi;
 }
 
+// One Q5_K super-block as 44 words: dm, 3 words of scales, 8 words qh, 32 words qs; activation blocks a0..a0+7.
+template <int NA>
+static __device__ __forceinline__ float mmvqp_dot_q5_K(const uint32_t * w, const mmvqp_act<NA> & a, const int a0, float acc) {
+    const uint32_t sc_lo = w[1] & 0x3f3f3f3f;                                   // scales of sub-blocks 0..3
+    const uint32_t m_lo  = w[2] & 0x3f3f3f3f;                                   // mins of sub-blocks 0..3
+    const uint32_t sc_hi = (w[3] & 0x0f0f0f0f) | ((w[1] >> 2) & 0x30303030);   // scales of 4..7
+    const uint32_t m_hi  = ((w[3] >> 4) & 0x0f0f0f0f) | ((w[2] >> 2) & 0x30303030);
+    float sumd = 0.0f;
+    float summ = 0.0f;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        int isum = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t q   = w[12 + 8*(s/2) + k];
+            const uint32_t nib = (s & 1) ? (q >> 4) & 0x0F0F0F0F : q & 0x0F0F0F0F;
+            const uint32_t hb  = s <= 4 ? (w[4 + k] << (4 - s)) & 0x10101010 : (w[4 + k] >> (s - 4)) & 0x10101010;
+            isum = ggml_cuda_dp4a((int) (nib | hb), a.u[a0 + s][k], isum);
+        }
+        const int sc = (int) (((s < 4 ? sc_lo : sc_hi) >> (8 * (s & 3))) & 0xff);
+        const int m  = (int) (((s < 4 ? m_lo  : m_hi ) >> (8 * (s & 3))) & 0xff);
+        sumd = fmaf(a.d[a0 + s], (float) (isum * sc), sumd);
+        summ = fmaf((float) m, a.s[a0 + s], summ);
+    }
+    return acc + mmvqp_h2f_lo(w[0]) * sumd - mmvqp_h2f_hi(w[0]) * summ;
+}
+
+// One IQ4_XS super-block as 34 words: d | scales_h << 16, scales_l, 32 words qs; activation blocks a0..a0+7.
+template <int NA>
+static __device__ __forceinline__ float mmvqp_dot_iq4_xs(const uint32_t * w, const mmvqp_act<NA> & a, const int a0, float acc) {
+    // kvalues_iq4nl as four words
+    constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
+    const uint32_t sh = w[0] >> 16;
+    const uint32_t sl = w[1];
+    float sumf = 0.0f;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        int isum = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4  = w[2 + 4*ib + j];
+            const uint32_t sel = 0x32103210 | ((q4 & 0x88888888) >> 1);
+            const uint32_t r0  = __byte_perm(__byte_perm(t0, t1, q4),       __byte_perm(t2, t3, q4),       sel);
+            const uint32_t r1  = __byte_perm(__byte_perm(t0, t1, q4 >> 16), __byte_perm(t2, t3, q4 >> 16), sel >> 16);
+            isum = ggml_cuda_dp4a((int) r0, a.u[a0 + ib][2*j + 0], isum);
+            isum = ggml_cuda_dp4a((int) r1, a.u[a0 + ib][2*j + 1], isum);
+        }
+        const int ls = (int) (((sl >> (4 * ib)) & 0xF) | (((sh >> (2 * ib)) & 3) << 4));
+        sumf = fmaf(a.d[a0 + ib], (float) (isum * (ls - 32)), sumf);
+    }
+    return fmaf(mmvqp_h2f_lo(w[0]), sumf, acc);
+}
+
 // C weight blocks (raw words) times the matching activation blocks, added to acc.
 template <ggml_type type, int C>
-static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvqp_act<C> & a, float acc) {
+static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvqp_act<C * mmvqp_traits<type>::na> & a, float acc) {
     constexpr int BS = mmvqp_traits<type>::bs;
 #pragma unroll
     for (int b = 0; b < C; ++b) {
         const int o = b * BS;
-        if constexpr (type == GGML_TYPE_Q4_1) {
+        if constexpr (type == GGML_TYPE_Q5_K) {
+            acc = mmvqp_dot_q5_K(w + o/4, a, 8*b, acc);
+        } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+            acc = mmvqp_dot_iq4_xs(w + o/4, a, 8*b, acc);
+        } else if constexpr (type == GGML_TYPE_Q4_1) {
             const uint32_t dm = mmvqp_word_at(w, o);
             const int isum = mmvqp_q4_isum16(mmvqp_word_at(w, o + 4), mmvqp_word_at(w, o + 8), mmvqp_word_at(w, o + 12),
                                              mmvqp_word_at(w, o + 16), a.u[b]);
@@ -257,7 +344,8 @@ static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_
     constexpr int NW = MMVQ_PASCAL_NWARPS;
     constexpr int BS = mmvqp_traits<type>::bs;
     constexpr int WB = C * BS;                     // weight bytes per lane and iteration
-    constexpr int YB = C * sizeof(block_q8_1);     // activation bytes per lane and iteration
+    constexpr int NA = C * mmvqp_traits<type>::na; // activation blocks per lane and iteration
+    constexpr int YB = NA * sizeof(block_q8_1);    // activation bytes per lane and iteration
     constexpr int M  = fk == MMVQP_GATE ? 2 : 1;   // matrices: up (or plain), gate
     constexpr int NU = (WB + 15) / 16;             // staged: 16-byte units per lane and row, the last one predicated
     __shared__ uint4 sm[staged ? NW : 1][staged ? WARP_SIZE * R * M * WB / 16 : 1];
@@ -327,8 +415,8 @@ static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_
             }
             __syncwarp();
         }
-        mmvqp_act<C> a;
-        mmvqp_load_act<type, C>(a, yp);
+        mmvqp_act<NA> a;
+        mmvqp_load_act<type, NA>(a, yp);
 #pragma unroll
         for (int m = 0; m < M; ++m) {
 #pragma unroll
@@ -423,6 +511,10 @@ static mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate) {
             return gate ? mmvqp_shape{ 1, 2, true } : mmvqp_shape{ 2, 2, true };
         case GGML_TYPE_Q8_0:
             return gate ? mmvqp_shape{ 1, 2, true } : mmvqp_shape{ 2, 2, true };
+        case GGML_TYPE_Q5_K:
+            return { 1, 1, true };
+        case GGML_TYPE_IQ4_XS:
+            return gate ? mmvqp_shape{ 1, 1, false } : mmvqp_shape{ 1, 1, true };
         default:
             GGML_ABORT("fatal error");
     }
@@ -478,6 +570,9 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args & p, const 
         MMVQP_CASE(1, 2, false)
         MMVQP_CASE(2, 2, true)
         MMVQP_CASE(2, 2, false)
+    } else if constexpr (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS) {
+        MMVQP_CASE(1, 1, true)
+        MMVQP_CASE(1, 1, false)
     } else {
         MMVQP_CASE(1, 2, true)
         MMVQP_CASE(1, 2, false)
@@ -516,7 +611,8 @@ bool ggml_cuda_mmvq_pascal(
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (mode == 1 && cc != GGML_CUDA_CC_DP4A)) {
         return false;
     }
-    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0) {
+    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
+            type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS) {
         return false;
     }
     if (fusion.x_scale || fusion.gate_scale) {
@@ -550,7 +646,7 @@ bool ggml_cuda_mmvq_pascal(
     if (row_bytes > INT_MAX || (!s.staged && !x_aligned(mmvqp_gcd((int) (s.C * bs), 16)))) {
         return false;
     }
-    const int64_t aly = mmvqp_gcd((int) (s.C * sizeof(block_q8_1)), 16);
+    const int64_t aly = mmvqp_gcd((int) (s.C * (ggml_blck_size(type) / QK8_1) * sizeof(block_q8_1)), 16);
     if (!mmvqp_aligned(vy, aly) || (stride_channel_y * (int64_t) sizeof(block_q8_1)) % aly != 0 ||
             (stride_sample_y * (int64_t) sizeof(block_q8_1)) % aly != 0) {
         return false;
@@ -584,6 +680,8 @@ bool ggml_cuda_mmvq_pascal(
         case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream); break;
         case GGML_TYPE_Q4_1: mmvqp_launch_shape<GGML_TYPE_Q4_1>(s, p, fusion, fk, grid, stream); break;
         case GGML_TYPE_Q5_0: mmvqp_launch_shape<GGML_TYPE_Q5_0>(s, p, fusion, fk, grid, stream); break;
+        case GGML_TYPE_Q5_K: mmvqp_launch_shape<GGML_TYPE_Q5_K>(s, p, fusion, fk, grid, stream); break;
+        case GGML_TYPE_IQ4_XS: mmvqp_launch_shape<GGML_TYPE_IQ4_XS>(s, p, fusion, fk, grid, stream); break;
         case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream); break;
         default:             GGML_ABORT("fatal error");
     }
