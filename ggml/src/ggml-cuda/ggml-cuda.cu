@@ -4926,6 +4926,77 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     }
 }
 
+// GGML_CUDA_PROFILE_HOST=<file>: one CSV line per graph evaluation: device, evaluation, the host time at entry to and
+// exit from the backend's graph_compute (ms since the first evaluation) and the GPU time between two CUDA events around
+// the evaluation's work. The events are read one evaluation later, so nothing synchronizes and only two events per
+// evaluation are added. Comparing the GPU chain with the host timeline shows whether the GPUs or the host set the time
+// per token.
+struct ggml_cuda_profile_host_state {
+    struct device_state {
+        cudaEvent_t ev[2][2];   // [slot][start, end]
+        double      enter[2] = { 0.0, 0.0 };
+        double      exit[2]  = { 0.0, 0.0 };
+        int64_t     n        = 0;
+    };
+    FILE * f = nullptr;
+    std::mutex mutex;
+    std::map<int, device_state> devices;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+
+    double now_ms() const {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+static ggml_cuda_profile_host_state * ggml_cuda_profile_host() {
+    static ggml_cuda_profile_host_state * state = []() -> ggml_cuda_profile_host_state * {
+        const char * path = getenv("GGML_CUDA_PROFILE_HOST");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        ggml_cuda_profile_host_state * st = new ggml_cuda_profile_host_state;
+        st->f = fopen(path, "w");
+        GGML_ASSERT(st->f != nullptr);
+        fprintf(st->f, "device,eval,host_enter_ms,host_exit_ms,gpu_us\n");
+        GGML_LOG_INFO("%s: timing every graph evaluation into %s\n", __func__, path);
+        return st;
+    }();
+    return state;
+}
+
+// at entry to graph_compute: write the previous evaluation of this device, record the start event of this one
+static void ggml_cuda_profile_host_enter(ggml_cuda_profile_host_state * ph, ggml_backend_cuda_context * cuda_ctx) {
+    std::lock_guard<std::mutex> lock(ph->mutex);
+    auto [it, inserted] = ph->devices.try_emplace(cuda_ctx->device);
+    ggml_cuda_profile_host_state::device_state & ds = it->second;
+    if (inserted) {
+        for (auto & slot : ds.ev) {
+            CUDA_CHECK(cudaEventCreate(&slot[0]));
+            CUDA_CHECK(cudaEventCreate(&slot[1]));
+        }
+    }
+    const int slot = ds.n & 1;
+    if (ds.n > 0) {
+        const int prev = slot ^ 1;
+        CUDA_CHECK(cudaEventSynchronize(ds.ev[prev][1]));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ds.ev[prev][0], ds.ev[prev][1]));
+        fprintf(ph->f, "%d,%" PRId64 ",%.3f,%.3f,%.2f\n", cuda_ctx->device, ds.n - 1, ds.enter[prev], ds.exit[prev], 1000.0 * ms);
+    }
+    ds.enter[slot] = ph->now_ms();
+    CUDA_CHECK(cudaEventRecord(ds.ev[slot][0], cuda_ctx->stream()));
+}
+
+// at exit from graph_compute: record the end event
+static void ggml_cuda_profile_host_exit(ggml_cuda_profile_host_state * ph, ggml_backend_cuda_context * cuda_ctx) {
+    std::lock_guard<std::mutex> lock(ph->mutex);
+    ggml_cuda_profile_host_state::device_state & ds = ph->devices[cuda_ctx->device];
+    const int slot = ds.n & 1;
+    CUDA_CHECK(cudaEventRecord(ds.ev[slot][1], cuda_ctx->stream()));
+    ds.exit[slot] = ph->now_ms();
+    ds.n++;
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -4947,6 +5018,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_profile_host_state * prof_host = ggml_cuda_profile_host();
+    if (prof_host) {
+        ggml_cuda_profile_host_enter(prof_host, cuda_ctx);
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5002,6 +5078,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (prof_host) {
+        ggml_cuda_profile_host_exit(prof_host, cuda_ctx);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
