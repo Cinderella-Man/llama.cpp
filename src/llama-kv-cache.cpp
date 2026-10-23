@@ -424,20 +424,35 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
+        // the freed cell that held the lowest position
+        uint32_t  pos_min_head = cells.size();
+        llama_pos pos_min      = std::numeric_limits<llama_pos>::max();
+
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
 
+            const llama_pos pos_i = cells.pos_get(i);
+
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+                if (pos_i < pos_min) {
+                    pos_min      = pos_i;
+                    pos_min_head = i;
+                }
             }
         }
 
-        // If we freed up a slot, set head to it so searching can start there.
-        if (new_head != cells.size() && new_head < head) {
+        if (p1 == std::numeric_limits<llama_pos>::max() && pos_min_head != cells.size()) {
+            // the tail of the sequence was removed: the next token takes the cell of the first removed position, so
+            // that re-decoding the tail gives the same cell layout as before, also when the tail wrapped around the
+            // end of the cache (pipelined speculation relies on this for bit-identical attention)
+            head = pos_min_head;
+        } else if (new_head != cells.size() && new_head < head) {
+            // If we freed up a slot, set head to it so searching can start there.
             head = new_head;
         }
     } else {
