@@ -1024,7 +1024,9 @@ extern "C" {
     // To drop submitted tokens (a wrong guess), remove their positions with llama_memory_seq_rm(mem, seq_id, p, -1)
     // and submit the right token at p: their work still finishes on the devices, ahead of the new token, and their
     // slots are reused only after it has. llama_decode waits for all submitted work first.
-    // Backend sampling is not supported.
+    // With a backend sampler (llama_set_sampler, one sequence) only the sampled token comes back: use
+    // llama_pipe_get_sampled. The sampler's graph inputs are set at submit time, before earlier tokens are sampled,
+    // so only samplers without random draws (greedy) give the same tokens as plain decoding.
     LLAMA_API int32_t llama_pipe_init(struct llama_context * ctx, int32_t n_slots);
 
     // Number of slots set by llama_pipe_init (0 before)
@@ -1040,6 +1042,9 @@ extern "C" {
 
     // Waits for the logits of the token last submitted in this slot ([n_vocab] floats, valid until it is reused)
     LLAMA_API float * llama_pipe_get_logits(struct llama_context * ctx, int32_t slot);
+
+    // With a backend sampler: waits for the token sampled after the token last submitted in this slot
+    LLAMA_API llama_token llama_pipe_get_sampled(struct llama_context * ctx, int32_t slot);
 
     // Waits for all submitted tokens
     LLAMA_API void llama_pipe_drain(struct llama_context * ctx);
