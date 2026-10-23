@@ -374,6 +374,25 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
     cparams.training = false;
 
+    // screened output head: LLAMA_SCREEN_HEAD=1 enables it for models with an output_screen tensor,
+    // LLAMA_SCREEN_HEAD_M=<M> overrides the model's number of candidates
+    {
+        const char * LLAMA_SCREEN_HEAD   = getenv("LLAMA_SCREEN_HEAD");
+        const char * LLAMA_SCREEN_HEAD_M = getenv("LLAMA_SCREEN_HEAD_M");
+        cparams.screen_head   = LLAMA_SCREEN_HEAD   ? atoi(LLAMA_SCREEN_HEAD) != 0 : false;
+        cparams.screen_head_m = LLAMA_SCREEN_HEAD_M ? (uint32_t) atoi(LLAMA_SCREEN_HEAD_M) : 0;
+
+        if (cparams.screen_head) {
+            if (model.output_screen) {
+                LLAMA_LOG_INFO("%s: screened output head on: %s screen, %u candidates\n", __func__,
+                        ggml_type_name(model.output_screen->type),
+                        cparams.screen_head_m ? cparams.screen_head_m : hparams.output_screen_top_m);
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_SCREEN_HEAD is set but the model has no output_screen tensor\n", __func__);
+            }
+        }
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -1373,6 +1392,17 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+void llama_context::set_screen_head(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    // like causal_attn: a flip rebuilds the graph, which allocates the few extra MB on the fly
+    cparams.screen_head = value;
+}
+
+bool llama_context::get_screen_head() const {
+    return cparams.screen_head;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -4224,6 +4254,18 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_screen_head(llama_context * ctx, bool enable) {
+    ctx->set_screen_head(enable);
+}
+
+bool llama_get_screen_head(const llama_context * ctx) {
+    return ctx->get_screen_head();
+}
+
+uint32_t llama_model_screen_head_m(const llama_model * model) {
+    return model->output_screen ? model->hparams.output_screen_top_m : 0;
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

@@ -1419,6 +1419,66 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     }
 }
 
+bool common_screen_head_requested() {
+    const char * e = getenv("LLAMA_SCREEN_HEAD");
+    return e && atoi(e) != 0;
+}
+
+bool common_sampling_screen_head_ok(const common_params_sampling & p, uint32_t m, std::string * why) {
+    const auto no = [&](const char * reason) {
+        if (why) {
+            *why = reason;
+        }
+        return false;
+    };
+    if (m == 0) {
+        return no("the model has no output_screen tensor");
+    }
+    if (p.n_probs > 0) {
+        return no("token probabilities are requested");
+    }
+    if (!p.grammar.empty()) {
+        return no("a grammar is set");
+    }
+    for (const auto & lb : p.logit_bias) {
+        if (lb.bias > 0.0f) {
+            return no("a positive logit bias is set");
+        }
+    }
+    if (p.mirostat != 0) {
+        return no("mirostat needs the whole distribution");
+    }
+    if (p.penalty_repeat < 1.0f || p.penalty_freq < 0.0f || p.penalty_present < 0.0f) {
+        return no("a penalty raises logits");
+    }
+    if (p.temp <= 0.0f) {
+        return true; // greedy: exact whenever the top token is a candidate
+    }
+    if (p.adaptive_target >= 0.0f) {
+        return no("adaptive-p needs the whole distribution");
+    }
+    if (p.top_k <= 0 || (uint32_t) p.top_k > m) {
+        return no("top-k must be between 1 and the number of candidates");
+    }
+    // samplers that read the normalized distribution must come after top-k
+    for (const auto s : p.samplers) {
+        if (s == COMMON_SAMPLER_TYPE_TOP_K) {
+            return true;
+        }
+        const bool reads_distribution =
+            (s == COMMON_SAMPLER_TYPE_TOP_P       && p.top_p < 1.0f) ||
+            (s == COMMON_SAMPLER_TYPE_TYPICAL_P   && p.typ_p < 1.0f) ||
+            (s == COMMON_SAMPLER_TYPE_XTC         && p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f) ||
+            (s == COMMON_SAMPLER_TYPE_TOP_N_SIGMA && p.top_n_sigma > 0.0f) ||
+            (s == COMMON_SAMPLER_TYPE_TEMPERATURE && p.dynatemp_range > 0.0f) ||
+            (s == COMMON_SAMPLER_TYPE_ADAPTIVE_P);
+        if (reads_distribution) {
+            return no("a sampler before top-k reads the whole distribution");
+        }
+    }
+    return no("top-k is not in the sampler chain");
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     common_init_result_ptr res(new common_init_result(params, model_only));
 
@@ -1439,6 +1499,15 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // the screened output head is exact only for some samplers (the server decides again for every batch)
+    if (llama_get_screen_head(lctx)) {
+        std::string why;
+        if (!common_sampling_screen_head_ok(params.sampling, llama_model_screen_head_m(model), &why)) {
+            COM_WRN("screened output head off: %s\n", why.c_str());
+            llama_set_screen_head(lctx, false);
+        }
+    }
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");

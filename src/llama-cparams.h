@@ -57,6 +57,9 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
+    bool     screen_head;    // screened output head: exact logits only for the candidates of the model's output_screen
+    uint32_t screen_head_m;  // number of candidates; 0 = the model's output_screen.top_m
+
     size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

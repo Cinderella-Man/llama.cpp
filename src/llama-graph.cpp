@@ -4381,6 +4381,44 @@ void llm_graph_context::build_pooling(
     ggml_build_forward_expand(gf, cur);
 }
 
+void llm_graph_context::build_screen_head(ggml_tensor * output, ggml_tensor * output_screen, uint32_t m) const {
+    ggml_tensor * logits = res->t_logits;
+
+    // only a single output row of the plain head product: no bias, scale, softcap or LoRA after it, and the final
+    // hidden state itself as its input (the screen is made from the untransformed head)
+    if (!cparams.screen_head || !output_screen || !logits || n_outputs != 1 || cparams.embeddings ||
+            logits->op != GGML_OP_MUL_MAT || logits->src[0] != output || logits->ne[1] != 1 ||
+            logits->src[1] != res->t_embd) {
+        return;
+    }
+
+    ggml_tensor * h = logits->src[1]; // [n_embd, 1]
+    const int64_t n_vocab = output->ne[1];
+    if (m == 0 || m >= n_vocab || output_screen->ne[0] != output->ne[0] || output_screen->ne[1] != n_vocab) {
+        return;
+    }
+
+    // candidates: the screen's top m
+    ggml_tensor * screen = ggml_mul_mat(ctx0, output_screen, h);
+    cb(screen, "result_screen", -1);
+    ggml_tensor * cand = ggml_top_k(ctx0, screen, m); // I32 [m, 1]
+    cb(cand, "result_screen_cand", -1);
+
+    // exact logits of the candidates: every row of the output tensor is one "expert" of a mul_mat_id, so each
+    // candidate row goes through the same matrix-vector kernel, with the same arithmetic, as in the full product
+    ggml_tensor * rows  = ggml_view_3d(ctx0, output, output->ne[0], 1, n_vocab, output->nb[1], output->nb[1], 0);
+    ggml_tensor * exact = ggml_mul_mat_id(ctx0, rows, ggml_reshape_3d(ctx0, h, h->ne[0], 1, 1), cand); // [1, m, 1]
+    cb(exact, "result_screen_exact", -1);
+
+    // every other token gets -INFINITY, so the samplers see exactly the candidates
+    ggml_tensor * out = ggml_fill(ctx0, screen, -INFINITY);
+    out = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, out, 1, n_vocab, 1), exact, cand);
+    out = ggml_cont_2d(ctx0, out, n_vocab, 1);
+    cb(out, "result_output", -1);
+
+    res->t_logits = out;
+}
+
 void llm_graph_context::build_logits() const {
     // a pooled embeddings context outputs one vector per sequence, so its graph skips the LM head
     if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE) {

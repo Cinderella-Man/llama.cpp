@@ -1008,6 +1008,8 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    uint32_t screen_head_m = 0; // > 0: the screened output head may be used (LLAMA_SCREEN_HEAD=1 and the model has one)
+
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
@@ -1288,6 +1290,13 @@ private:
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+
+        // screened output head: asked for with LLAMA_SCREEN_HEAD=1, used for the batches whose slots all sample
+        // in a way it is exact for (decode())
+        screen_head_m = common_screen_head_requested() && model_tgt ? llama_model_screen_head_m(model_tgt) : 0;
+        if (screen_head_m > 0) {
+            SRV_INF("screened output head: %u candidates, used for requests whose sampling it is exact for\n", screen_head_m);
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -4551,6 +4560,17 @@ private:
         bool has_output = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+        }
+
+        // screened output head: only if every slot with a row in this batch samples in a way it is exact for
+        if (screen_head_m > 0) {
+            bool screen = true;
+            for (const auto & slot : slots) {
+                if (slot.task && slot.i_batch >= off && slot.i_batch < off + (int) batch.view.size()) {
+                    screen = screen && common_sampling_screen_head_ok(slot.task->params.sampling, screen_head_m);
+                }
+            }
+            llama_set_screen_head(ctx_tgt, screen);
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
