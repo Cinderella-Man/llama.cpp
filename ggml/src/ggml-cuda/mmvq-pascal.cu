@@ -15,9 +15,11 @@
 //     are 32 bits wide and strided.
 //   - 4-bit codes are unpacked with masks only: dp4a on (q & 0x0F0F0F0F) and an unsigned-by-signed dp4a on
 //     (q & 0xF0F0F0F0), combined as (lo << 4) + hi, with the factor 1/16 moved into the activation scale.
-//   - Q5_K and IQ4_XS take one 256-weight super-block per lane. Q5_K's activation sums (for its mins) are computed once
-//     per super-block and shared by all rows; IQ4_XS looks its 4-bit indices up with __byte_perm in a table held in
-//     registers, with the activations pre-permuted into the order the lookup produces.
+//   - The activation block sums that the offsets and mins need (Q4_0, Q4_1, Q5_0, Q5_K) are computed in FP32 from the
+//     int8 values once per activation load and shared by all rows; block_q8_1's FP16 sum is never read, because it
+//     overflows on large activations.
+//   - Q5_K and IQ4_XS take one 256-weight super-block per lane. IQ4_XS looks its 4-bit indices up with __byte_perm in a
+//     table held in registers, with the activations pre-permuted into the order the lookup produces.
 //   - Q5_0's fifth bits stay where they are: a block's sum splits into sum(nibble * a) + 16 * sum(bit * a), and
 //     (qh >> j) & 0x01010101 holds the fifth bits of weights j, 8 + j, 16 + j and 24 + j, so the activations are
 //     regrouped the same way once per block (two 4 x 4 byte transposes), shared by all rows.
@@ -124,7 +126,7 @@ struct mmvqp_act {
     int   u[NA][8];
     int   t[NA][8];  // Q5_0 only: t[j] = bytes a[j], a[8 + j], a[16 + j], a[24 + j] of the block
     float d[NA];     // d8 (Q8_0, Q5_K, IQ4_XS) or d8 / 16 (4- and 5-bit legacy types)
-    float s[NA];     // s8 (Q4_1), -8 * s8 (Q4_0), -16 * s8 (Q5_0), or d8 * the sum of the int8 values (Q5_K)
+    float s[NA];     // with S = d8 * the sum of the int8 values: S (Q4_1, Q5_K), -8 * S (Q4_0), -16 * S (Q5_0)
 };
 
 // 4 x 4 byte transpose: out[j] = bytes j of x0, x1, x2, x3.
@@ -152,27 +154,33 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             a.u[b][k] = (int) w[9*b + 1 + k];
         }
         const float d8 = mmvqp_h2f_lo(w[9*b]);
-        const float s8 = mmvqp_h2f_hi(w[9*b]);
-        if constexpr (type == GGML_TYPE_Q8_0) {
-            a.d[b] = d8;
-            a.s[b] = 0.0f;
-        } else if constexpr (type == GGML_TYPE_Q4_0) {
-            a.d[b] = d8 * 0.0625f;
-            a.s[b] = -8.0f * s8;
-        } else if constexpr (type == GGML_TYPE_Q5_0) {
-            a.d[b] = d8 * 0.0625f;
-            a.s[b] = -16.0f * s8;
-            mmvqp_transpose4(a.u[b][0], a.u[b][2], a.u[b][4], a.u[b][6], a.t[b] + 0);
-            mmvqp_transpose4(a.u[b][1], a.u[b][3], a.u[b][5], a.u[b][7], a.t[b] + 4);
-        } else if constexpr (type == GGML_TYPE_Q5_K) {
-            // the mins term needs the sum of the quantized activations, as vec_dot_q5_K_q8_1 computes it
+        // The offsets (Q4_0, Q5_0) and mins (Q4_1, Q5_K) need the block's sum. It is taken from the int8 values, in
+        // FP32, not from the FP16 sum that block_q8_1 stores next to d8: that one becomes infinite once the block's
+        // activations add up past 65504 (Flint's expert down-projections in layers 46-48), while d8 * sum(int8) is
+        // finite whenever d8 is. 8 dp4a per activation block, shared by all rows of the lane group.
+        float S = 0.0f;
+        if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_K) {
             int sum = 0;
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
                 sum = ggml_cuda_dp4a(0x01010101, a.u[b][k], sum);
             }
+            S = d8 * (float) sum;
+        }
+        if constexpr (type == GGML_TYPE_Q8_0) {
             a.d[b] = d8;
-            a.s[b] = d8 * (float) sum;
+            a.s[b] = 0.0f;
+        } else if constexpr (type == GGML_TYPE_Q4_0) {
+            a.d[b] = d8 * 0.0625f;
+            a.s[b] = -8.0f * S;
+        } else if constexpr (type == GGML_TYPE_Q5_0) {
+            a.d[b] = d8 * 0.0625f;
+            a.s[b] = -16.0f * S;
+            mmvqp_transpose4(a.u[b][0], a.u[b][2], a.u[b][4], a.u[b][6], a.t[b] + 0);
+            mmvqp_transpose4(a.u[b][1], a.u[b][3], a.u[b][5], a.u[b][7], a.t[b] + 4);
+        } else if constexpr (type == GGML_TYPE_Q5_K) {
+            a.d[b] = d8;
+            a.s[b] = S;
         } else if constexpr (type == GGML_TYPE_IQ4_XS) {
             // word k of the codes holds weights 4k..4k+3 (low nibbles) and 4k+16..4k+19 (high nibbles); the table
             // lookup returns them as (4k, 4k+16, 4k+1, 4k+17) and (4k+2, 4k+18, 4k+3, 4k+19)
@@ -190,7 +198,7 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             a.s[b] = 0.0f;
         } else {
             a.d[b] = d8 * 0.0625f;
-            a.s[b] = s8;
+            a.s[b] = S;
         }
     }
 }
@@ -597,18 +605,18 @@ static bool mmvqp_aligned(const void * ptr, const int64_t al) {
 
 } // namespace
 
+bool ggml_cuda_mmvq_pascal_active(const int cc) {
+    const int mode = mmvqp_mode();
+    return mode != 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && (mode != 1 || cc == GGML_CUDA_CC_DP4A);
+}
+
 bool ggml_cuda_mmvq_pascal(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
         float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x,
         int64_t nchannels_x, int64_t nchannels_y, int64_t nchannels_dst, int64_t stride_channel_x, int64_t stride_channel_y,
         int64_t stride_channel_dst, int64_t nsamples_x, int64_t nsamples_dst, int64_t stride_sample_x, int64_t stride_sample_y,
         int64_t stride_sample_dst, cudaStream_t stream) {
-    const int mode = mmvqp_mode();
-    if (mode == 0 || ncols_dst != 1) {
-        return false;
-    }
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (mode == 1 && cc != GGML_CUDA_CC_DP4A)) {
+    if (ncols_dst != 1 || !ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
@@ -689,6 +697,11 @@ bool ggml_cuda_mmvq_pascal(
 }
 
 #else
+
+bool ggml_cuda_mmvq_pascal_active(const int cc) {
+    GGML_UNUSED(cc);
+    return false;
+}
 
 bool ggml_cuda_mmvq_pascal(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,

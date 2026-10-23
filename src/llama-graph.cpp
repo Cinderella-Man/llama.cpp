@@ -1667,6 +1667,21 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+// LLAMA_NO_MOE_DOWN_RESCALE: unset keeps the MoE down-projection rescale of build_moe_ffn, which keeps the FP16 block
+// sums of Q8_1 activations from overflowing. "tg" drops it where the down-projection has one token: on compute 6.1 that
+// product runs the Pascal kernels of mmvq-pascal.cu, which compute the sums in FP32 (Q4_0, Q4_1, Q5_0, Q8_0, Q5_K,
+// IQ4_XS; mul_mat_vec_q does so for the other K-quants, but still reads the FP16 sum for Q5_1 and Q4_1_64, as the CPU
+// backend does for Q4_1 and Q5_1). Batches keep it: mul_mat_vec_q (2-8 tokens) reads the FP16 sums for Q4_0, Q4_1,
+// Q5_0 and Q5_1, MMQ for Q4_1, Q5_1, Q4_K, Q5_K and, without tensor cores, Q4_0. Any other value drops it everywhere,
+// which is safe only for down-projections whose kernels never read those sums (Q8_0, Q6_K, IQ4_XS, IQ4_NL, MXFP4).
+static bool llm_graph_moe_down_rescale(int64_t n_tokens) {
+    static const char * env = getenv("LLAMA_NO_MOE_DOWN_RESCALE");
+    if (env == nullptr) {
+        return true;
+    }
+    return strcmp(env, "tg") == 0 && n_tokens > 1;
+}
+
 llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
           ggml_tensor * cur) const {
     llm_graph_amax_src1 result = {
@@ -2510,7 +2525,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         //       ref: https://github.com/ggml-org/llama.cpp/pull/30656#issuecomment-6269597922
         llm_graph_amax_src1 amax_src1 = { nullptr, nullptr };
 
-        if ((arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT) && getenv("LLAMA_NO_MOE_DOWN_RESCALE") == nullptr) {
+        if ((arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT) && llm_graph_moe_down_rescale(n_tokens)) {
             amax_src1 = build_amax_src1_f16(cur);
             cur = amax_src1.res;
         }

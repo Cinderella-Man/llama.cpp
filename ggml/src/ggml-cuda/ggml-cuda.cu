@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-pascal.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -6370,6 +6371,13 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         for (int id = 0; id < info.device_count; ++id) {
             if (blackwell_mma_available(info.devices[id].cc)) {
                 features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
+                break;
+            }
+        }
+        // the Pascal single-token kernels (mmvq-pascal.cu) run on some device
+        for (int id = 0; id < info.device_count; ++id) {
+            if (ggml_cuda_mmvq_pascal_active(info.devices[id].cc)) {
+                features.push_back({ "MMVQ_PASCAL", "1"});
                 break;
             }
         }
