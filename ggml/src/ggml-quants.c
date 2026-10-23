@@ -497,6 +497,64 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void quantize_row_q4_1_64_ref(const float * GGML_RESTRICT x, block_q4_1_64 * GGML_RESTRICT y, int64_t k) {
+    const int qk = QK4_1_64;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float min = FLT_MAX;
+        float max = -FLT_MAX;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        const float d  = (max - min) / ((1 << 4) - 1);
+        const float id = d ? 1.0f/d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].m = GGML_FP32_TO_FP16(min);
+        for (int h = 0; h < 2; ++h) {
+            for (int j = 0; j < 16; ++j) {
+                const float x0 = (x[i*qk + 32*h +      j] - min)*id;
+                const float x1 = (x[i*qk + 32*h + 16 + j] - min)*id;
+                const uint8_t xi0 = MIN(15, (int8_t)(x0 + 0.5f));
+                const uint8_t xi1 = MIN(15, (int8_t)(x1 + 0.5f));
+                y[i].qs[16*h + j] = xi0 | (xi1 << 4);
+            }
+        }
+    }
+}
+
+void dequantize_row_q4_1_64(const block_q4_1_64 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_1_64;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+        for (int h = 0; h < 2; ++h) {
+            for (int j = 0; j < 16; ++j) {
+                y[i*qk + 32*h +      j] = (x[i].qs[16*h + j] & 0x0F)*d + m;
+                y[i*qk + 32*h + 16 + j] = (x[i].qs[16*h + j] >>   4)*d + m;
+            }
+        }
+    }
+}
+
+size_t quantize_q4_1_64(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights); // the importance matrix is not used yet
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_1_64, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4_1_64_ref(src, (block_q4_1_64 *) qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
 void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
@@ -5516,6 +5574,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_1:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_1, data, nb, d, m);
+            } break;
+        case GGML_TYPE_Q4_1_64:
+            {
+                VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_1_64, data, nb, d, m);
             } break;
         case GGML_TYPE_Q5_0:
             {

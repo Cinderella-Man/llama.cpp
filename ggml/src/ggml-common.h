@@ -105,6 +105,8 @@ typedef sycl::half2 ggml_half2;
 
 #define QI4_1 (QK4_1 / (4 * QR4_1))
 #define QR4_1 2
+#define QI4_1_64 (QK4_1_64 / (4 * QR4_1_64))
+#define QR4_1_64 2
 
 #define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
 #define QR_MXFP4 2
@@ -210,6 +212,20 @@ typedef struct {
     uint8_t qs[QK4_1 / 2]; // nibbles / quants
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4_1 block size/padding");
+
+// Q4_1 with one scale and offset shared by 64 weights; each half of 32 weights is packed exactly like a Q4_1 block
+#define QK4_1_64 64
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d; // delta
+            ggml_half m; // min
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t qs[QK4_1_64 / 2]; // nibbles: qs[16*h + j] holds weights 32*h + j (low) and 32*h + 16 + j (high)
+} block_q4_1_64;
+static_assert(sizeof(block_q4_1_64) == 2 * sizeof(ggml_half) + QK4_1_64 / 2, "wrong q4_1_64 block size/padding");
 
 #define QK_MXFP4 32
 typedef struct {

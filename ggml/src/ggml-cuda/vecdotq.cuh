@@ -139,6 +139,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
 #define VDR_Q4_1_Q8_1_MMVQ 2
 #define VDR_Q4_1_Q8_1_MMQ  4
 
+#define VDR_Q4_1_64_Q8_1_MMVQ 2
+
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(
     const int * v, const int * u, const half2 & dm4, const half2 & ds8) {
 
@@ -832,6 +834,28 @@ static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     }
 
     return vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMVQ>(v, u, bq4_1->dm, bq8_1->ds);
+}
+
+static __device__ __forceinline__ float vec_dot_q4_1_64_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    // 64 weights per block: iqs in [0, QI4_1_64) selects the 32-weight half (one Q8_1 block) and the ints within it
+    const block_q4_1_64 * bq = (const block_q4_1_64 *) vbq + kbx;
+    const int h = iqs / QI4_1;
+    const int j = iqs % QI4_1;
+    const block_q8_1 * b8 = bq8_1 + h;
+
+    int v[VDR_Q4_1_64_Q8_1_MMVQ];
+    int u[2*VDR_Q4_1_64_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_1_64_Q8_1_MMVQ; ++i) {
+        v[i]     = get_int_b4(bq->qs + 16*h, j + i);
+        u[2*i+0] = get_int_b4(b8->qs, j + i);
+        u[2*i+1] = get_int_b4(b8->qs, j + i + QI4_1);
+    }
+
+    return vec_dot_q4_1_q8_1_impl<VDR_Q4_1_64_Q8_1_MMVQ>(v, u, bq->dm, b8->ds);
 }
 
 static __device__ __forceinline__ float vec_dot_q5_0_q8_1(
