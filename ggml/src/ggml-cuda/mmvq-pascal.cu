@@ -22,6 +22,12 @@
 //     overflows on large activations.
 //   - Q5_K and IQ4_XS take one 256-weight super-block per lane. IQ4_XS looks its 4-bit indices up with __byte_perm in a
 //     table held in registers, with the activations pre-permuted into the order the lookup produces.
+//   - Q6_K takes one super-block per lane too, staged only: its 210-byte super-blocks are 2-byte aligned, so lanes whose
+//     block starts at an odd half-word shift the words they read from shared memory by 2 bytes, rows that are only 8- or
+//     4-byte aligned (K = 1024, 512) are staged with 8- or 4-byte loads, and a fused gate/up stages its two matrices one
+//     after the other in the same buffer (27 KB per block instead of 54 KB). The 6-bit codes are nibbles of ql OR-ed with
+//     a 2-bit field of qh, one dp4a per 4 weights, and the offset -32 comes from the activations' half-block sums,
+//     shared by all rows.
 //   - Q5_0's fifth bits stay where they are: a block's sum splits into sum(nibble * a) + 16 * sum(bit * a), and
 //     (qh >> j) & 0x01010101 holds the fifth bits of weights j, 8 + j, 16 + j and 24 + j, so the activations are
 //     regrouped the same way once per block (two 4 x 4 byte transposes), shared by all rows.
@@ -80,32 +86,74 @@ struct mmvqp_args_mc : mmvqp_args {
 
 enum mmvqp_fusion { MMVQP_PLAIN = 0, MMVQP_BIAS = 1, MMVQP_GATE = 2 };
 
+// Staged weights: matrices staged at a time (Q6_K's gate and up one after the other), and bytes of padding behind each
+// warp's buffer (mmvqp_lds_q6_K reads 2 bytes past a block).
+template <ggml_type type, int M> constexpr __host__ __device__ int mmvqp_staged_mats() { return type == GGML_TYPE_Q6_K ? 1 : M; }
+template <ggml_type type> constexpr __host__ __device__ int mmvqp_staged_pad() { return type == GGML_TYPE_Q6_K ? 16 : 0; }
+
 template <ggml_type type, int R, int C, bool staged, bool gate>
 constexpr bool mmvqp_fits() {
-    return !staged || MMVQ_PASCAL_NWARPS * WARP_SIZE * R * (gate ? 2 : 1) * C * mmvqp_traits<type>::bs <= 48 * 1024;
+    return !staged || MMVQ_PASCAL_NWARPS * (WARP_SIZE * R * mmvqp_staged_mats<type, gate ? 2 : 1>() * C * mmvqp_traits<type>::bs +
+        mmvqp_staged_pad<type>()) <= 48 * 1024;
 }
 
 // the multi-token kernel with each token's activations staged as well (sa)
 template <ggml_type type, int R, int C, bool staged, bool gate, bool sa>
 constexpr bool mmvqp_fits_mc() {
-    constexpr int wb = staged ? R * (gate ? 2 : 1) * C * mmvqp_traits<type>::bs : 0;
-    constexpr int yb = sa ? C * mmvqp_traits<type>::na * (int) sizeof(block_q8_1) : 0;
-    return MMVQ_PASCAL_NWARPS * WARP_SIZE * (wb + yb) <= 48 * 1024;
+    constexpr int wb = staged ? WARP_SIZE * R * mmvqp_staged_mats<type, gate ? 2 : 1>() * C * mmvqp_traits<type>::bs +
+        mmvqp_staged_pad<type>() : 0;
+    constexpr int yb = sa ? WARP_SIZE * C * mmvqp_traits<type>::na * (int) sizeof(block_q8_1) : 0;
+    return MMVQ_PASCAL_NWARPS * (wb + yb) <= 48 * 1024;
+}
+
+// Loads that stage weight segments: 16 bytes, or 8 and 4 where Q6_K's rows are only 8- or 4-byte aligned.
+template <int SU> struct mmvqp_stage_unit;
+template <> struct mmvqp_stage_unit<16> { using t = uint4; };
+template <> struct mmvqp_stage_unit<8>  { using t = uint2; };
+template <> struct mmvqp_stage_unit<4>  { using t = unsigned int; };
+
+// One lane's Q6_K super-block (210 bytes at a 2-byte boundary in shared memory) as 53 4-byte-aligned words: the words
+// around it, shifted by 2 bytes where it starts at an odd half-word.
+static __device__ __forceinline__ void mmvqp_lds_q6_K(uint32_t * w, const char * p) {
+    const int        mis = (int) ((uintptr_t) p & 2);
+    const uint32_t * aw  = (const uint32_t *) (p - mis); // pointer arithmetic keeps the shared address space
+    const uint32_t   sel = mis ? 0x5432 : 0x3210;
+    uint32_t cur = aw[0];
+#pragma unroll
+    for (int i = 0; i < 52; ++i) {
+        const uint32_t nxt = aw[i + 1];
+        w[i] = __byte_perm(cur, nxt, sel);
+        cur = nxt;
+    }
+    w[52] = __byte_perm(cur, 0, sel);
+}
+
+// A lane's staged weight chunk of WB bytes from shared memory.
+template <ggml_type type, int WB>
+static __device__ __forceinline__ void mmvqp_lds_chunk(uint32_t * w, const char * p) {
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        static_assert(WB == sizeof(block_q6_K), "Q6_K: one super-block per lane");
+        mmvqp_lds_q6_K(w, p);
+    } else {
+        mmvqp_lds_words<WB, mmvqp_gcd(WB, 16)>(w, p);
+    }
 }
 
 // One token: the rows of row block bx (blockIdx.x of mul_mat_vec_q_pascal). Shared by mul_mat_vec_q_pascal and the
 // Q/K/V launch (mul_mat_vec_q_pascal_qkv), where each type's instantiation has its own staging memory.
-template <ggml_type type, int R, int C, bool staged, int fk>
+template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
 static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const ggml_cuda_mm_fusion_args_device & fusion,
                                                      const uint32_t bx) {
+    using unit_t = typename mmvqp_stage_unit<SU>::t;
     constexpr int NW = MMVQ_PASCAL_NWARPS;
     constexpr int BS = mmvqp_traits<type>::bs;
     constexpr int WB = C * BS;                     // weight bytes per lane and iteration
     constexpr int NA = C * mmvqp_traits<type>::na; // activation blocks per lane and iteration
     constexpr int YB = NA * sizeof(block_q8_1);    // activation bytes per lane and iteration
     constexpr int M  = fk == MMVQP_GATE ? 2 : 1;   // matrices: up (or plain), gate
-    constexpr int NU = (WB + 15) / 16;             // staged: 16-byte units per lane and row, the last one predicated
-    __shared__ uint4 sm[staged ? NW : 1][staged ? WARP_SIZE * R * M * WB / 16 : 1];
+    constexpr int MS = mmvqp_staged_mats<type, M>(); // matrices staged at a time
+    constexpr int NU = (WB + SU - 1) / SU;         // staged: units per lane and row, the last one predicated
+    __shared__ uint4 sm[staged ? NW : 1][staged ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
 
     const int lane     = threadIdx.x;
     const int lpr_log2 = p.lpr_log2;
@@ -141,8 +189,8 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     const char * yp = p.vy + sample_dst*p.sample_bytes_y + channel_y*p.channel_bytes_y + sl * YB;
     const int wstep = WB << lpr_log2;
     const int ystep = YB << lpr_log2;
-    [[maybe_unused]] char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * M * WB << lpr_log2 : 0);
-    [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> 4;
+    [[maybe_unused]] char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * MS * WB << lpr_log2 : 0);
+    [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> (SU == 16 ? 4 : SU == 8 ? 3 : 2);
 
     float acc[M][R];
 #pragma unroll
@@ -154,42 +202,48 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     }
 
     for (int it = 0; it < p.niter; ++it) {
-        if constexpr (staged) {
+        mmvqp_act<NA> a;
 #pragma unroll
-            for (int m = 0; m < M; ++m) {
+        for (int g = 0; g < M / MS; ++g) {
+            if constexpr (staged) {
 #pragma unroll
-                for (int i = 0; i < R; ++i) {
-                    uint4       * dsm = (uint4 *) (smw + ((m*R + i) * WB << lpr_log2));
-                    const uint4 * src = (const uint4 *) rw[m][i];
+                for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
-                    for (int j = 0; j < NU; ++j) {
-                        const int u = sl + (j << lpr_log2);
-                        if (j < NU - 1 || u < seg_units) {
-                            dsm[u] = __ldg(src + u);
+                    for (int i = 0; i < R; ++i) {
+                        unit_t       * dsm = (unit_t *) (smw + ((ms*R + i) * WB << lpr_log2));
+                        const unit_t * src = (const unit_t *) rw[g*MS + ms][i];
+#pragma unroll
+                        for (int j = 0; j < NU; ++j) {
+                            const int u = sl + (j << lpr_log2);
+                            if (j < NU - 1 || u < seg_units) {
+                                dsm[u] = __ldg(src + u);
+                            }
                         }
                     }
                 }
+                __syncwarp();
             }
-            __syncwarp();
-        }
-        mmvqp_act<NA> a;
-        mmvqp_load_act<type, NA>(a, yp);
+            if (g == 0) {
+                mmvqp_load_act<type, NA>(a, yp);
+            }
 #pragma unroll
-        for (int m = 0; m < M; ++m) {
+            for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
-            for (int i = 0; i < R; ++i) {
-                uint32_t w[WB / 4];
-                if constexpr (staged) {
-                    mmvqp_lds_words<WB, mmvqp_gcd(WB, 16)>(w, smw + ((m*R + i) * WB << lpr_log2) + sl * WB);
-                } else {
-                    mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(w, rw[m][i]);
+                for (int i = 0; i < R; ++i) {
+                    const int m = g*MS + ms;
+                    uint32_t w[(WB + 3) / 4];
+                    if constexpr (staged) {
+                        mmvqp_lds_chunk<type, WB>(w, smw + ((ms*R + i) * WB << lpr_log2) + sl * WB);
+                    } else {
+                        mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(w, rw[m][i]);
+                    }
+                    acc[m][i] = mmvqp_dot<type, C>(w, a, acc[m][i]);
+                    rw[m][i] += wstep;
                 }
-                acc[m][i] = mmvqp_dot<type, C>(w, a, acc[m][i]);
-                rw[m][i] += wstep;
             }
-        }
-        if constexpr (staged) {
-            __syncwarp();
+            if constexpr (staged) {
+                __syncwarp();
+            }
         }
         yp += ystep;
     }
@@ -248,10 +302,10 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     }
 }
 
-template <ggml_type type, int R, int C, bool staged, int fk>
+template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
 __launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_mm_fusion_args_device fusion) {
-    mmvqp_rows_1t<type, R, C, staged, fk>(p, fusion, blockIdx.x);
+    mmvqp_rows_1t<type, R, C, staged, fk, SU>(p, fusion, blockIdx.x);
 }
 
 // One token, three products of the same activations in one launch (an attention block's Q, K and V): row blocks
@@ -276,9 +330,10 @@ static __global__ void mul_mat_vec_q_pascal_qkv(const mmvqp_args pq, const mmvqp
 // expert, samples) for MUL_MAT_ID, where block y = t * nslots + k is entry (token t, slot k) of ids.
 // sa: each token's activation segment is copied into shared memory by the whole warp with coalesced 128-bit loads, and
 // every lane reads its blocks from there, instead of loading its own blocks from global memory at a stride of YB bytes.
-template <ggml_type type, int R, int C, bool staged, int fk, bool sa>
+template <ggml_type type, int R, int C, bool staged, int fk, bool sa, int SU = 16>
 __launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml_cuda_mm_fusion_args_device fusion) {
+    using unit_t = typename mmvqp_stage_unit<SU>::t;
     constexpr int NW = MMVQ_PASCAL_NWARPS;
     constexpr int NC = MMVQP_MAX_COLS;
     constexpr int BS = mmvqp_traits<type>::bs;
@@ -286,9 +341,10 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
     constexpr int NA = C * mmvqp_traits<type>::na; // activation blocks per lane and iteration
     constexpr int YB = NA * sizeof(block_q8_1);    // activation bytes per lane, iteration and token
     constexpr int M  = fk == MMVQP_GATE ? 2 : 1;   // matrices: up (or plain), gate
-    constexpr int NU = (WB + 15) / 16;             // staged: 16-byte units per lane and row, the last one predicated
+    constexpr int MS = mmvqp_staged_mats<type, M>(); // matrices staged at a time
+    constexpr int NU = (WB + SU - 1) / SU;         // staged: units per lane and row, the last one predicated
     constexpr int NY = (WARP_SIZE * YB / 16 + WARP_SIZE - 1) / WARP_SIZE; // sa: 16-byte units per lane and token
-    __shared__ uint4 sm[staged ? NW : 1][staged ? WARP_SIZE * R * M * WB / 16 : 1];
+    __shared__ uint4 sm[staged ? NW : 1][staged ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
     __shared__ uint4 sm_y[sa ? NW : 1][sa ? WARP_SIZE * YB / 16 : 1];
 
     const int lane     = threadIdx.x;
@@ -381,8 +437,8 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
     }
     const int wstep = WB << lpr_log2;
     const int ystep = YB << lpr_log2;
-    [[maybe_unused]] char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * M * WB << lpr_log2 : 0);
-    [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> 4;
+    [[maybe_unused]] char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * MS * WB << lpr_log2 : 0);
+    [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> (SU == 16 ? 4 : SU == 8 ? 3 : 2);
 
     float acc[NC][M][R];
 #pragma unroll
@@ -398,83 +454,88 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
 
     const char * yp = p.vy + sl * YB;
     for (int it = 0; it < p.niter; ++it) {
-        if constexpr (staged) {
 #pragma unroll
-            for (int m = 0; m < M; ++m) {
+        for (int g = 0; g < M / MS; ++g) {
+            if constexpr (staged) {
 #pragma unroll
-                for (int i = 0; i < R; ++i) {
-                    uint4       * dsm = (uint4 *) (smw + ((m*R + i) * WB << lpr_log2));
-                    const uint4 * src = (const uint4 *) rw[m][i];
+                for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
-                    for (int j = 0; j < NU; ++j) {
-                        const int u = sl + (j << lpr_log2);
-                        if (j < NU - 1 || u < seg_units) {
-                            dsm[u] = __ldg(src + u);
+                    for (int i = 0; i < R; ++i) {
+                        unit_t       * dsm = (unit_t *) (smw + ((ms*R + i) * WB << lpr_log2));
+                        const unit_t * src = (const unit_t *) rw[g*MS + ms][i];
+#pragma unroll
+                        for (int j = 0; j < NU; ++j) {
+                            const int u = sl + (j << lpr_log2);
+                            if (j < NU - 1 || u < seg_units) {
+                                dsm[u] = __ldg(src + u);
+                            }
                         }
                     }
                 }
+                __syncwarp();
             }
-            __syncwarp();
-        }
-        // sa: every row's chunk goes into registers before the first token, because the warp barriers between tokens
-        // keep the compiler from reusing the chunks it loaded for the previous token (without sa it reuses them)
-        [[maybe_unused]] uint32_t wr[sa ? M : 1][sa ? R : 1][WB / 4];
-        if constexpr (sa) {
-#pragma unroll
-            for (int m = 0; m < M; ++m) {
-#pragma unroll
-                for (int i = 0; i < R; ++i) {
-                    if constexpr (staged) {
-                        mmvqp_lds_words<WB, mmvqp_gcd(WB, 16)>(wr[m][i], smw + ((m*R + i) * WB << lpr_log2) + sl * WB);
-                    } else {
-                        mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(wr[m][i], rw[m][i]);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < NC; ++j) {
-            if (j >= nt) {
-                break;
-            }
-            mmvqp_act<NA> a;
+            // sa: every row's chunk goes into registers before the first token, because the warp barriers between
+            // tokens keep the compiler from reusing the chunks it loaded for the previous token (without sa it reuses
+            // them)
+            [[maybe_unused]] uint32_t wr[sa ? MS : 1][sa ? R : 1][(WB + 3) / 4];
             if constexpr (sa) {
-                // all lane groups of the warp read the same segment of lpr * YB bytes
-                const uint4 * src  = (const uint4 *) (yp - sl * YB + yc[j]);
-                const int     segy = (YB << lpr_log2) >> 4;
-                __syncwarp();
 #pragma unroll
-                for (int u0 = 0; u0 < NY; ++u0) {
-                    const int u = lane + u0 * WARP_SIZE;
-                    if (u < segy) {
-                        sm_y[threadIdx.y][u] = __ldg(src + u);
-                    }
-                }
-                __syncwarp();
-                mmvqp_load_act<type, NA, MMVQP_SRC_SMEM>(a, (const char *) sm_y[threadIdx.y] + sl * YB);
-            } else {
-                mmvqp_load_act<type, NA>(a, yp + yc[j]);
-            }
+                for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
-            for (int m = 0; m < M; ++m) {
-#pragma unroll
-                for (int i = 0; i < R; ++i) {
-                    if constexpr (sa) {
-                        acc[j][m][i] = mmvqp_dot<type, C>(wr[m][i], a, acc[j][m][i]);
-                    } else {
-                        uint32_t w[WB / 4];
+                    for (int i = 0; i < R; ++i) {
                         if constexpr (staged) {
-                            mmvqp_lds_words<WB, mmvqp_gcd(WB, 16)>(w, smw + ((m*R + i) * WB << lpr_log2) + sl * WB);
+                            mmvqp_lds_chunk<type, WB>(wr[ms][i], smw + ((ms*R + i) * WB << lpr_log2) + sl * WB);
                         } else {
-                            mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(w, rw[m][i]);
+                            mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(wr[ms][i], rw[g*MS + ms][i]);
                         }
-                        acc[j][m][i] = mmvqp_dot<type, C>(w, a, acc[j][m][i]);
                     }
                 }
             }
-        }
-        if constexpr (staged) {
-            __syncwarp();
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                if (j >= nt) {
+                    break;
+                }
+                mmvqp_act<NA> a;
+                if constexpr (sa) {
+                    // all lane groups of the warp read the same segment of lpr * YB bytes
+                    const uint4 * src  = (const uint4 *) (yp - sl * YB + yc[j]);
+                    const int     segy = (YB << lpr_log2) >> 4;
+                    __syncwarp();
+#pragma unroll
+                    for (int u0 = 0; u0 < NY; ++u0) {
+                        const int u = lane + u0 * WARP_SIZE;
+                        if (u < segy) {
+                            sm_y[threadIdx.y][u] = __ldg(src + u);
+                        }
+                    }
+                    __syncwarp();
+                    mmvqp_load_act<type, NA, MMVQP_SRC_SMEM>(a, (const char *) sm_y[threadIdx.y] + sl * YB);
+                } else {
+                    mmvqp_load_act<type, NA>(a, yp + yc[j]);
+                }
+#pragma unroll
+                for (int ms = 0; ms < MS; ++ms) {
+#pragma unroll
+                    for (int i = 0; i < R; ++i) {
+                        const int m = g*MS + ms;
+                        if constexpr (sa) {
+                            acc[j][m][i] = mmvqp_dot<type, C>(wr[ms][i], a, acc[j][m][i]);
+                        } else {
+                            uint32_t w[(WB + 3) / 4];
+                            if constexpr (staged) {
+                                mmvqp_lds_chunk<type, WB>(w, smw + ((ms*R + i) * WB << lpr_log2) + sl * WB);
+                            } else {
+                                mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(w, rw[m][i]);
+                            }
+                            acc[j][m][i] = mmvqp_dot<type, C>(w, a, acc[j][m][i]);
+                        }
+                    }
+                }
+            }
+            if constexpr (staged) {
+                __syncwarp();
+            }
         }
 #pragma unroll
         for (int m = 0; m < M; ++m) {
@@ -553,52 +614,61 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
 }
 
 // The single-token kernel for one token, the multi-token one for more.
-template <ggml_type type, int R, int C, bool staged, int fk>
+template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
 static void mmvqp_launch_kernel(const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args_device & fusion, const dim3 grid,
                                 cudaStream_t stream) {
     const dim3 block(WARP_SIZE, MMVQ_PASCAL_NWARPS, 1);
     if constexpr (mmvqp_fits<type, R, C, staged, fk == MMVQP_GATE>()) {
         if (p.ncols == 1) {
-            mul_mat_vec_q_pascal<type, R, C, staged, fk><<<grid, block, 0, stream>>>(p, fusion);
+            mul_mat_vec_q_pascal<type, R, C, staged, fk, SU><<<grid, block, 0, stream>>>(p, fusion);
             return;
         }
         if constexpr (mmvqp_fits_mc<type, R, C, staged, fk == MMVQP_GATE, true>()) {
             if (p.stage_act) {
-                mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, true><<<grid, block, 0, stream>>>(p, fusion);
+                mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, true, SU><<<grid, block, 0, stream>>>(p, fusion);
                 return;
             }
         }
-        mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, false><<<grid, block, 0, stream>>>(p, fusion);
+        mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, false, SU><<<grid, block, 0, stream>>>(p, fusion);
     } else {
         GGML_ABORT("fatal error");
     }
 }
 
-template <ggml_type type, int R, int C, bool staged>
+template <ggml_type type, int R, int C, bool staged, int SU = 16>
 static void mmvqp_launch(const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args_device & fusion, const int fk,
                          const dim3 grid, cudaStream_t stream) {
     switch (fk) {
         case MMVQP_PLAIN:
-            mmvqp_launch_kernel<type, R, C, staged, MMVQP_PLAIN>(p, fusion, grid, stream);
+            mmvqp_launch_kernel<type, R, C, staged, MMVQP_PLAIN, SU>(p, fusion, grid, stream);
             break;
         case MMVQP_BIAS:
-            mmvqp_launch_kernel<type, R, C, staged, MMVQP_BIAS>(p, fusion, grid, stream);
+            mmvqp_launch_kernel<type, R, C, staged, MMVQP_BIAS, SU>(p, fusion, grid, stream);
             break;
         default:
-            mmvqp_launch_kernel<type, R, C, staged, MMVQP_GATE>(p, fusion, grid, stream);
+            mmvqp_launch_kernel<type, R, C, staged, MMVQP_GATE, SU>(p, fusion, grid, stream);
             break;
     }
 }
 
+// su: bytes per staging load (16; Q6_K also 8 and 4)
 template <ggml_type type>
 static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args_device & fusion,
-                               const int fk, const dim3 grid, cudaStream_t stream) {
+                               const int fk, const dim3 grid, cudaStream_t stream, const int su) {
 #define MMVQP_CASE(R_, C_, S_)                                              \
     if (s.R == R_ && s.C == C_ && s.staged == S_) {                         \
         mmvqp_launch<type, R_, C_, S_>(p, fusion, fk, grid, stream);        \
         return;                                                             \
     }
-    if constexpr (type == GGML_TYPE_Q4_1) {
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        if (s.R == 1 && s.C == 1 && s.staged) {
+            switch (su) {
+                case 16: mmvqp_launch<type, 1, 1, true, 16>(p, fusion, fk, grid, stream); return;
+                case 8:  mmvqp_launch<type, 1, 1, true, 8>(p, fusion, fk, grid, stream);  return;
+                default: mmvqp_launch<type, 1, 1, true, 4>(p, fusion, fk, grid, stream);  return;
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_Q4_1) {
         MMVQP_CASE(2, 4, true)
         MMVQP_CASE(2, 4, false)
         MMVQP_CASE(2, 2, true)
@@ -621,6 +691,7 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
         MMVQP_CASE(2, 2, false)
     }
 #undef MMVQP_CASE
+    GGML_UNUSED(su);
     GGML_ABORT("fatal error");
 }
 
@@ -674,7 +745,7 @@ bool ggml_cuda_mmvq_pascal(
         return false;
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
-            type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS) {
+            type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K) {
         return false;
     }
     if (fusion.x_scale || fusion.gate_scale) {
@@ -706,11 +777,26 @@ bool ggml_cuda_mmvq_pascal(
             mmvqp_aligned(fusion.shared_gate, al) && row_bytes % al == 0 && (stride_channel_x * bs) % al == 0 &&
             (stride_sample_x * bs) % al == 0;
     };
-    if (s.staged && (((s.C * bs) << lpr_log2) % 16 != 0 || !x_aligned(16))) {
-        s.staged = false;
-    }
-    if (row_bytes > INT_MAX || (!s.staged && !x_aligned(mmvqp_gcd((int) (s.C * bs), 16)))) {
-        return false;
+    int su = 16;
+    if (type == GGML_TYPE_Q6_K) {
+        // staged only (2-byte-aligned blocks), with the widest loads the rows and the segment allow
+        su = 0;
+        for (const int u : { 16, 8, 4 }) {
+            if (((s.C * bs) << lpr_log2) % u == 0 && x_aligned(u)) {
+                su = u;
+                break;
+            }
+        }
+        if (su == 0 || row_bytes > INT_MAX) {
+            return false;
+        }
+    } else {
+        if (s.staged && (((s.C * bs) << lpr_log2) % 16 != 0 || !x_aligned(16))) {
+            s.staged = false;
+        }
+        if (row_bytes > INT_MAX || (!s.staged && !x_aligned(mmvqp_gcd((int) (s.C * bs), 16)))) {
+            return false;
+        }
     }
     const int64_t aly = mmvqp_gcd((int) (s.C * (ggml_blck_size(type) / QK8_1) * sizeof(block_q8_1)), 16);
     if (!mmvqp_aligned(vy, aly) || (stride_channel_y * (int64_t) sizeof(block_q8_1)) % aly != 0 ||
@@ -769,12 +855,13 @@ bool ggml_cuda_mmvq_pascal(
                     (unsigned) (nblocks_y + (fusion.shared_up ? 1 : 0)), (unsigned) nsamples_dst);
 
     switch (type) {
-        case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream); break;
-        case GGML_TYPE_Q4_1: mmvqp_launch_shape<GGML_TYPE_Q4_1>(s, p, fusion, fk, grid, stream); break;
-        case GGML_TYPE_Q5_0: mmvqp_launch_shape<GGML_TYPE_Q5_0>(s, p, fusion, fk, grid, stream); break;
-        case GGML_TYPE_Q5_K: mmvqp_launch_shape<GGML_TYPE_Q5_K>(s, p, fusion, fk, grid, stream); break;
-        case GGML_TYPE_IQ4_XS: mmvqp_launch_shape<GGML_TYPE_IQ4_XS>(s, p, fusion, fk, grid, stream); break;
-        case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream); break;
+        case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_Q4_1: mmvqp_launch_shape<GGML_TYPE_Q4_1>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_Q5_0: mmvqp_launch_shape<GGML_TYPE_Q5_0>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_Q5_K: mmvqp_launch_shape<GGML_TYPE_Q5_K>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_IQ4_XS: mmvqp_launch_shape<GGML_TYPE_IQ4_XS>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_Q6_K: mmvqp_launch_shape<GGML_TYPE_Q6_K>(s, p, fusion, fk, grid, stream, su); break;
         default:             GGML_ABORT("fatal error");
     }
     return true;
