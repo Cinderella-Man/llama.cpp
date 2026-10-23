@@ -108,6 +108,7 @@ struct llama_context {
     size_t get_sampled_candidates_count(int32_t idx);
 
     bool get_causal_attn() const;
+    bool get_screen_head() const;
 
     void attach_threadpool(
             ggml_threadpool_t threadpool,
@@ -128,6 +129,7 @@ struct llama_context {
     bool supports_embd_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    void set_screen_head(bool value);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

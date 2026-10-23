@@ -918,6 +918,8 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
+            cparams.screen_head             == other.cparams.screen_head             &&
+            cparams.screen_head_m           == other.cparams.screen_head_m           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1479,6 +1481,10 @@ struct llm_graph_context {
     //
 
     void build_logits() const;
+
+    // replaces a plain output head product (res->t_logits = output x h, one output row) by the screened head:
+    // output_screen ranks all tokens, the output tensor gives exact logits for the top m, all others are -INFINITY
+    void build_screen_head(ggml_tensor * output, ggml_tensor * output_screen, uint32_t m) const;
 
     //
     // sampling (backend sampling)
