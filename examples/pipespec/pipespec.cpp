@@ -31,6 +31,8 @@
 //                           cell that is still visible
 //   --pipe-state-out FILE   the sequence's KV state (llama_state_seq_get_data) after generation
 //   --pipe-trace FILE       one line per sampled token: microseconds since the first submit, guesses in flight, outcome
+//   --pipe-backend-greedy   greedy sampling on the GPU (llama_set_sampler) in both modes: only the token id comes back
+//                           instead of the logits; the logits hashes then hash the token ids
 
 #include "arg.h"
 #include "chat.h"
@@ -52,6 +54,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+// greedy sampling on the device that computes the logits (--pipe-backend-greedy)
+static bool g_backend_greedy = false;
 
 struct pipe_job {
     std::string name     = "run";
@@ -110,6 +115,10 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
         }
         if (a == "--pipe-chat") {
             def.chat = true;
+            continue;
+        }
+        if (a == "--pipe-backend-greedy") {
+            g_backend_greedy = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -311,8 +320,17 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         hashes.push_back(fnv1a(logits, sizeof(float)*n_vocab));
         return id;
     };
+    auto take_id = [&](llama_token id) {
+        gen.push_back(id);
+        hashes.push_back(fnv1a(&id, sizeof(id)));
+        return id;
+    };
 
-    take(llama_get_logits_ith(ctx, -1));
+    if (g_backend_greedy) {
+        take_id(llama_get_sampled_token_ith(ctx, -1));
+    } else {
+        take(llama_get_logits_ith(ctx, -1));
+    }
 
     // stats
     int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0;
@@ -339,7 +357,11 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                 return false;
             }
             n_submit++;
-            take(llama_get_logits_ith(ctx, -1));
+            if (g_backend_greedy) {
+                take_id(llama_get_sampled_token_ith(ctx, -1));
+            } else {
+                take(llama_get_logits_ith(ctx, -1));
+            }
             if (!job.trace.empty()) {
                 trace.push_back({ ggml_time_us() - t_gen_start, 0, 'p' });
             }
@@ -508,7 +530,8 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             const entry cur = win.front();
             win.pop_front();
 
-            const llama_token id = take(llama_pipe_get_logits(ctx, cur.slot));
+            const llama_token id = g_backend_greedy ? take_id(llama_pipe_get_sampled(ctx, cur.slot))
+                                                    : take(llama_pipe_get_logits(ctx, cur.slot));
             hist.push_back(id);
 
             char outcome = 'n'; // no guess in flight
@@ -613,7 +636,12 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                 LOG_ERR("%s: probe decode failed\n", __func__);
                 return false;
             }
-            ph.push_back(fnv1a(llama_get_logits_ith(ctx, -1), sizeof(float)*n_vocab));
+            if (g_backend_greedy) {
+                const llama_token pid = llama_get_sampled_token_ith(ctx, -1);
+                ph.push_back(fnv1a(&pid, sizeof(pid)));
+            } else {
+                ph.push_back(fnv1a(llama_get_logits_ith(ctx, -1), sizeof(float)*n_vocab));
+            }
         }
         h_probe = fnv1a(ph.data(), ph.size()*sizeof(uint64_t));
     }
@@ -693,6 +721,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_sampler * smpl_backend = nullptr;
+    if (g_backend_greedy) {
+        if (params.sampling.temp > 0.0f) {
+            LOG_ERR("%s: --pipe-backend-greedy needs --temp 0\n", __func__);
+            return 1;
+        }
+        smpl_backend = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(smpl_backend, llama_sampler_init_greedy());
+        if (!llama_set_sampler(ctx, 0, smpl_backend)) {
+            LOG_ERR("%s: the greedy sampler cannot run on the backend\n", __func__);
+            return 1;
+        }
+    }
+
     if (depth_max >= 0) {
         const int n = n_slots > 0 ? n_slots : 2*(depth_max + 1);
         if (llama_pipe_init(ctx, n) != 0) {
@@ -714,6 +756,10 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_free();
+
+    if (smpl_backend) {
+        llama_sampler_free(smpl_backend);
+    }
 
     return n_failed == 0 ? 0 : 1;
 }

@@ -1617,8 +1617,8 @@ int32_t llama_context::pipe_init(int32_t n_slots) {
         LLAMA_LOG_ERROR("%s: pipelined decoding needs a causal decoder context with a memory module\n", __func__);
         return -1;
     }
-    if (!sampling.samplers.empty()) {
-        LLAMA_LOG_ERROR("%s: backend sampling is not supported by pipelined decoding\n", __func__);
+    if (sampling.samplers.size() > 1) {
+        LLAMA_LOG_ERROR("%s: pipelined decoding supports backend sampling for one sequence only\n", __func__);
         return -1;
     }
     if (n_slots < 1) {
@@ -1766,6 +1766,10 @@ int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos 
         return -2;
     }
 
+    for (const auto & entry : sampling.samplers) {
+        llama_sampler_backend_begin(entry.second);
+    }
+
     const auto save_n_outputs = this->n_outputs;
     this->n_outputs = 1;
 
@@ -1815,13 +1819,23 @@ int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos 
         return -3;
     }
 
-    ggml_tensor * t_logits = slot.res->get_logits();
-    GGML_ASSERT(t_logits != nullptr);
+    // with a backend sampler only the sampled token comes back, otherwise the logits
+    ggml_tensor * t_out = nullptr;
+    size_t        n_out = 0;
+    if (!sampling.samplers.empty()) {
+        GGML_ASSERT(!slot.res->t_sampled.empty() && slot.res->t_sampled[0] != nullptr);
+        t_out = slot.res->t_sampled[0];
+        n_out = sizeof(llama_token);
+    } else {
+        t_out = slot.res->get_logits();
+        n_out = model.vocab.n_tokens()*sizeof(float);
+    }
+    GGML_ASSERT(t_out != nullptr);
 
-    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(slot.sched.get(), t_logits);
+    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(slot.sched.get(), t_out);
     GGML_ASSERT(backend_res != nullptr);
 
-    ggml_backend_tensor_get_async(backend_res, t_logits, slot.logits, 0, model.vocab.n_tokens()*sizeof(float));
+    ggml_backend_tensor_get_async(backend_res, t_out, slot.logits, 0, n_out);
 
     ggml_backend_dev_t dev_res = ggml_backend_get_device(backend_res);
     if (slot.ev_out == nullptr || slot.ev_dev != dev_res) {
@@ -1857,6 +1871,19 @@ float * llama_context::pipe_get_logits(int32_t i_slot) {
     }
 
     return slot.logits;
+}
+
+llama_token llama_context::pipe_get_sampled(int32_t i_slot) {
+    if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size() || sampling.samplers.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const float * out = pipe_get_logits(i_slot);
+
+    llama_token id;
+    memcpy(&id, out, sizeof(id));
+
+    return id;
 }
 
 void llama_context::pipe_drain() {
@@ -4938,6 +4965,10 @@ int32_t llama_pipe_submit(llama_context * ctx, int32_t slot, llama_token token, 
 
 float * llama_pipe_get_logits(llama_context * ctx, int32_t slot) {
     return ctx->pipe_get_logits(slot);
+}
+
+llama_token llama_pipe_get_sampled(llama_context * ctx, int32_t slot) {
+    return ctx->pipe_get_sampled(slot);
 }
 
 void llama_pipe_drain(llama_context * ctx) {

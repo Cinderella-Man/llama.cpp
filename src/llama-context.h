@@ -270,6 +270,7 @@ public:
     int32_t pipe_n_slots() const { return (int32_t) pipe_slots.size(); }
     int32_t pipe_submit(int32_t i_slot, llama_token token, llama_pos pos, llama_seq_id seq_id);
     float * pipe_get_logits(int32_t i_slot);
+    llama_token pipe_get_sampled(int32_t i_slot);
     void    pipe_drain();
 
 private:
