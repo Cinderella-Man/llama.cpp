@@ -11372,7 +11372,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one-token products at the shapes of a large MoE model (Flint: hidden 2048, 32 x 128 query heads, 4 x 128 KV
     // heads, 256 experts of width 512 with 6 used, a 1024-wide shared expert), and an odd row count; these reach the
     // full-width paths of the Pascal matrix-vector kernels (mmvq-pascal.cu) that the small cases above don't
-    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                 { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 2048, 1024 }, { 6144, 2048 }, { 2048, 6144 }, { 4097, 2048 } }) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, { 1, 1 }, { 1, 1 }));
