@@ -1009,6 +1009,42 @@ extern "C" {
               struct llama_batch   batch);
 
     //
+    // Pipelined single-token decoding (experimental)
+    //
+    // With the layers split over several devices, a single sequence keeps one device busy at a time. These calls queue
+    // one-token evaluations behind each other without waiting, so a later token (for example a guessed one) runs on the
+    // first devices while earlier tokens are still on the later ones. Each in-flight token uses its own slot: its own
+    // scheduler, graph, inputs and output buffer. Every device runs the queued work in submission order, so each
+    // layer's KV cache sees the tokens in order.
+    //
+    // Usage, one sequence:
+    //   llama_pipe_init(ctx, n_slots) after the prompt has been decoded with llama_decode
+    //   llama_pipe_submit(ctx, slot, token, pos, seq_id) with pos = llama_memory_seq_pos_max(mem, seq_id) + 1
+    //   llama_pipe_get_logits(ctx, slot) waits for that token's logits
+    // To drop submitted tokens (a wrong guess), remove their positions with llama_memory_seq_rm(mem, seq_id, p, -1)
+    // and submit the right token at p: their work still finishes on the devices, ahead of the new token, and their
+    // slots are reused only after it has. llama_decode waits for all submitted work first.
+    // Backend sampling is not supported.
+    LLAMA_API int32_t llama_pipe_init(struct llama_context * ctx, int32_t n_slots);
+
+    // Number of slots set by llama_pipe_init (0 before)
+    LLAMA_API int32_t llama_pipe_n_slots(const struct llama_context * ctx);
+
+    // Returns 0 on success, 1 if no memory slot was found, < 0 on error
+    LLAMA_API int32_t llama_pipe_submit(
+            struct llama_context * ctx,
+                         int32_t   slot,
+                     llama_token   token,
+                       llama_pos   pos,
+                    llama_seq_id   seq_id);
+
+    // Waits for the logits of the token last submitted in this slot ([n_vocab] floats, valid until it is reused)
+    LLAMA_API float * llama_pipe_get_logits(struct llama_context * ctx, int32_t slot);
+
+    // Waits for all submitted tokens
+    LLAMA_API void llama_pipe_drain(struct llama_context * ctx);
+
+    //
     // Extended batch API
     //
 
