@@ -31,6 +31,7 @@
 //                           cell that is still visible
 //   --pipe-state-out FILE   the sequence's KV state (llama_state_seq_get_data) after generation
 //   --pipe-trace FILE       one line per sampled token: microseconds since the first submit, guesses in flight, outcome
+//                           (h right guess behind it, m wrong, n none, p plain, r a raced sample's token)
 //   --pipe-backend-greedy   greedy sampling on the GPU (llama_set_sampler) in both modes: only the token id comes back
 //                           instead of the logits; the logits hashes then hash the token ids
 //   --pipe-race K           race K samples of the request (sequences 0..K-1 share the prompt's KV, seeds seed..seed+K-1)
@@ -363,6 +364,13 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     // stats
     int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0;
 
+    struct trace_row { int64_t t_us; int inflight; char outcome; };
+    std::vector<trace_row> trace;
+
+    // generation time includes the race; t_race is the time until the race ended
+    const int64_t t_gen_start = ggml_time_us();
+    double        t_race      = 0.0;
+
     // race: K samples of the request, one sequence each, until one emits the stop text
     int      race_winner = -1;
     int      race_tokens = 0;
@@ -387,6 +395,9 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             rgen[s].push_back(id);
             rhash[s].push_back(fnv1a(logits, sizeof(float)*n_vocab));
             race_tokens++;
+            if (!job.trace.empty()) {
+                trace.push_back({ ggml_time_us() - t_gen_start, n_race - 1, 'r' });
+            }
             return id;
         };
         // true if sample s is done: the stop text, end of generation or the token limit
@@ -498,6 +509,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             all.push_back(fnv1a(rhash[s].data(), rhash[s].size()*sizeof(uint64_t)));
         }
         race_hash = fnv1a(all.data(), all.size()*sizeof(uint64_t));
+        t_race    = (ggml_time_us() - t_gen_start)/1e6;
 
         seq    = race_winner;
         smpl   = smpls[seq].get();
@@ -512,10 +524,6 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     double depth_sum = 0.0;
     int    depth_n   = 0;
 
-    struct trace_row { int64_t t_us; int inflight; char outcome; };
-    std::vector<trace_row> trace;
-
-    const int64_t t_gen_start = ggml_time_us();
 
     auto done = [&]() {
         return (int) gen.size() >= n_predict || llama_vocab_is_eog(vocab, gen.back());
@@ -819,12 +827,12 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     const int n_gen = (int) gen.size();
     LOG_INF("PIPESPEC name=%s mode=%s guess=%s depth=%d n_prompt=%d n_gen=%d t_gen=%.3f tok_s=%.3f submits=%d guesses=%d "
             "hits=%d misses=%d wasted=%d avg_inflight_guesses=%.3f tokens=%016" PRIx64 " logits=%016" PRIx64 " state=%016" PRIx64
-            " probe=%016" PRIx64 " race=%d winner=%d race_tokens=%d race_hash=%016" PRIx64 "\n",
+            " probe=%016" PRIx64 " race=%d winner=%d race_tokens=%d t_race=%.3f race_hash=%016" PRIx64 "\n",
             job.name.c_str(), job.mode.c_str(), job.mode == "plain" ? "-" : job.guess.c_str(), job.mode == "plain" ? 0 : job.depth,
             n_prompt, n_gen, t_gen, (n_gen - 1)/t_gen, n_submit, n_guess, n_hit, n_miss, n_wasted,
             depth_n ? depth_sum/depth_n : 0.0,
             fnv1a(gen.data(), gen.size()*sizeof(llama_token)), fnv1a(hashes.data(), hashes.size()*sizeof(uint64_t)),
-            h_state, h_probe, n_race, race_winner, race_tokens, race_hash);
+            h_state, h_probe, n_race, race_winner, race_tokens, t_race, race_hash);
 
     return true;
 }
