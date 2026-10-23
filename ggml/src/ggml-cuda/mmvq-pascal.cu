@@ -15,6 +15,9 @@
 //     are 32 bits wide and strided.
 //   - 4-bit codes are unpacked with masks only: dp4a on (q & 0x0F0F0F0F) and an unsigned-by-signed dp4a on
 //     (q & 0xF0F0F0F0), combined as (lo << 4) + hi, with the factor 1/16 moved into the activation scale.
+//   - Q5_0's fifth bits stay where they are: a block's sum splits into sum(nibble * a) + 16 * sum(bit * a), and
+//     (qh >> j) & 0x01010101 holds the fifth bits of weights j, 8 + j, 16 + j and 24 + j, so the activations are
+//     regrouped the same way once per block (two 4 x 4 byte transposes), shared by all rows.
 //   - Row pointers are computed once and advanced by a constant; partial sums are reduced with warp shuffles only.
 // The expert path (ids), the routed + shared expert launch (fusion.shared_up), biases and the GLU epilogue follow
 // mul_mat_vec_q exactly.
@@ -26,6 +29,7 @@ namespace {
 template <ggml_type type> struct mmvqp_traits;
 template <> struct mmvqp_traits<GGML_TYPE_Q4_0> { static constexpr int bs = sizeof(block_q4_0); };
 template <> struct mmvqp_traits<GGML_TYPE_Q4_1> { static constexpr int bs = sizeof(block_q4_1); };
+template <> struct mmvqp_traits<GGML_TYPE_Q5_0> { static constexpr int bs = sizeof(block_q5_0); };
 template <> struct mmvqp_traits<GGML_TYPE_Q8_0> { static constexpr int bs = sizeof(block_q8_0); };
 
 constexpr __host__ __device__ int mmvqp_gcd(const int a, const int b) {
@@ -112,9 +116,23 @@ static __device__ __forceinline__ uint32_t mmvqp_u16_at(const uint32_t * w, cons
 template <int NA>
 struct mmvqp_act {
     int   u[NA][8];
-    float d[NA];  // d8 (Q8_0) or d8 / 16 (4-bit types)
-    float s[NA];  // s8 (Q4_1) or -8 * s8 (Q4_0)
+    int   t[NA][8];  // Q5_0 only: t[j] = bytes a[j], a[8 + j], a[16 + j], a[24 + j] of the block
+    float d[NA];     // d8 (Q8_0) or d8 / 16 (4- and 5-bit types)
+    float s[NA];     // s8 (Q4_1), -8 * s8 (Q4_0) or -16 * s8 (Q5_0)
 };
+
+// 4 x 4 byte transpose: out[j] = bytes j of x0, x1, x2, x3.
+static __device__ __forceinline__ void mmvqp_transpose4(
+        const uint32_t x0, const uint32_t x1, const uint32_t x2, const uint32_t x3, int * out) {
+    const uint32_t a = __byte_perm(x0, x1, 0x5140);
+    const uint32_t b = __byte_perm(x0, x1, 0x7362);
+    const uint32_t c = __byte_perm(x2, x3, 0x5140);
+    const uint32_t d = __byte_perm(x2, x3, 0x7362);
+    out[0] = (int) __byte_perm(a, c, 0x5410);
+    out[1] = (int) __byte_perm(a, c, 0x7632);
+    out[2] = (int) __byte_perm(b, d, 0x5410);
+    out[3] = (int) __byte_perm(b, d, 0x7632);
+}
 
 template <ggml_type type, int NA>
 static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const char * p) {
@@ -135,6 +153,11 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
         } else if constexpr (type == GGML_TYPE_Q4_0) {
             a.d[b] = d8 * 0.0625f;
             a.s[b] = -8.0f * s8;
+        } else if constexpr (type == GGML_TYPE_Q5_0) {
+            a.d[b] = d8 * 0.0625f;
+            a.s[b] = -16.0f * s8;
+            mmvqp_transpose4(a.u[b][0], a.u[b][2], a.u[b][4], a.u[b][6], a.t[b] + 0);
+            mmvqp_transpose4(a.u[b][1], a.u[b][3], a.u[b][5], a.u[b][7], a.t[b] + 4);
         } else {
             a.d[b] = d8 * 0.0625f;
             a.s[b] = s8;
@@ -175,6 +198,17 @@ static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvq
             const float d = mmvqp_h2f_lo(mmvqp_u16_at(w, o));
             const int isum = mmvqp_q4_isum16(mmvqp_word_at(w, o + 2), mmvqp_word_at(w, o + 6), mmvqp_word_at(w, o + 10),
                                              mmvqp_word_at(w, o + 14), a.u[b]);
+            acc = fmaf(d, fmaf((float) isum, a.d[b], a.s[b]), acc);
+        } else if constexpr (type == GGML_TYPE_Q5_0) {
+            const float    d  = mmvqp_h2f_lo(mmvqp_u16_at(w, o));
+            const uint32_t qh = mmvqp_word_at(w, o + 2);
+            int hsum = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                hsum = ggml_cuda_dp4a((int) ((qh >> j) & 0x01010101), a.t[b][j], hsum);
+            }
+            const int isum = mmvqp_q4_isum16(mmvqp_word_at(w, o + 6), mmvqp_word_at(w, o + 10), mmvqp_word_at(w, o + 14),
+                                             mmvqp_word_at(w, o + 18), a.u[b]) + (hsum << 8);
             acc = fmaf(d, fmaf((float) isum, a.d[b], a.s[b]), acc);
         } else { // GGML_TYPE_Q8_0
             const float d = mmvqp_h2f_lo(mmvqp_u16_at(w, o));
@@ -385,6 +419,8 @@ static mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate) {
             return gate ? mmvqp_shape{ 2, 2, true } : mmvqp_shape{ 2, 4, true };
         case GGML_TYPE_Q4_0:
             return { 2, 2, true };
+        case GGML_TYPE_Q5_0:
+            return gate ? mmvqp_shape{ 1, 2, true } : mmvqp_shape{ 2, 2, true };
         case GGML_TYPE_Q8_0:
             return gate ? mmvqp_shape{ 1, 2, true } : mmvqp_shape{ 2, 2, true };
         default:
@@ -437,6 +473,11 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args & p, const 
     } else if constexpr (type == GGML_TYPE_Q4_0) {
         MMVQP_CASE(2, 2, true)
         MMVQP_CASE(2, 2, false)
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        MMVQP_CASE(1, 2, true)
+        MMVQP_CASE(1, 2, false)
+        MMVQP_CASE(2, 2, true)
+        MMVQP_CASE(2, 2, false)
     } else {
         MMVQP_CASE(1, 2, true)
         MMVQP_CASE(1, 2, false)
@@ -475,7 +516,7 @@ bool ggml_cuda_mmvq_pascal(
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (mode == 1 && cc != GGML_CUDA_CC_DP4A)) {
         return false;
     }
-    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q8_0) {
+    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0) {
         return false;
     }
     if (fusion.x_scale || fusion.gate_scale) {
@@ -542,6 +583,7 @@ bool ggml_cuda_mmvq_pascal(
     switch (type) {
         case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream); break;
         case GGML_TYPE_Q4_1: mmvqp_launch_shape<GGML_TYPE_Q4_1>(s, p, fusion, fk, grid, stream); break;
+        case GGML_TYPE_Q5_0: mmvqp_launch_shape<GGML_TYPE_Q5_0>(s, p, fusion, fk, grid, stream); break;
         case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream); break;
         default:             GGML_ABORT("fatal error");
     }
