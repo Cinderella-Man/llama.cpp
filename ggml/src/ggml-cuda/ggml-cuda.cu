@@ -77,6 +77,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -4572,6 +4573,112 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_PROFILE=<file>: times every launch group (one node, or one group of fused nodes) of every graph evaluation
+// with CUDA events recorded between the groups and writes one CSV line per group to <file>. Under stream capture the
+// events become event-record nodes of the CUDA graph, so graph launches are timed as they run. NVIDIA's profilers
+// refuse the CMP mining GPUs (P106 and others); this works on any GPU. The stream is synchronized after every
+// evaluation, and each event adds a little GPU time.
+struct ggml_cuda_profile_graph {
+    std::vector<cudaEvent_t> events;  // events[k] before group k, events[k + 1] after it
+    std::vector<std::string> labels;
+};
+
+struct ggml_cuda_profile_state {
+    FILE * f = nullptr;
+    std::mutex mutex;
+    std::map<std::pair<const void *, const void *>, ggml_cuda_profile_graph> graphs; // (context, graph key)
+    std::map<int, int64_t> n_eval;                                                      // per device
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+};
+
+static ggml_cuda_profile_state * ggml_cuda_profile() {
+    static ggml_cuda_profile_state * state = []() -> ggml_cuda_profile_state * {
+        const char * path = getenv("GGML_CUDA_PROFILE");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        ggml_cuda_profile_state * st = new ggml_cuda_profile_state;
+        st->f = fopen(path, "w");
+        GGML_ASSERT(st->f != nullptr);
+        fprintf(st->f, "device,eval,host_ms,group,label,us\n");
+        GGML_LOG_INFO("%s: timing every launch group into %s\n", __func__, path);
+        return st;
+    }();
+    return state;
+}
+
+// "blk.12.ffn_up_exps.weight" -> "ffn_up_exps", "attn_norm-12" -> "attn_norm"
+static std::string ggml_cuda_profile_name(const char * name) {
+    std::string n = name;
+    if (n.rfind("blk.", 0) == 0) {
+        const size_t dot = n.find('.', 4);
+        n = dot == std::string::npos ? n : n.substr(dot + 1);
+    }
+    const size_t w = n.rfind(".weight");
+    if (w != std::string::npos) {
+        n = n.substr(0, w);
+    }
+    const size_t dash = n.rfind('-');
+    if (dash != std::string::npos && dash + 1 < n.size() && n.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
+        n = n.substr(0, dash);
+    }
+    for (char & c : n) {
+        if (c == ',' || c == ' ') {
+            c = '_';
+        }
+    }
+    return n;
+}
+
+// The ops of nodes i0..i1, then each matrix product's weight name, type and shape (K x N), e.g.
+// "MUL_MAT_ID+MUL_MAT_ID+GLU ffn_up_exps:q5_0:2048x512 ffn_gate_exps:q5_0:2048x512"
+static std::string ggml_cuda_profile_label(const ggml_cgraph * cgraph, const int i0, const int i1) {
+    std::string ops;
+    std::string weights;
+    for (int i = i0; i <= i1; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (!ops.empty()) {
+            ops += "+";
+        }
+        ops += ggml_op_desc(node);
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != nullptr) {
+            const ggml_tensor * w = node->src[0];
+            weights += " " + ggml_cuda_profile_name(w->name) + ":" + ggml_type_name(w->type) + ":" +
+                std::to_string(w->ne[0]) + "x" + std::to_string(w->ne[1]);
+        }
+    }
+    if (weights.empty()) {
+        weights = " " + ggml_cuda_profile_name(cgraph->nodes[i0]->name);
+    }
+    return ops + weights;
+}
+
+static void ggml_cuda_profile_record(ggml_cuda_profile_graph & pg, const size_t k, cudaStream_t stream) {
+    while (pg.events.size() <= k) {
+        cudaEvent_t ev;
+        CUDA_CHECK(cudaEventCreate(&ev));
+        pg.events.push_back(ev);
+    }
+    CUDA_CHECK(cudaEventRecordWithFlags(pg.events[k], stream, cudaEventRecordExternal));
+}
+
+static void ggml_cuda_profile_write(ggml_cuda_profile_state * prof, ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    std::lock_guard<std::mutex> lock(prof->mutex);
+    const ggml_cuda_profile_graph & pg = prof->graphs[{ cuda_ctx, graph_key }];
+    const int64_t eval = prof->n_eval[cuda_ctx->device]++;
+    const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prof->t0).count();
+    for (size_t k = 0; k < pg.labels.size(); ++k) {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, pg.events[k], pg.events[k + 1]));
+        fprintf(prof->f, "%d,%" PRId64 ",%.3f,%zu,%s,%.2f\n", cuda_ctx->device, eval, host_ms, k, pg.labels[k].c_str(), 1000.0 * ms);
+    }
+    fflush(prof->f);
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4670,6 +4777,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            ggml_cuda_profile_state * prof = ggml_cuda_profile();
+            ggml_cuda_profile_graph * prof_graph = nullptr;
+            if (prof) {
+                std::lock_guard<std::mutex> lock(prof->mutex);
+                prof_graph = &prof->graphs[{ cuda_ctx, graph_key }];
+                prof_graph->labels.clear();
+                ggml_cuda_profile_record(*prof_graph, 0, cuda_ctx->stream());
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4721,6 +4837,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (prof_graph) {
+                        prof_graph->labels.push_back(ggml_cuda_profile_label(cgraph, i, i + nodes_to_skip));
+                        ggml_cuda_profile_record(*prof_graph, prof_graph->labels.size(), cuda_ctx->stream());
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4746,6 +4866,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (prof_graph) {
+                    prof_graph->labels.push_back(ggml_cuda_profile_label(cgraph, i, i));
+                    ggml_cuda_profile_record(*prof_graph, prof_graph->labels.size(), cuda_ctx->stream());
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4787,6 +4912,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
+    }
+
+    if (ggml_cuda_profile_state * prof = ggml_cuda_profile()) {
+        ggml_cuda_profile_write(prof, cuda_ctx, graph_key);
     }
 }
 
