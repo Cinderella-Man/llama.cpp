@@ -455,6 +455,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
+                // 5-SM Pascal cards at one token: 2 warps per block for rows of >= 2048 values (llama.cpp PR #25479),
+                // the stock 4 warps for the small-K shapes, where 2 warps are slower (this build targets sm_61 only)
+                return small_k ? 4 : 2;
             case 2:
             case 3:
             case 4:
@@ -1144,7 +1147,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
-        const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
+        const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id, /*small_k =*/ true);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
