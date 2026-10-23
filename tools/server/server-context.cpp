@@ -1009,6 +1009,7 @@ public:
     llama_model * model_tgt = nullptr;
 
     uint32_t screen_head_m = 0; // > 0: the screened output head may be used (LLAMA_SCREEN_HEAD=1 and the model has one)
+    int screen_head_state  = -1; // last decision (-1 = none yet), logged when it changes
 
     mtmd_context * mctx = nullptr;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
@@ -4571,6 +4572,10 @@ private:
                 }
             }
             llama_set_screen_head(ctx_tgt, screen);
+            if ((int) screen != screen_head_state) {
+                SRV_INF("screened output head %s\n", screen ? "on" : "off");
+                screen_head_state = screen;
+            }
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
