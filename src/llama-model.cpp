@@ -2133,6 +2133,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN3NEXT:
+            case LLM_ARCH_FLINT:
                 break;
             default:
                 throw std::runtime_error(format(
