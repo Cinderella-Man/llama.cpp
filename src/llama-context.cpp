@@ -1395,7 +1395,10 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 }
 
 void llama_context::set_screen_head(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+    if (cparams.screen_head == value) {
+        return;
+    }
+    LLAMA_LOG_INFO("%s: screened output head %s\n", __func__, value ? "on" : "off");
 
     // like causal_attn: a flip rebuilds the graph, which allocates the few extra MB on the fly
     cparams.screen_head = value;
