@@ -3598,6 +3598,17 @@ static bool ggml_cuda_match_moe_layer(const ggml_cgraph * cgraph, const int node
             return false;
         }
     }
+    // Flint's MoE down-projection rescale (llm_graph_moe_down_rescale) puts its amax chain between the GLU and the down
+    // product: the layer keeps the per-op path, and the caller says why
+    for (int k = i; k < n_nodes; ++k) {
+        if (nodes[k]->op == GGML_OP_UNARY && ggml_get_unary_op(nodes[k]) == GGML_UNARY_OP_ABS && nodes[k]->src[0] == glu) {
+            layer.down_rescale = true;
+            return false;
+        }
+        if (!ggml_cuda_is_view_or_noop(nodes[k])) {
+            break;
+        }
+    }
     ggml_tensor * down = take(GGML_OP_MUL_MAT_ID);
     if (!down || down->src[1] != glu || down->src[2] != ids || down->src[0]->op != GGML_OP_NONE) {
         return false;
@@ -3675,10 +3686,18 @@ static bool ggml_cuda_match_moe_layer(const ggml_cgraph * cgraph, const int node
 // Whether the layer starting at node_idx runs as one persistent kernel on this context.
 static bool ggml_cuda_moe_layer_persistent(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
                                            const int node_idx, ggml_cuda_moe_layer & layer) {
-    return node_idx < cgraph->n_nodes && cgraph->nodes[node_idx]->op == GGML_OP_RMS_NORM &&
-        ggml_cuda_moe_persistent_enabled(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-        cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_match_moe_layer(cgraph, node_idx, layer) &&
-        ggml_cuda_moe_persistent_supported(layer);
+    if (node_idx >= cgraph->n_nodes || cgraph->nodes[node_idx]->op != GGML_OP_RMS_NORM ||
+            !ggml_cuda_moe_persistent_enabled(ggml_cuda_info().devices[cuda_ctx->device].cc) ||
+            !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    if (!ggml_cuda_match_moe_layer(cgraph, node_idx, layer)) {
+        if (layer.down_rescale) {
+            ggml_cuda_moe_persistent_rescale_notice(cuda_ctx->device);
+        }
+        return false;
+    }
+    return ggml_cuda_moe_persistent_supported(layer);
 }
 
 
