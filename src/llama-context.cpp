@@ -2738,8 +2738,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (logits.data && t_logits && n_outputs > 0 && !needs_raw_logits(ubatch, sampling.samplers)) {
             // every output of this ubatch is sampled by a backend sampler: its logits stay on the device
             logits_dev_tensor = t_logits;
-            for (int32_t k = 0; k < n_outputs; k++) {
-                logits_dev_rows[n_outputs_prev + k] = k;
+            for (uint32_t k = 0; k < n_outputs; k++) {
+                logits_dev_rows[n_outputs_prev + k] = (int32_t) k;
             }
         }
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
