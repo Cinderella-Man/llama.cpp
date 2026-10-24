@@ -890,6 +890,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    gf_in_flight = false;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1534,12 +1535,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // With pipeline parallelism the previous graph may still be computing on the devices. A reused graph keeps the
+    // previous ubatch's copy of the inputs, so it would have to wait for every device before set_inputs; a rebuilt graph
+    // takes the scheduler's next input copy and overlaps with the ones in flight (up to n_copies ubatches, as for
+    // prompts whose KV length changes every ubatch). So reuse only when nothing is in flight: one ubatch per decode
+    // call after the caller synchronized, as in token generation and speculative verify steps, which keep their graphs.
+    const bool reuse_safe = !(cparams.pipeline_parallel && gf_in_flight);
+
+    if (!graph_reuse_disable && reuse_safe && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
+        // that the previous compute is still reading (reuse_safe makes this a no-op wait).
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
@@ -1584,6 +1592,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    gf_in_flight = true;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
