@@ -17,11 +17,14 @@
 //     are 32 bits wide and strided.
 //   - 4-bit codes are unpacked with masks only: dp4a on (q & 0x0F0F0F0F) and an unsigned-by-signed dp4a on
 //     (q & 0xF0F0F0F0), combined as (lo << 4) + hi, with the factor 1/16 moved into the activation scale.
-//   - The activation block sums that the offsets and mins need (Q4_0, Q4_1, Q5_0, Q5_K) are computed in FP32 from the
-//     int8 values once per activation load and shared by all rows; block_q8_1's FP16 sum is never read, because it
+//   - The activation block sums that the offsets and mins need (Q4_0, Q4_1, Q5_0, Q4_K, Q5_K) are computed in FP32 from
+//     the int8 values once per activation load and shared by all rows; block_q8_1's FP16 sum is never read, because it
 //     overflows on large activations.
-//   - Q5_K and IQ4_XS take one 256-weight super-block per lane. IQ4_XS looks its 4-bit indices up with __byte_perm in a
-//     table held in registers, with the activations pre-permuted into the order the lookup produces.
+//   - Q4_K, Q5_K and IQ4_XS take one 256-weight super-block per lane. IQ4_XS looks its 4-bit indices up with __byte_perm
+//     in a table held in registers, with the activations pre-permuted into the order the lookup produces.
+//   - Q4_K is Q5_K without the fifth bit: sub-blocks 2j and 2j + 1 take the low and high nibbles of the same 8 code
+//     words. The high nibbles stay in place (q & 0xF0F0F0F0, unsigned-by-signed dp4a), and the sub-block's sum, which is
+//     then exactly 16 times too large, is shifted right by 4 once, instead of shifting every word.
 //   - Q6_K takes one super-block per lane too, staged only: its 210-byte super-blocks are 2-byte aligned, so lanes whose
 //     block starts at an odd half-word shift the words they read from shared memory by 2 bytes, rows that are only 8- or
 //     4-byte aligned (K = 1024, 512) are staged with 8- or 4-byte loads, and a fused gate/up stages its two matrices one
@@ -45,8 +48,8 @@
 //     other blocks exit at once, so every distinct expert's rows are read once per step instead of once per token.
 //   - The routed + shared expert launch adds one block that serves all tokens with the shared expert.
 //   - GGML_CUDA_MMVQ_PASCAL_STAGE_ACT=1 also stages each token's activations through shared memory (where they fit
-//     next to the weights: all types but Q5_K and the staged IQ4_XS shape), so that they are read with coalesced loads
-//     instead of one strided load per lane and token. Off by default until it is measured on a P106.
+//     next to the weights: all types but Q4_K, Q5_K and the staged IQ4_XS shape), so that they are read with coalesced
+//     loads instead of one strided load per lane and token. Off by default until it is measured on a P106.
 
 #define MMVQ_PASCAL_NWARPS 4
 #define MMVQP_MAX_COLS 4
@@ -681,7 +684,7 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
         MMVQP_CASE(1, 2, false)
         MMVQP_CASE(2, 2, true)
         MMVQP_CASE(2, 2, false)
-    } else if constexpr (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS) {
+    } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS) {
         MMVQP_CASE(1, 1, true)
         MMVQP_CASE(1, 1, false)
     } else {
@@ -745,7 +748,7 @@ bool ggml_cuda_mmvq_pascal(
         return false;
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
-            type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K) {
+            type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K) {
         return false;
     }
     if (fusion.x_scale || fusion.gate_scale) {
@@ -858,6 +861,7 @@ bool ggml_cuda_mmvq_pascal(
         case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream, su); break;
         case GGML_TYPE_Q4_1: mmvqp_launch_shape<GGML_TYPE_Q4_1>(s, p, fusion, fk, grid, stream, su); break;
         case GGML_TYPE_Q5_0: mmvqp_launch_shape<GGML_TYPE_Q5_0>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_Q4_K: mmvqp_launch_shape<GGML_TYPE_Q4_K>(s, p, fusion, fk, grid, stream, su); break;
         case GGML_TYPE_Q5_K: mmvqp_launch_shape<GGML_TYPE_Q5_K>(s, p, fusion, fk, grid, stream, su); break;
         case GGML_TYPE_IQ4_XS: mmvqp_launch_shape<GGML_TYPE_IQ4_XS>(s, p, fusion, fk, grid, stream, su); break;
         case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream, su); break;
