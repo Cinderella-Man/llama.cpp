@@ -131,6 +131,9 @@ struct common_sampler {
     // the last token was a backend sampler's draw that the grammar rejected, resampled on the host
     bool last_resampled_device = false;
 
+    // tokens the grammar has checked (for LLAMA_GRAMMAR_TEST_REJECT)
+    int32_t n_checked = 0;
+
     void reset() {
         prev.clear();
 
@@ -651,6 +654,16 @@ static void common_sampler_commit_draw(struct common_sampler * gsmpl) {
     }
 }
 
+// LLAMA_GRAMMAR_TEST_REJECT=N, for tests: every Nth token the grammar checks counts as rejected, on the host path and
+// on the backend path alike, so that the resample runs at a known rate
+static bool common_sampler_test_reject(struct common_sampler * gsmpl) {
+    static const int every = [] {
+        const char * e = getenv("LLAMA_GRAMMAR_TEST_REJECT");
+        return e ? atoi(e) : 0;
+    }();
+    return every > 0 && ++gsmpl->n_checked % every == 0;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -704,7 +717,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             }
 
             if (!grammar_first) {
-                if (common_sampler_grammar_accepts(gsmpl, id)) {
+                if (common_sampler_grammar_accepts(gsmpl, id) && !common_sampler_test_reject(gsmpl)) {
                     return id;
                 }
 
@@ -745,7 +758,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     // check if it the sampled token fits the grammar (grammar-based rejection sampling)
-    if (common_sampler_grammar_accepts(gsmpl, id)) {
+    if (common_sampler_grammar_accepts(gsmpl, id) && !common_sampler_test_reject(gsmpl)) {
         return id;
     }
 
