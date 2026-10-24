@@ -162,6 +162,12 @@ json server_slot_stats::to_json() const {
         base["grammar_rejected_n"] = smpl_rejected;
     }
 
+    static const char * cache_src_names[] = { "none", "live", "checkpoint", "prefix" };
+    base["cache_src"]       = cache_src_names[std::clamp(cache_src, 0, 3)];
+    base["cache_ckpt_n"]    = n_ckpt_pos;
+    base["ckpt_created_n"]  = n_ckpt_created;
+    base["cache_restore_ms"] = t_restore_us / 1000.0;
+
     return base;
 }
 
