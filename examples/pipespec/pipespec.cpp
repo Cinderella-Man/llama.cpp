@@ -40,7 +40,8 @@
 //   --pipe-backend-greedy   greedy sampling on the GPU (llama_set_sampler) in both modes: only the token id comes back
 //                           instead of the logits; the logits hashes then hash the token ids
 //   --pipe-race K           race K samples of the request (sequences 0..K-1 share the prompt's KV, seeds seed..seed+K-1)
-//                           until one of them emits --pipe-race-stop (default "</think>"), then continue that one alone;
+//                           until one of them emits --pipe-race-stop (default "</think>"), then continue that one alone
+//                           (K = 1: one sample, timed to the stop text the same way);
 //                           plain mode decodes the samples round robin, pipe mode keeps one token of each in flight
 //                           (needs host sampling; the context gets K sequences and a unified KV cache)
 
@@ -497,7 +498,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     int      race_tokens = 0;
     uint64_t race_hash   = 0;
 
-    if (n_race > 1) {
+    if (job.race >= 1) {
         if (g_backend_greedy) {
             LOG_ERR("%s: a race needs host sampling\n", __func__);
             return false;
