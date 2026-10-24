@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-pascal.cuh"
 #include "fattn-tile.cuh"
+#include "fattn-tile-pascal.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
@@ -736,6 +737,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // the compute-6.1 prompt kernel reads F16 and Q8_0 K/V directly
+            need_f16_K = !ggml_cuda_fattn_tile_pascal_supported(device, dst);
+            need_f16_V = need_f16_K;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -765,7 +770,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
-            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            if (!ggml_cuda_flash_attn_ext_tile_pascal(ctx, dst)) {
+                ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            }
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);

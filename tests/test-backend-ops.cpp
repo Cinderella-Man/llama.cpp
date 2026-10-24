@@ -9111,6 +9111,38 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// the mask of a prompt micro-batch at depth: token j of nb sits at position kv - nb + j and sees the keys up to its own
+// position (causal), or only the last `window` of them; the random mask's -inf blocks would let a prompt-size kernel
+// skip tiles that a real prompt computes
+struct test_flash_attn_ext_prompt : public test_flash_attn_ext {
+    const int64_t window;
+
+    test_flash_attn_ext_prompt(int64_t hs, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, bool sinks,
+                               ggml_type type_KV, int64_t window)
+        : test_flash_attn_ext(hs, hs, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}),
+          window(window) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",window=" + std::to_string(window);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> data(ggml_nelements(m));
+        for (int64_t i3 = 0; i3 < m->ne[3]; ++i3) {
+            for (int64_t j = 0; j < m->ne[1]; ++j) {
+                const int64_t pos = kv - nb + j;
+                for (int64_t i = 0; i < m->ne[0]; ++i) {
+                    const bool visible = i <= pos && (window <= 0 || i > pos - window);
+                    data[(i3*m->ne[1] + j)*m->ne[0] + i] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                }
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, ggml_nbytes(m));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12735,6 +12767,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
 
+    // FLASH_ATTN_EXT: prompt-size attention at the shapes of Flint (head 128, 4 KV heads) and the Qwen3.6 class (head 256,
+    // 2 KV heads), 8 query heads per KV head, F16 and Q8_0 caches viewed as in the KV cache. The compute-6.1 prompt kernel
+    // (fattn-tile-pascal.cu; GGML_CUDA_FATTN_TILE_PASCAL=2 runs it on any GPU) takes these from 9 tokens (3 with Q8_0).
+    // The random mask's -inf blocks cover whole key tiles; the prompt masks are causal at depth and a 513-key sliding
+    // window; large logits make the online softmax rescale; 16 query heads per KV head and two sequences give more block
+    // columns. ALiBi, softcap, 4 query heads per KV head and an unpadded length fall through to the stock kernels.
+    for (int hs : { 128, 256 }) {
+        const int nh = hs == 128 ? 4 : 2;
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            for (int kv : { 256, 1280, 4096 }) {
+                for (int nb : { 3, 9, 32, 77, 512 }) {
+                    for (bool sinks : { false, true }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {8, 1}, kv, nb, true, sinks, 0, 0,
+                                                                        GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+                    }
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_large_logits(hs, hs, nh, {8, 1}, kv, 64, true, true, 0, 0,
+                                                                             GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_prompt(hs, nh, {8, 1}, 1280, 512, true,  type_KV, 513));
+            test_cases.emplace_back(new test_flash_attn_ext_prompt(hs, nh, {8, 1}, 1024, 512, false, type_KV, 0));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {16, 1}, 512, 33, true, true,  0,    0,     GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 8, 2}, 512, 33, true, true,  0,    0,     GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 8, 1}, 512, 33, true, false, 0,    0,     GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 8, 1}, 512, 33, true, false, 8.0f, 0,     GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 8, 1}, 512, 33, true, false, 0,    10.0f, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 4, 1}, 512, 33, true, true,  0,    0,     GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 8, 1}, 300, 33, true, true,  0,    0,     GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+        }
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -13263,6 +13326,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,     0));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
+
+    // prompt-size attention per layer call, a 512-token micro-batch at depth (causal mask; 1280 keys with a 513-key window
+    // is Flint's sliding-window ring at -ub 512), Flint's shape (head 128, 4 KV heads, sinks) and Qwen3.6's (head 256,
+    // 2 KV heads), 8 query heads per KV head: the compute-6.1 prompt kernel against the stock TILE kernel
+    // (GGML_CUDA_FATTN_TILE_PASCAL=1/0)
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_prompt(128, 4, {8, 1}, 1280, 512, true, type_KV, 513));
+        for (int kv : { 8192, 32768, 65536 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_prompt(128, 4, {8, 1}, kv, 512, true,  type_KV, 0));
+            test_cases.emplace_back(new test_flash_attn_ext_prompt(256, 2, {8, 1}, kv, 512, false, type_KV, 0));
+        }
+    }
 
     // GLM 4.7 Flash gqa20
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 8192, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
