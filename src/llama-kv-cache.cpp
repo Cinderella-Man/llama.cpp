@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1305,7 +1306,18 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LLAMA_KV_PAD (a power of 2 from 256 up) pads further: every graph is rebuilt when n_kv grows by a step, which
+    // costs once per pipe slot (llama_pipe_*), against attention over up to that many masked cells
+    static const uint32_t n_pad_env = [] {
+        const char * e = getenv("LLAMA_KV_PAD");
+        uint32_t v = e ? (uint32_t) atoi(e) : 0;
+        uint32_t p = 256;
+        while (p < v && p < (1u << 20)) {
+            p *= 2;
+        }
+        return v > 0 ? p : 0u;
+    }();
+    const uint32_t n_pad_cur = std::max({ n_pad, 256u, n_pad_env });
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];

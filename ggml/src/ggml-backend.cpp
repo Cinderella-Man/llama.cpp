@@ -1981,11 +1981,14 @@ static void ggml_backend_sched_pack_inputs(ggml_backend_sched_t sched) {
                 ggml_backend_buffer_free(pack->host_buf);
                 ggml_free(pack->ctx);
             }
-            pack->dev_buf  = ggml_backend_buft_alloc_buffer(dev_buft,  size);
-            pack->host_buf = ggml_backend_buft_alloc_buffer(host_buft, size);
+            // the attention mask grows with every KV step: twice the size, so that the buffers are rarely replaced
+            // (freeing them synchronizes the device, and allocating pinned memory is slow)
+            const size_t capacity = std::max(2*size, (size_t) 65536);
+            pack->dev_buf  = ggml_backend_buft_alloc_buffer(dev_buft,  capacity);
+            pack->host_buf = ggml_backend_buft_alloc_buffer(host_buft, capacity);
             struct ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
             pack->ctx    = ggml_init(params);
-            pack->region = ggml_new_tensor_1d(pack->ctx, GGML_TYPE_I8, (int64_t) size);
+            pack->region = ggml_new_tensor_1d(pack->ctx, GGML_TYPE_I8, (int64_t) capacity);
             ggml_backend_tensor_alloc(pack->dev_buf, pack->region, ggml_backend_buffer_get_base(pack->dev_buf));
         }
         pack->size = size;
