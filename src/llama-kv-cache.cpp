@@ -471,7 +471,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
         }
 
-        if (p1 == std::numeric_limits<llama_pos>::max() && pos_min_head != cells.size()) {
+        if (cells.get_used() == 0) {
+            // the stream is empty: the next prompt fills it from cell 0, the cell layout of a fresh context, whatever
+            // the stream held before (a sliding-window cache that wrapped ends with head anywhere). Attention sums the
+            // keys in cell order, so a prompt processed from scratch, or a saved state loaded here, then gives the
+            // same values as on a server that has just started
+            head = 0;
+        } else if (p1 == std::numeric_limits<llama_pos>::max() && pos_min_head != cells.size()) {
             // the tail of the sequence was removed: the next token takes the cell of the first removed position, so
             // that re-decoding the tail gives the same cell layout as before, also when the tail wrapped around the
             // end of the cache (pipelined speculation relies on this for bit-identical attention)
@@ -502,7 +508,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             // If we freed up a slot, set head to it so searching can start there.
-            if (new_head != cells.size() && new_head < head) {
+            if (cells.get_used() == 0) {
+                head = 0;
+            } else if (new_head != cells.size() && new_head < head) {
                 head = new_head;
             }
         }
@@ -2379,7 +2387,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
             // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
+            if (add_cell && seq_id != -1 && !(flags & LLAMA_STATE_SEQ_FLAGS_SWA_RING)) {
                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
@@ -2635,6 +2643,42 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
+// the cells a sequence processed from its first token occupies in an empty stream: position p in cell p, or in cell
+// p mod size in a sliding-window cache that wraps (head starts at 0 and takes each next cell, the oldest one being
+// outside the window by then). A state restored there gives attention the keys in the order a fresh context has them.
+// Empty if the stream holds other cells or two positions would share a cell.
+llama_kv_cache::slot_info llama_kv_cache::canonical_slot(uint32_t strm, const llama_ubatch & ubatch, uint32_t n_cells) const {
+    const auto & cells = v_cells[strm];
+    if (cells.get_used() != 0) {
+        return {};
+    }
+
+    const bool ring = n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE;
+
+    slot_info res;
+    res.resize(1);
+    res.s0 = strm;
+    res.s1 = strm;
+    res.strm[0] = strm;
+    res.idxs[0].resize(n_cells);
+
+    std::vector<bool> taken(cells.size(), false);
+    for (uint32_t i = 0; i < n_cells; ++i) {
+        const llama_pos pos = ubatch.pos[i];
+        if (pos < 0 || (!ring && (uint32_t) pos >= cells.size())) {
+            return {};
+        }
+        const uint32_t idx = ring ? (uint32_t) pos % cells.size() : (uint32_t) pos;
+        if (taken[idx]) {
+            return {};
+        }
+        taken[idx] = true;
+        res.idxs[0][i] = idx;
+    }
+
+    return res;
+}
+
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
@@ -2647,6 +2691,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         seq_rm(dest_seq_id, -1, -1);
+
+        bool canonical = false; // the cells go where processing the sequence from its first token puts them
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2724,7 +2770,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
-            sinfo = find_slot(ubatch, false);
+            sinfo = canonical_slot(strm, ubatch, cell_count);
+            canonical = !sinfo.empty();
+            if (!canonical) {
+                sinfo = find_slot(ubatch, false);
+            }
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;
@@ -2735,6 +2785,20 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+
+        if (canonical) {
+            // the next position goes where processing would put it (the cells were saved in cell order, not by
+            // position, so the last one is not the newest when the window had wrapped)
+            llama_pos pos_max = -1;
+            uint32_t  idx_max = 0;
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                if (ubatch.pos[i] > pos_max) {
+                    pos_max = ubatch.pos[i];
+                    idx_max = sinfo.idxs[0][i];
+                }
+            }
+            head = (idx_max + 1) % cells.size();
+        }
 
         // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
         // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
