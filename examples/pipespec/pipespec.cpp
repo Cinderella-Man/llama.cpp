@@ -36,7 +36,8 @@
 //   --pipe-jsonl FILE       append {id, category, prompt_tokens, gen_tokens} (bench/ngram_replay's transcript format, for
 //                           its pipeline simulator); --pipe-cat sets the category (default chat)
 //   --pipe-trace FILE       one line per sampled token: microseconds since the first submit, guesses in flight, outcome
-//                           (h right guess behind it, m wrong, n none, p plain, r a raced sample's token)
+//                           (h right guess behind it, m wrong, n none, p plain, r a raced sample's token, f the next
+//                           token already in flight, fed on the devices)
 //   --pipe-backend-greedy   greedy sampling on the GPU (llama_set_sampler) in both modes: only the token id comes back
 //                           instead of the logits; the logits hashes then hash the token ids
 //   --pipe-backend-sample   the --temp/--top-k/--top-p/--min-p chain on the GPU, one per sequence, each draw keyed by
@@ -54,6 +55,14 @@
 //                           (K = 1: one sample, timed to the stop text the same way);
 //                           plain mode decodes the samples round robin, pipe mode keeps one token of each in flight
 //                           (needs host sampling; the context gets K sequences and a unified KV cache)
+//   --pipe-feed             (job key feed) pipe mode at depth 0 and streams mode without guesses, with a sampler on the
+//                           device: a sequence's next token is submitted before its current token is sampled, fed on
+//                           the devices from that token's sampled output (llama_pipe_submit_fed; run with
+//                           LLAMA_INPUT_ON_GPU=1), so the host stays one token ahead instead of waiting in between
+// Pipe and streams jobs also report the host time per generated token: inside the submit calls (host_submit_us), inside
+// the waits for results (host_wait_us) and the rest (host_rest_us, the executor's own work).
+// LLAMA_PIPE_UPLOAD=0|1|2 sets how the slots upload their host inputs (llama-context; 2, one packed asynchronous copy
+// per card and token, is the default).
 
 #include "arg.h"
 #include "chat.h"
@@ -97,6 +106,18 @@ static int g_n_chunk_slots = 0;
 // token file of other outputs for the continuation guesser (--pipe-table), one output per line
 static std::string g_table_path;
 
+// host time in the current job: inside the submit calls (building, uploading and launching an evaluation) and inside
+// the waits for results
+static int64_t g_t_submit_us = 0;
+static int64_t g_t_wait_us   = 0;
+
+struct host_timer {
+    int64_t & acc;
+    int64_t   t0;
+    explicit host_timer(int64_t & a) : acc(a), t0(ggml_time_us()) {}
+    ~host_timer() { acc += ggml_time_us() - t0; }
+};
+
 struct pipe_job {
     std::string name     = "run";
     std::string mode     = "pipe";
@@ -124,6 +145,7 @@ struct pipe_job {
     int         arrive   = 0;      // streams: conversation c joins after arrive * c generated tokens
     int         budget   = 0;      // streams: items in flight before guesses stop (0 = no limit)
     int         seq      = 0;      // the sequence (KV stream) a plain or pipe job generates in
+    bool        feed     = false;  // submit each next token fed from the device (llama_pipe_submit_fed)
 };
 
 static bool job_set(pipe_job & j, const std::string & k, const std::string & v) {
@@ -153,6 +175,7 @@ static bool job_set(pipe_job & j, const std::string & k, const std::string & v) 
     else if (k == "arrive")    { j.arrive    = atoi(v.c_str()); }
     else if (k == "budget")    { j.budget    = atoi(v.c_str()); }
     else if (k == "seq")       { j.seq       = atoi(v.c_str()); }
+    else if (k == "feed")      { j.feed      = v != "0"; }
     else {
         return false;
     }
@@ -179,6 +202,10 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
         }
         if (a == "--pipe-chat") {
             def.chat = true;
+            continue;
+        }
+        if (a == "--pipe-feed") {
+            def.feed = true;
             continue;
         }
         if (a == "--pipe-backend-greedy") {
@@ -599,6 +626,9 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     // generation time includes the race; t_race is the time until the race ended
     const int64_t t_gen_start = ggml_time_us();
     double        t_race      = 0.0;
+    int           n_fed       = 0;
+    g_t_submit_us = 0;
+    g_t_wait_us   = 0;
 
     // race: K samples of the request, one sequence each, until one emits the stop text
     int      race_winner = -1;
@@ -696,7 +726,12 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                         continue;
                     }
                     const llama_pos pos = n_prompt + (llama_pos) rgen[s].size() - 1;
-                    if (llama_pipe_submit(ctx, sl, rgen[s].back(), pos, s) != 0) {
+                    int ret;
+                    {
+                        host_timer ht(g_t_submit_us);
+                        ret = llama_pipe_submit(ctx, sl, rgen[s].back(), pos, s);
+                    }
+                    if (ret != 0) {
                         LOG_ERR("%s: llama_pipe_submit failed at pos %d of sample %d\n", __func__, pos, s);
                         return false;
                     }
@@ -713,7 +748,12 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             while (race_winner < 0) {
                 const rentry e = fifo.front();
                 fifo.pop_front();
-                if (race_over(e.s, rtake(e.s, llama_pipe_get_logits(ctx, e.slot)))) {
+                const float * logits;
+                {
+                    host_timer ht(g_t_wait_us);
+                    logits = llama_pipe_get_logits(ctx, e.slot);
+                }
+                if (race_over(e.s, rtake(e.s, logits))) {
                     race_winner = e.s;
                     break;
                 }
@@ -783,6 +823,10 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             LOG_ERR("%s: depth %d needs at least %d slots, the context has %d\n", __func__, D, D + 2, n_slots);
             return false;
         }
+        if (job.feed && (D != 0 || !backend_sampling())) {
+            LOG_ERR("%s: %s: feed needs depth 0 and a sampler on the device\n", __func__, job.name.c_str());
+            return false;
+        }
 
         std::vector<llama_token> oracle;
         if (job.guess == "oracle") {
@@ -818,7 +862,8 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         int next_slot = 0;
         bool failed = false;
 
-        auto submit = [&](llama_token tok, llama_pos pos) {
+        // src_slot >= 0: the token is the sampled output of that slot, fed on the devices (tok is not known yet)
+        auto submit = [&](llama_token tok, llama_pos pos, int src_slot = -1) {
             // round robin: the least recently used slot that is not in the window
             for (;;) {
                 const int s = next_slot;
@@ -831,9 +876,14 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                     continue;
                 }
                 backend_pos(seq, pos);
-                const int ret = llama_pipe_submit(ctx, s, tok, pos, seq);
+                int ret;
+                {
+                    host_timer ht(g_t_submit_us);
+                    ret = src_slot >= 0 ? llama_pipe_submit_fed(ctx, s, src_slot, pos, seq)
+                                        : llama_pipe_submit(ctx, s, tok, pos, seq);
+                }
                 if (ret != 0) {
-                    LOG_ERR("%s: llama_pipe_submit failed (%d) at pos %d\n", __func__, ret, pos);
+                    LOG_ERR("%s: llama_pipe_submit%s failed (%d) at pos %d\n", __func__, src_slot >= 0 ? "_fed" : "", ret, pos);
                     failed = true;
                     return;
                 }
@@ -951,15 +1001,42 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             depth_sum += inflight;
             depth_n++;
 
+            // feed: the next token goes in before this one is sampled, fed on the devices from its sampled output
+            if (job.feed && win.size() == 1 && win.back().pos + 1 < n_prompt + n_predict) {
+                submit(-1, win.back().pos + 1, win.back().slot);
+                n_fed++;
+                if (failed) {
+                    break;
+                }
+            }
+
             const entry cur = win.front();
             win.pop_front();
 
-            const llama_token id = backend_sampling() ? take_id(llama_pipe_get_sampled(ctx, cur.slot))
-                                                      : take(llama_pipe_get_logits(ctx, cur.slot));
+            llama_token id;
+            if (backend_sampling()) {
+                llama_token sid;
+                {
+                    host_timer ht(g_t_wait_us);
+                    sid = llama_pipe_get_sampled(ctx, cur.slot);
+                }
+                id = take_id(sid);
+            } else {
+                const float * logits;
+                {
+                    host_timer ht(g_t_wait_us);
+                    logits = llama_pipe_get_logits(ctx, cur.slot);
+                }
+                id = take(logits);
+            }
             hist.push_back(id);
 
             char outcome = 'n'; // no guess in flight
-            if (!win.empty()) {
+            const bool fed_next = job.feed && !win.empty();
+            if (fed_next) {
+                win.front().tok = id; // the fed token is the one just sampled
+                outcome = 'f';
+            } else if (!win.empty()) {
                 outcome = win.front().tok == id ? 'h' : 'm';
             }
             if (!job.trace.empty()) {
@@ -968,6 +1045,10 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 
             if (done()) {
                 break;
+            }
+
+            if (fed_next) {
+                continue;
             }
 
             if (outcome == 'h') {
@@ -1085,12 +1166,15 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     const int n_gen = (int) gen.size();
     LOG_INF("PIPESPEC name=%s mode=%s guess=%s depth=%d n_prompt=%d n_gen=%d t_gen=%.3f tok_s=%.3f submits=%d guesses=%d "
             "hits=%d misses=%d wasted=%d avg_inflight_guesses=%.3f tokens=%016" PRIx64 " logits=%016" PRIx64 " state=%016" PRIx64
-            " probe=%016" PRIx64 " race=%d winner=%d race_tokens=%d t_race=%.3f race_hash=%016" PRIx64 "\n",
+            " probe=%016" PRIx64 " race=%d winner=%d race_tokens=%d t_race=%.3f race_hash=%016" PRIx64
+            " fed=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f\n",
             job.name.c_str(), job.mode.c_str(), job.mode == "plain" ? "-" : job.guess.c_str(), job.mode == "plain" ? 0 : job.depth,
             n_prompt, n_gen, t_gen, (n_gen - 1)/t_gen, n_submit, n_guess, n_hit, n_miss, n_wasted,
             depth_n ? depth_sum/depth_n : 0.0,
             fnv1a(gen.data(), gen.size()*sizeof(llama_token)), fnv1a(hashes.data(), hashes.size()*sizeof(uint64_t)),
-            h_state, h_probe, n_race, race_winner, race_tokens, t_race, race_hash);
+            h_state, h_probe, n_race, race_winner, race_tokens, t_race, race_hash, n_fed,
+            n_gen ? (double) g_t_submit_us/n_gen : 0.0, n_gen ? (double) g_t_wait_us/n_gen : 0.0,
+            n_gen ? (t_gen*1e6 - g_t_submit_us - g_t_wait_us)/n_gen : 0.0);
 
     return true;
 }
@@ -1115,6 +1199,11 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
     const int      P      = 2*(D + 1);                       // one-token slots per conversation
     const uint32_t seed0  = job.seed >= 0 ? (uint32_t) job.seed : params.sampling.seed;
     const int      budget = job.budget > 0 ? job.budget : N*(1 + D) + g_n_chunk_slots;
+
+    if (job.feed && (D != 0 || !backend_sampling())) {
+        LOG_ERR("%s: %s: feed needs depth 0 and a sampler on the device\n", __func__, job.name.c_str());
+        return false;
+    }
 
     if (N > (int) llama_n_seq_max(ctx) || N*P > g_n_token_slots || g_n_chunk_slots < 1) {
         LOG_ERR("%s: %s: %d conversations at depth %d need %d sequences, %d one-token slots and chunk slots; the context "
@@ -1197,6 +1286,9 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
     bool     failed = false;
 
     const int64_t t_start = ggml_time_us();
+    int n_fed = 0;
+    g_t_submit_us = 0;
+    g_t_wait_us   = 0;
 
     auto slot_in_use = [&](int s) {
         for (const auto & it : fifo) {
@@ -1207,18 +1299,25 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         return false;
     };
 
-    // submit tokens of conversation c into slot s
-    auto submit = [&](int c, int s, char kind, const llama_token * toks, int n, llama_pos pos) {
+    // submit tokens of conversation c into slot s; src_slot >= 0: one token, the sampled output of that slot, fed on
+    // the devices (toks is not read)
+    auto submit = [&](int c, int s, char kind, const llama_token * toks, int n, llama_pos pos, int src_slot = -1) {
         auto & v = cv[c];
         backend_pos(v.seq, pos + n - 1);
-        const int ret = llama_pipe_submit_tokens(ctx, s, toks, n, pos, v.seq);
+        int ret;
+        {
+            host_timer ht(g_t_submit_us);
+            ret = src_slot >= 0 ? llama_pipe_submit_fed(ctx, s, src_slot, pos, v.seq)
+                                : llama_pipe_submit_tokens(ctx, s, toks, n, pos, v.seq);
+        }
         if (ret != 0) {
-            LOG_ERR("%s: llama_pipe_submit_tokens failed (%d) for conversation %d at pos %d\n", __func__, ret, c, pos);
+            LOG_ERR("%s: llama_pipe_submit%s failed (%d) for conversation %d at pos %d\n", __func__,
+                    src_slot >= 0 ? "_fed" : "_tokens", ret, c, pos);
             failed = true;
             return (uint64_t) 0;
         }
         const uint64_t id = next_id++;
-        fifo.push_back({ id, s, c, kind, pos, n, toks[n - 1], true });
+        fifo.push_back({ id, s, c, kind, pos, n, src_slot >= 0 ? (llama_token) -1 : toks[n - 1], true });
         v.n_submit++;
         return id;
     };
@@ -1364,10 +1463,17 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         auto & v = cv[c];
         llama_token id;
         if (backend_sampling()) {
-            id = llama_pipe_get_sampled(ctx, it.slot);
+            {
+                host_timer ht(g_t_wait_us);
+                id = llama_pipe_get_sampled(ctx, it.slot);
+            }
             v.hashes.push_back(fnv1a(&id, sizeof(id)));
         } else {
-            const float * logits = llama_pipe_get_logits(ctx, it.slot);
+            const float * logits;
+            {
+                host_timer ht(g_t_wait_us);
+                logits = llama_pipe_get_logits(ctx, it.slot);
+            }
             id = v.smpl->sample(logits);
             v.hashes.push_back(fnv1a(logits, sizeof(float)*n_vocab));
         }
@@ -1393,11 +1499,30 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         }
         GGML_ASSERT(!fifo.empty());
 
+        // feed: the oldest item's conversation gets its next token before that item is sampled, fed on the devices
+        // from its sampled output; it enters the cards after every item already in flight, as it would after the wait
+        if (job.feed) {
+            const item & front = fifo.front();
+            auto & v = cv[front.conv];
+            if (front.live && front.kind == 't' && v.win.size() == 1 && v.win.front() == front.id &&
+                    (int) (front.pos + 1 - v.inp.size()) < job.n_predict) {
+                const int s = token_slot(front.conv);
+                GGML_ASSERT(s >= 0);
+                const uint64_t id = submit(front.conv, s, 't', nullptr, 1, front.pos + 1, front.slot);
+                if (!id) {
+                    break;
+                }
+                v.win.push_back(id);
+                n_fed++;
+            }
+        }
+
         const item it = fifo.front();
         fifo.pop_front();
         auto & v = cv[it.conv];
 
         if (!it.live) {
+            host_timer ht(g_t_wait_us);
             llama_pipe_get_logits(ctx, it.slot); // a dropped guess: wait so its slot is free
             continue;
         }
@@ -1405,6 +1530,7 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         if (it.kind == 'c') {
             v.chunk_inflight = false;
             if (v.n_prefilled < (int) v.inp.size()) {
+                host_timer ht(g_t_wait_us);
                 llama_pipe_get_logits(ctx, it.slot);
                 continue;
             }
@@ -1437,7 +1563,9 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
 
         if (!v.win.empty()) {
             item * nx = find(v.win.front());
-            if (nx->tok == id) {
+            if (job.feed) {
+                nx->tok = id; // the fed token is the one just sampled
+            } else if (nx->tok == id) {
                 v.n_hit++;
             } else {
                 v.n_miss++;
@@ -1515,8 +1643,11 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         done_jobs[name] = std::move(r);
     }
 
-    LOG_INF("PIPESPEC_STREAMS name=%s n_conv=%d chunk=%d depth=%d budget=%d total_tokens=%d t_all=%.3f total_tok_s=%.3f\n",
-            job.name.c_str(), N, C, D, budget, n_total, t_all, n_total/t_all);
+    LOG_INF("PIPESPEC_STREAMS name=%s n_conv=%d chunk=%d depth=%d budget=%d total_tokens=%d t_all=%.3f total_tok_s=%.3f "
+            "fed=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f\n",
+            job.name.c_str(), N, C, D, budget, n_total, t_all, n_total/t_all, n_fed,
+            n_total ? (double) g_t_submit_us/n_total : 0.0, n_total ? (double) g_t_wait_us/n_total : 0.0,
+            n_total ? (t_all*1e6 - g_t_submit_us - g_t_wait_us)/n_total : 0.0);
 
     return true;
 }
