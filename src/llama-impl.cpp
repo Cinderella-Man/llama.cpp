@@ -211,3 +211,20 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t m
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
 }
+
+bool llama_backend_dev_has_feature(struct ggml_backend_device * dev, const char * name) {
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto * get_features_fn = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    if (get_features_fn == nullptr) {
+        return false;
+    }
+    for (ggml_backend_feature * f = get_features_fn(reg); f->name; f++) {
+        if (strcmp(f->name, name) == 0) {
+            return strcmp(f->value, "0") != 0;
+        }
+    }
+    return false;
+}

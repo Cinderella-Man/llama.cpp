@@ -104,6 +104,9 @@ void replace_all(std::string & s, const std::string & search, const std::string 
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
 std::string format(const char * fmt, ...);
 
+// whether the backend registry of dev reports the feature name with a value other than "0" (ggml_backend_get_features)
+bool llama_backend_dev_has_feature(struct ggml_backend_device * dev, const char * name);
+
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
