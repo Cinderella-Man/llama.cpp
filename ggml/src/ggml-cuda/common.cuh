@@ -1535,6 +1535,18 @@ struct ggml_backend_cuda_context {
         int n_written = 0, n_written_add = 0, n_read = 0, n_quantized = 0;
     } q8_1_row;
 
+    // The persistent MoE kernel's counters and scratch (GGML_CUDA_PERSISTENT_MOE, moe-persistent.cu), allocated on
+    // first use. Per context, so that two contexts on one device never share counters; the kernels of one context run
+    // on its main stream one after another.
+    struct moe_persistent_state {
+        void              * buf       = nullptr; // device: counters (zeroed once, reset by each launch), then scratch
+        unsigned          * err_host  = nullptr; // mapped host memory: [0] a wait timed out, [1] check: layers differing
+        unsigned          * err_dev   = nullptr; // the same words as seen from the device
+        const ggml_tensor * check_dst = nullptr; // check mode: the layer output still to be compared
+        int n_layers  = 0;                       // per graph evaluation: layers run by the kernel
+        int n_checked = 0;                       // check mode: layers compared
+    } moe_persistent;
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();

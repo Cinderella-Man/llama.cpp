@@ -73,6 +73,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/moe-persistent.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -771,6 +772,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(q8_1_row.buf));
     }
+    ggml_cuda_moe_persistent_free(*this);
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -3498,6 +3500,178 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+// One MoE layer at one token, from the RMS norm of its FFN to ffn_out, for the persistent kernel (moe-persistent.cuh):
+//   RMS_NORM, MUL                                     norm of the layer input x, times the norm weight
+//   MUL_MAT                                           router
+//   UNARY (sigmoid) .. RESHAPE                        the top-k chain that topk_moe fuses, with normalized weights
+//   RESHAPE, MUL_MAT_ID x 2, GLU                      routed gate/up + SwiGLU (gate and up in either order)
+//   MUL_MAT_ID                                        routed down
+//   MUL, VIEW x k, ADD x (k - 1)                      weighted sum of the routed experts
+//   MUL_MAT x 2, GLU                                  shared gate/up + SwiGLU (gate and up in either order)
+//   MUL_MAT, ADD                                      shared down; ffn_out = routed sum + shared expert
+// View nodes that belong to none of these may sit in between (they launch nothing); any other node ends the match.
+// Only ffn_out may be read outside the layer. Shapes, types and alignment are left to
+// ggml_cuda_moe_persistent_supported.
+static bool ggml_cuda_match_moe_layer(const ggml_cgraph * cgraph, const int node_idx, ggml_cuda_moe_layer & layer) {
+    ggml_tensor ** nodes   = cgraph->nodes;
+    const int      n_nodes = cgraph->n_nodes;
+
+    if (nodes[node_idx]->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+
+    std::vector<int>     idxs;
+    std::vector<ggml_op> ops;
+    idxs.reserve(40);
+    ops.reserve(40);
+    int i = node_idx;
+
+    // the next node of the layer, which must have this op; foreign view nodes before it are skipped
+    const auto take = [&](const ggml_op op) -> ggml_tensor * {
+        while (i < n_nodes && nodes[i]->op != op && ggml_cuda_is_view_or_noop(nodes[i])) {
+            i++;
+        }
+        if (i >= n_nodes || nodes[i]->op != op) {
+            return nullptr;
+        }
+        idxs.push_back(i);
+        ops.push_back(op);
+        return nodes[i++];
+    };
+    const auto is_swiglu_split = [](const ggml_tensor * glu) {
+        return glu->src[1] != nullptr && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0;
+    };
+
+    // norm
+    ggml_tensor * norm = take(GGML_OP_RMS_NORM);
+    ggml_tensor * mul  = take(GGML_OP_MUL);
+    if (!norm || !mul || mul->src[0] != norm || mul->src[1]->op != GGML_OP_NONE) {
+        return false;
+    }
+
+    // router and top-k
+    ggml_tensor * logits = take(GGML_OP_MUL_MAT);
+    if (!logits || logits->src[1] != mul || logits->src[0]->op != GGML_OP_NONE) {
+        return false;
+    }
+    ggml_cuda_topk_moe_args args;
+    while (i < n_nodes && nodes[i]->op != GGML_OP_UNARY && ggml_cuda_is_view_or_noop(nodes[i])) {
+        i++;
+    }
+    if (i >= n_nodes || !ggml_cuda_topk_moe_fusion(cgraph, i, args) || !args.sigmoid || !args.norm || args.prob_bias ||
+            args.n_groups > 0 || args.delayed_softmax) {
+        return false;
+    }
+    ggml_tensor * gating = take(GGML_OP_UNARY);
+    take(GGML_OP_RESHAPE);
+    take(GGML_OP_ARGSORT);
+    ggml_tensor * ids = take(GGML_OP_VIEW);
+    take(GGML_OP_GET_ROWS);
+    take(GGML_OP_RESHAPE);
+    take(GGML_OP_SUM_ROWS);
+    ggml_tensor * clamp   = take(GGML_OP_CLAMP);
+    take(GGML_OP_DIV);
+    ggml_tensor * weights = take(GGML_OP_RESHAPE);
+    ggml_tensor * scale   = nullptr;
+    if (args.scale) {
+        scale   = take(GGML_OP_SCALE);
+        weights = scale;
+    }
+    if (!gating || !ids || !clamp || !weights || gating->src[0] != logits ||
+            !ggml_cuda_should_use_topk_moe(gating, logits, weights, ids)) {
+        return false;
+    }
+
+    // routed experts
+    ggml_tensor * cur3d = take(GGML_OP_RESHAPE);
+    ggml_tensor * mm_a  = take(GGML_OP_MUL_MAT_ID);
+    ggml_tensor * mm_b  = take(GGML_OP_MUL_MAT_ID);
+    ggml_tensor * glu   = take(GGML_OP_GLU);
+    if (!cur3d || !mm_a || !mm_b || !glu || cur3d->src[0] != mul || !is_swiglu_split(glu) ||
+            !((glu->src[0] == mm_a && glu->src[1] == mm_b) || (glu->src[0] == mm_b && glu->src[1] == mm_a))) {
+        return false;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    for (const ggml_tensor * mm : { gate, up }) {
+        if (mm->src[1] != cur3d || mm->src[2] != ids || mm->src[0]->op != GGML_OP_NONE) {
+            return false;
+        }
+    }
+    ggml_tensor * down = take(GGML_OP_MUL_MAT_ID);
+    if (!down || down->src[1] != glu || down->src[2] != ids || down->src[0]->op != GGML_OP_NONE) {
+        return false;
+    }
+
+    // weighted sum
+    while (i < n_nodes && nodes[i]->op != GGML_OP_MUL && ggml_cuda_is_view_or_noop(nodes[i])) {
+        i++;
+    }
+    ggml_cuda_moe_weighted_reduction_match wr;
+    if (i >= n_nodes || !ggml_cuda_match_moe_weighted_reduction(cgraph, i, wr) || wr.expert_scale != nullptr ||
+            wr.experts != down || wr.weights != weights) {
+        return false;
+    }
+    for (int j = 0; j < wr.node_count; ++j) {
+        idxs.push_back(i + j);
+        ops.push_back(nodes[i + j]->op);
+    }
+    i += wr.node_count;
+
+    // shared expert and ffn_out
+    ggml_tensor * sm_a  = take(GGML_OP_MUL_MAT);
+    ggml_tensor * sm_b  = take(GGML_OP_MUL_MAT);
+    ggml_tensor * sglu  = take(GGML_OP_GLU);
+    if (!sm_a || !sm_b || !sglu || !is_swiglu_split(sglu) ||
+            !((sglu->src[0] == sm_a && sglu->src[1] == sm_b) || (sglu->src[0] == sm_b && sglu->src[1] == sm_a))) {
+        return false;
+    }
+    const ggml_tensor * sgate = sglu->src[0];
+    const ggml_tensor * sup   = sglu->src[1];
+    for (const ggml_tensor * mm : { sgate, sup }) {
+        if (mm->src[1] != mul || mm->src[0]->op != GGML_OP_NONE) {
+            return false;
+        }
+    }
+    ggml_tensor * sdown = take(GGML_OP_MUL_MAT);
+    ggml_tensor * out   = take(GGML_OP_ADD);
+    if (!sdown || !out || sdown->src[1] != sglu || sdown->src[0]->op != GGML_OP_NONE ||
+            !((out->src[0] == wr.dst && out->src[1] == sdown) || (out->src[0] == sdown && out->src[1] == wr.dst))) {
+        return false;
+    }
+
+    // nothing but ffn_out leaves the layer
+    const int out_idx = idxs.back();
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), (int) idxs.size(), ops.data(), &out_idx, 1)) {
+        return false;
+    }
+
+    layer.x         = norm->src[0];
+    layer.norm_w    = mul->src[1];
+    layer.router    = logits->src[0];
+    layer.gate_exps = gate->src[0];
+    layer.up_exps   = up->src[0];
+    layer.down_exps = down->src[0];
+    layer.gate_sh   = sgate->src[0];
+    layer.up_sh     = sup->src[0];
+    layer.down_sh   = sdown->src[0];
+    layer.dst       = out;
+    memcpy(&layer.eps, norm->op_params, sizeof(float));
+    layer.clamp_val = ggml_get_op_params_f32(clamp, 0);
+    layer.scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+    layer.n_nodes   = i - node_idx;
+    return true;
+}
+
+// Whether the layer starting at node_idx runs as one persistent kernel on this context.
+static bool ggml_cuda_moe_layer_persistent(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+                                           const int node_idx, ggml_cuda_moe_layer & layer) {
+    return node_idx < cgraph->n_nodes && cgraph->nodes[node_idx]->op == GGML_OP_RMS_NORM &&
+        ggml_cuda_moe_persistent_enabled(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+        cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_match_moe_layer(cgraph, node_idx, layer) &&
+        ggml_cuda_moe_persistent_supported(layer);
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3803,6 +3977,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // a whole MoE layer as one persistent kernel (GGML_CUDA_PERSISTENT_MOE); in check mode the kernel writes a scratch
+    // output and the layer's nodes run as usual below, to be compared with it once ffn_out is written
+    {
+        ggml_cuda_moe_layer layer;
+        if (ggml_cuda_moe_layer_persistent(cuda_ctx, cgraph, i, layer)) {
+            ggml_cuda_op_moe_persistent(*cuda_ctx, layer);
+            if (!ggml_cuda_moe_persistent_check_mode()) {
+                return layer.n_nodes - 1;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -3999,9 +4185,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // residual ADD + RMS_NORM + MUL of one row, writing the sum, the normed row and its Q8_1 copy (GGML_CUDA_NORM_Q8);
     // the sum is an output too, since the residual stream is read again later
+    // (unless the norm starts a MoE layer that runs as one persistent kernel: the add then runs alone)
+    ggml_cuda_moe_layer next_layer;
     if (node->op == GGML_OP_ADD && ggml_cuda_norm_q8_enabled() && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
             cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] &&
+            !ggml_cuda_moe_layer_persistent(cuda_ctx, cgraph, i + 1, next_layer) &&
             ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
         return 2;
     }
@@ -4895,6 +5084,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (nodes_to_skip != 0) {
                     q8_1_row_check(i, i + nodes_to_skip, q8_1_row_before);
+                    for (int j = i; cuda_ctx->moe_persistent.check_dst && j <= i + nodes_to_skip; ++j) {
+                        ggml_cuda_moe_persistent_check_node(*cuda_ctx, cgraph->nodes[j]);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4931,6 +5123,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
                 q8_1_row_check(i, i, q8_1_row_before);
+                if (cuda_ctx->moe_persistent.check_dst) {
+                    ggml_cuda_moe_persistent_check_node(*cuda_ctx, node);
+                }
 
                 if (prof_graph) {
                     prof_graph->labels.push_back(ggml_cuda_profile_label(cgraph, i, i));
@@ -4941,6 +5136,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            ggml_cuda_moe_persistent_end_graph(*cuda_ctx);
 
             static const bool norm_q8_debug = [] {
                 const char * env = getenv("GGML_CUDA_NORM_Q8_DEBUG");
@@ -5087,6 +5284,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_persistent_begin_graph(*cuda_ctx);
 
     ggml_cuda_profile_host_state * prof_host = ggml_cuda_profile_host();
     if (prof_host) {
@@ -5103,7 +5301,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    // the persistent MoE kernel's check mode reads its counts on the host after every evaluation
+    if (graph->is_enabled() && !ggml_cuda_moe_persistent_check_mode()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
