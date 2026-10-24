@@ -6227,10 +6227,19 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
     };
 }
 
+// params "priority=high": the backend's streams get the device's greatest priority, so that its kernels are scheduled
+// ahead of those of default-priority streams (the device's lowest) whenever both have work pending
 static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(params);
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
-    return ggml_backend_cuda_init(ctx->device);
+    ggml_backend_t backend = ggml_backend_cuda_init(ctx->device);
+    if (backend != nullptr && params != nullptr && strstr(params, "priority=high") != nullptr) {
+        int least    = 0;
+        int greatest = 0;
+        ggml_cuda_set_device(ctx->device);
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        ((ggml_backend_cuda_context *) backend->context)->stream_priority = greatest;
+    }
+    return backend;
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_backend_dev_t dev) {
@@ -6780,6 +6789,18 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+// true if the work recorded before the event has completed, without waiting (ggml_backend_event_query)
+static bool ggml_backend_cuda_event_query(ggml_backend_event_t event) {
+    const cudaError_t err = cudaEventQuery((cudaEvent_t)event->context);
+    if (err == cudaErrorNotReady) {
+        // not an error: clear it so that the next error check does not report it
+        (void) cudaGetLastError();
+        return false;
+    }
+    CUDA_CHECK(err);
+    return true;
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -6912,6 +6933,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_event_query") == 0) {
+        return (void *)ggml_backend_cuda_event_query;
     }
     return nullptr;
 }
