@@ -156,6 +156,12 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (smpl_grammar) {
+        base["sampled_on_device"]  = smpl_device;
+        base["grammar_n"]          = smpl_constrained;
+        base["grammar_rejected_n"] = smpl_rejected;
+    }
+
     return base;
 }
 
