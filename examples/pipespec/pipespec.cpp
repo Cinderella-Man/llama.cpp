@@ -54,6 +54,11 @@
 //                           conversation c joins after --pipe-arrive * c generated tokens. One PIPESPEC line per
 //                           conversation (<name>-c<c>), comparable with a plain job of that prompt, seed and chunk size
 //   --pipe-chunk C          prompt chunk size (job key chunk): plain mode decodes the prompt in chunks of C tokens too
+//   --pipe-chunks K         streams: prompt chunks in flight at once (job key chunks, default 2; the context gets the
+//                           largest K of the jobs as chunk slots), several of one prompt if it has them, prompts in
+//                           order of arrival
+//   --pipe-chunks-gen G     streams: chunks in flight while any conversation generates (job key chunks_gen, default K);
+//                           on one stream per card every token queued behind a chunk waits for it on every card
 //   --pipe-seed S           the job's base seed (job key seed; default --seed)
 //   --pipe-race K           race K samples of the request (sequences 0..K-1 share the prompt's KV, seeds seed..seed+K-1)
 //                           until one of them emits --pipe-race-stop (default "</think>"), then continue that one alone
@@ -73,7 +78,8 @@
 // Pipe and streams jobs also report the host time per generated token: inside the submit calls (host_submit_us), inside
 // the waits for results (host_wait_us) and the rest (host_rest_us, the executor's own work).
 // LLAMA_PIPE_UPLOAD=0|1|2 sets how the slots upload their host inputs (llama-context; 2, one packed asynchronous copy
-// per card and token, is the default).
+// per card and token, is the default). LLAMA_PIPE_CHUNK_STREAM=1 runs the prompt chunks on a second stream per card,
+// below the priority of the tokens' streams, so that tokens overtake the chunks queued before them (llama-context).
 
 #include "arg.h"
 #include "chat.h"
@@ -113,6 +119,9 @@ static std::vector<llama_sampler *> g_backend_chains;
 // slots given to llama_pipe_init_ext: one-token slots first, then the chunk slots
 static int g_n_token_slots = 0;
 static int g_n_chunk_slots = 0;
+
+// streams: handle the newest complete item first (PIPESPEC_PICK=newest, a test)
+static const bool g_pick_newest = getenv("PIPESPEC_PICK") != nullptr && std::string(getenv("PIPESPEC_PICK")) == "newest";
 
 // token file of other outputs for the continuation guesser (--pipe-table), one output per line
 static std::string g_table_path;
@@ -165,6 +174,8 @@ struct pipe_job {
     int         seq      = 0;      // the sequence (KV stream) a plain or pipe job generates in
     bool        feed     = false;  // submit each next token fed from the device (llama_pipe_submit_fed)
     int         floor    = 0;      // pipe mode: guesses kept in flight when the guesser has none (a filler token)
+    int         chunks   = 0;      // streams: prompt chunks in flight (0 = 2)
+    int         chunks_gen = -1;   // streams: prompt chunks in flight while a conversation generates (-1 = chunks)
 };
 
 static bool job_set(pipe_job & j, const std::string & k, const std::string & v) {
@@ -196,6 +207,8 @@ static bool job_set(pipe_job & j, const std::string & k, const std::string & v) 
     else if (k == "seq")       { j.seq       = atoi(v.c_str()); }
     else if (k == "feed")      { j.feed      = v != "0"; }
     else if (k == "floor")     { j.floor     = atoi(v.c_str()); }
+    else if (k == "chunks")    { j.chunks    = atoi(v.c_str()); }
+    else if (k == "chunks_gen") { j.chunks_gen = atoi(v.c_str()); }
     else {
         return false;
     }
@@ -212,6 +225,7 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
         {"--pipe-race-stop", "race_stop"}, {"--pipe-jsonl", "jsonl"}, {"--pipe-cat", "cat"},
         {"--pipe-streams", "streams"}, {"--pipe-prompts", "prompts"}, {"--pipe-chunk", "chunk"}, {"--pipe-seed", "seed"},
         {"--pipe-arrive", "arrive"}, {"--pipe-budget", "budget"}, {"--pipe-floor", "floor"},
+        {"--pipe-chunks", "chunks"}, {"--pipe-chunks-gen", "chunks_gen"},
     };
     int j = 1;
     for (int i = 1; i < argc; i++) {
@@ -1304,10 +1318,14 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 // (job.prompts, cycled), sampler and seed (seed + c). Work items, in submission order:
 //   - a conversation's next token, submitted the moment its previous token is sampled (first);
 //   - prompt chunks of job.chunk tokens on the shared chunk slots (a new prompt joins the pipeline instead of draining
-//     it through llama_decode);
+//     it through llama_decode), prompts in order of arrival, up to job.chunks in flight (job.chunks_gen while a
+//     conversation generates), several of one prompt: each card runs a prompt's chunks in submission order;
 //   - guesses (job.guess, up to job.depth per conversation), only while fewer than job.budget items are in flight:
 //     copy-lookup guesses of any conversation before the other kinds.
-// Every card runs its items in submission order, so items complete in that order: the loop always waits for the oldest.
+// Every card runs its items in submission order, so on one stream per card items complete in that order. With
+// LLAMA_PIPE_CHUNK_STREAM=1 the chunks have streams of their own, below the tokens' priority, and a token can complete
+// before an earlier chunk: the loop handles the oldest complete item among each conversation's oldest (a conversation's
+// items still complete in order), and when none is complete waits for the oldest token or guess, else the oldest chunk.
 static bool run_streams(const pipe_job & job, common_params & params, llama_model * model, llama_context * ctx,
                         std::map<std::string, job_result> & done_jobs) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
@@ -1319,17 +1337,19 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
     const int      C      = job.chunk > 0 ? job.chunk : 64;
     const int      P      = 2*(D + 1);                       // one-token slots per conversation
     const uint32_t seed0  = job.seed >= 0 ? (uint32_t) job.seed : params.sampling.seed;
-    const int      budget = job.budget > 0 ? job.budget : N*(1 + D) + g_n_chunk_slots;
+    const int      K      = job.chunks > 0 ? job.chunks : 2;
+    const int      K_gen  = job.chunks_gen >= 0 ? std::min(job.chunks_gen, K) : K;
+    const int      budget = job.budget > 0 ? job.budget : N*(1 + D) + K;
 
     if (job.feed && (D != 0 || !backend_sampling())) {
         LOG_ERR("%s: %s: feed needs depth 0 and a sampler on the device\n", __func__, job.name.c_str());
         return false;
     }
 
-    if (N > (int) llama_n_seq_max(ctx) || N*P > g_n_token_slots || g_n_chunk_slots < 1) {
-        LOG_ERR("%s: %s: %d conversations at depth %d need %d sequences, %d one-token slots and chunk slots; the context "
-                "has %u, %d and %d\n", __func__, job.name.c_str(), N, D, N, N*P, llama_n_seq_max(ctx), g_n_token_slots,
-                g_n_chunk_slots);
+    if (N > (int) llama_n_seq_max(ctx) || N*P > g_n_token_slots || g_n_chunk_slots < K) {
+        LOG_ERR("%s: %s: %d conversations at depth %d need %d sequences, %d one-token slots and %d chunk slots; the "
+                "context has %u, %d and %d\n", __func__, job.name.c_str(), N, D, N, N*P, K, llama_n_seq_max(ctx),
+                g_n_token_slots, g_n_chunk_slots);
         return false;
     }
 
@@ -1359,7 +1379,6 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         llama_seq_id             seq;
         std::vector<llama_token> inp;
         int                      n_prefilled    = 0;     // prompt tokens submitted
-        bool                     chunk_inflight = false;
         bool                     started        = false; // its prompt may be submitted
         bool                     generating     = false; // the prompt is done
         bool                     done           = false;
@@ -1399,6 +1418,7 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         int         n_tok;
         llama_token tok;       // the last token
         bool        live;
+        bool        last = false; // a prompt's last chunk: its output is the first generated token
     };
     std::deque<item> fifo;
     uint64_t next_id = 1;
@@ -1529,21 +1549,32 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
                 }
             }
         }
-        // 3. prompt chunks, one in flight per conversation, on free chunk slots
-        for (int c = 0; c < N && !failed; c++) {
+        // 3. prompt chunks in order of arrival on free chunk slots, several of one prompt: up to K in flight, K_gen while
+        //    a conversation generates
+        int  n_chunks_inflight = 0;
+        bool any_generating    = false;
+        for (const auto & it : fifo) {
+            n_chunks_inflight += it.kind == 'c';
+        }
+        for (const auto & v : cv) {
+            any_generating = any_generating || (v.generating && !v.done);
+        }
+        const int n_chunks_max = any_generating ? K_gen : K;
+        for (int c = 0; c < N && !failed && n_chunks_inflight < n_chunks_max; c++) {
             auto & v = cv[c];
-            if (!v.started || v.generating || v.chunk_inflight) {
-                continue;
-            }
-            const int s = chunk_slot();
-            if (s < 0) {
-                break;
-            }
-            const int n = std::min(C, (int) v.inp.size() - v.n_prefilled);
-            if (submit(c, s, 'c', v.inp.data() + v.n_prefilled, n, v.n_prefilled)) {
+            while (v.started && v.n_prefilled < (int) v.inp.size() && n_chunks_inflight < n_chunks_max && !failed) {
+                const int s = chunk_slot();
+                if (s < 0) {
+                    break;
+                }
+                const int n = std::min(C, (int) v.inp.size() - v.n_prefilled);
+                if (!submit(c, s, 'c', v.inp.data() + v.n_prefilled, n, v.n_prefilled)) {
+                    break;
+                }
                 v.n_prefilled += n;
-                v.chunk_inflight = true;
+                fifo.back().last = v.n_prefilled == (int) v.inp.size();
                 v.n_chunks++;
+                n_chunks_inflight++;
             }
         }
         // 4. guesses in the slack: copy-lookup guesses first, then the other kinds
@@ -1620,10 +1651,36 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         }
         GGML_ASSERT(!fifo.empty());
 
-        // feed: the oldest item's conversation gets its next token before that item is sampled, fed on the devices
+        // the item to handle next: the oldest complete one among each conversation's oldest, else the oldest token or
+        // guess (the chunks' streams run below the tokens' priority), else the oldest chunk. PIPESPEC_PICK=newest
+        // (a test of the bookkeeping on the CPU, where every item is complete) takes the newest complete one instead
+        size_t i_next = 0;
+        {
+            std::vector<bool> seen(N, false);
+            size_t i_tok = fifo.size();
+            bool   found = false;
+            for (size_t i = 0; i < fifo.size() && (!found || g_pick_newest); i++) {
+                const item & q = fifo[i];
+                if (seen[q.conv]) {
+                    continue;
+                }
+                seen[q.conv] = true;
+                if (llama_pipe_ready(ctx, q.slot)) {
+                    i_next = i;
+                    found  = true;
+                } else if (q.kind != 'c' && i_tok == fifo.size()) {
+                    i_tok = i;
+                }
+            }
+            if (!found && i_tok < fifo.size()) {
+                i_next = i_tok;
+            }
+        }
+
+        // feed: the next item's conversation gets its next token before that item is sampled, fed on the devices
         // from its sampled output; it enters the cards after every item already in flight, as it would after the wait
         if (job.feed) {
-            const item & front = fifo.front();
+            const item & front = fifo[i_next];
             auto & v = cv[front.conv];
             if (front.live && front.kind == 't' && v.win.size() == 1 && v.win.front() == front.id &&
                     (int) (front.pos + 1 - v.inp.size()) < job.n_predict) {
@@ -1638,8 +1695,8 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
             }
         }
 
-        const item it = fifo.front();
-        fifo.pop_front();
+        const item it = fifo[i_next];
+        fifo.erase(fifo.begin() + i_next);
         auto & v = cv[it.conv];
 
         if (!it.live) {
@@ -1649,8 +1706,7 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         }
 
         if (it.kind == 'c') {
-            v.chunk_inflight = false;
-            if (v.n_prefilled < (int) v.inp.size()) {
+            if (!it.last) {
                 host_timer ht(g_t_wait_us);
                 llama_pipe_get_logits(ctx, it.slot);
                 continue;
@@ -1764,9 +1820,11 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         done_jobs[name] = std::move(r);
     }
 
-    LOG_INF("PIPESPEC_STREAMS name=%s n_conv=%d chunk=%d depth=%d budget=%d total_tokens=%d t_all=%.3f total_tok_s=%.3f "
-            "fed=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f\n",
-            job.name.c_str(), N, C, D, budget, n_total, t_all, n_total/t_all, n_fed,
+    const char * chunk_stream = getenv("LLAMA_PIPE_CHUNK_STREAM");
+    LOG_INF("PIPESPEC_STREAMS name=%s n_conv=%d chunk=%d chunks=%d chunks_gen=%d chunk_stream=%d depth=%d budget=%d "
+            "total_tokens=%d t_all=%.3f total_tok_s=%.3f fed=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f\n",
+            job.name.c_str(), N, C, K, K_gen, chunk_stream ? atoi(chunk_stream) : 0, D, budget, n_total, t_all,
+            n_total/t_all, n_fed,
             n_total ? (double) g_t_submit_us/n_total : 0.0, n_total ? (double) g_t_wait_us/n_total : 0.0,
             n_total ? (t_all*1e6 - g_t_submit_us - g_t_wait_us)/n_total : 0.0);
 
@@ -1822,6 +1880,7 @@ int main(int argc, char ** argv) {
     int streams_max = 0;
     int streams_slots = 0;
     int chunk_max   = 0;
+    int chunks_max  = 0;
     for (const auto & j : jobs) {
         if (j.mode == "pipe" || j.streams > 0) {
             depth_max = std::max(depth_max, j.depth);
@@ -1831,6 +1890,7 @@ int main(int argc, char ** argv) {
             streams_max   = std::max(streams_max, j.streams);
             streams_slots = std::max(streams_slots, j.streams*2*(std::max(0, j.depth) + 1));
             chunk_max     = std::max(chunk_max, j.chunk > 0 ? j.chunk : 64);
+            chunks_max    = std::max(chunks_max, j.chunks > 0 ? j.chunks : 2);
         }
     }
     if (race_max > 1 && streams_max > 0) {
@@ -1891,7 +1951,7 @@ int main(int argc, char ** argv) {
 
     if (depth_max >= 0) {
         g_n_token_slots = n_slots > 0 ? n_slots : std::max({ 2*(depth_max + 1), 2*race_max, streams_slots });
-        g_n_chunk_slots = streams_max > 0 ? 2 : 0;
+        g_n_chunk_slots = streams_max > 0 ? chunks_max : 0;
         if (llama_pipe_init_ext(ctx, g_n_token_slots, g_n_chunk_slots, chunk_max) != 0) {
             LOG_ERR("%s: llama_pipe_init failed\n", __func__);
             return 1;
