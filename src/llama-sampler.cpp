@@ -2959,6 +2959,14 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
+bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    return ctx->grammar != nullptr && ctx->grammar->awaiting_trigger;
+}
+
 // penalties
 
 struct llama_sampler_penalties : public llama_sampler_backend {

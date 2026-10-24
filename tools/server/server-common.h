@@ -413,6 +413,12 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // how the request's tokens were sampled (common_sampler_stats), reported for requests with a grammar
+    bool     smpl_grammar     = false;
+    int32_t  smpl_device      = 0; // drawn by the backend sampler
+    int32_t  smpl_constrained = 0; // while the grammar could reject them
+    int32_t  smpl_rejected    = 0; // first draw rejected by the grammar, resampled from the full row
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

@@ -84,6 +84,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    float * get_logits_ith_fetch(int32_t i);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -385,6 +386,11 @@ private:
     };
 
     std::vector<swap_info> output_swaps;
+
+    // logits of the last decode that a backend sampler sampled stay on the device: get_logits_ith fetches such a row
+    // on demand, as long as no later ubatch of that decode, or a later decode, has reused the compute buffers
+    ggml_tensor *        logits_dev_tensor  = nullptr; // the logits of the decode's last ubatch
+    std::vector<int32_t> logits_dev_rows;              // per output row: its row in logits_dev_tensor, -1 on the host, -2 lost
 
     ggml_backend_sched_ptr sched;
 

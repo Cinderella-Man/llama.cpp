@@ -1142,6 +1142,35 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+float * llama_context::get_logits_ith_fetch(int32_t i) {
+    output_reorder();
+
+    try {
+        if (logits.data == nullptr) {
+            throw std::runtime_error("no logits");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        const int64_t n_vocab = model.vocab.n_tokens();
+
+        // an output sampled by a backend sampler: its logits are on the device, if still there
+        if ((size_t) j < logits_dev_rows.size() && logits_dev_rows[j] != -1) {
+            if (logits_dev_rows[j] == -2 || logits_dev_tensor == nullptr) {
+                throw std::runtime_error("sampled on the device, and a later ubatch overwrote its logits");
+            }
+            synchronize();
+            ggml_backend_tensor_get(logits_dev_tensor, logits.data + j*n_vocab, logits_dev_rows[j]*n_vocab*sizeof(float),
+                    n_vocab*sizeof(float));
+            logits_dev_rows[j] = -1;
+        }
+
+        return logits.data + j*n_vocab;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+        return nullptr;
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2556,6 +2585,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    logits_dev_tensor = nullptr;
+    logits_dev_rows.clear();
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -2694,7 +2726,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        // this ubatch reused the compute buffers: rows that an earlier ubatch left on the device are gone
+        for (auto & r : logits_dev_rows) {
+            r = r >= 0 ? -2 : r;
+        }
+        if (logits_dev_rows.size() < (size_t) n_outputs_all) {
+            logits_dev_rows.resize(n_outputs_all, -1);
+        }
+
         // extract logits
+        if (logits.data && t_logits && n_outputs > 0 && !needs_raw_logits(ubatch, sampling.samplers)) {
+            // every output of this ubatch is sampled by a backend sampler: its logits stay on the device
+            logits_dev_tensor = t_logits;
+            for (int32_t k = 0; k < n_outputs; k++) {
+                logits_dev_rows[n_outputs_prev + k] = k;
+            }
+        }
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
@@ -3081,6 +3128,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
+        }
+
+        if (i0 < logits_dev_rows.size() && i1 < logits_dev_rows.size()) {
+            std::swap(logits_dev_rows[i0], logits_dev_rows[i1]);
         }
 
         if (embd.size > 0) {
@@ -4886,6 +4937,12 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+float * llama_get_logits_ith_fetch(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_logits_ith_fetch(i);
 }
 
 float * llama_get_logits(llama_context * ctx) {

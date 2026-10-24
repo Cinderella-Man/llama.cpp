@@ -1283,6 +1283,11 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Like llama_get_logits_ith, also for an output that a backend sampler sampled: its row is copied from the device
+    // first (the device keeps the logits of a decode's last ubatch until the next decode). NULL if a later ubatch of that
+    // decode overwrote it.
+    LLAMA_API float * llama_get_logits_ith_fetch(struct llama_context * ctx, int32_t i);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
@@ -1707,6 +1712,9 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
+
+    /// @details True for a lazy grammar sampler that has not seen its trigger yet: until then it allows every token
+    LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
 
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
