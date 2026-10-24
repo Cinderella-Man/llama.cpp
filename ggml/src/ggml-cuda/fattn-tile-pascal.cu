@@ -628,6 +628,15 @@ bool ggml_cuda_flash_attn_ext_tile_pascal(ggml_backend_cuda_context & ctx, ggml_
     const ggml_tensor * K = dst->src[1];
     const bool q8_0 = K->type == GGML_TYPE_Q8_0;
 
+    // one log line per head size and cache type, so a run shows that the kernel took the prompts
+    static bool logged[2][2] = {{false, false}, {false, false}};
+    const int D = (int) dst->src[0]->ne[0];
+    if (!logged[D == 256][q8_0]) {
+        logged[D == 256][q8_0] = true;
+        GGML_LOG_INFO("%s: compute-6.1 prompt attention kernel: head %d, %s K/V, %s scores (GGML_CUDA_FATTN_TILE_PASCAL=0 turns it off)\n",
+            __func__, D, ggml_type_name(K->type), D == 128 && ftp_split_128() ? "split" : "plain");
+    }
+
     switch (dst->src[0]->ne[0]) {
         case 128:
             if (ftp_split_128()) {
