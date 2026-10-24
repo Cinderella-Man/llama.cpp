@@ -16,10 +16,11 @@
 // the same order, so ffn_out is bit-identical to it. bench/persistent_pascal of
 // github.com/Cinderella-Man/llms-on-crypto-mining-rigs has the prototype and the argument why it cannot deadlock.
 //
-// Where it runs: only on NVIDIA GPUs of compute capability 6.1 (the 5-SM P106-090 class it was tuned for), and only when
-// switched on; every other GPU, HIP and MUSA keep the per-op path. The kernel itself runs on any NVIDIA GPU, so tests
-// can force it there (=2), natively and through the compute_61 PTX.
-// GGML_CUDA_PERSISTENT_MOE:       0 off (default), 1 compute capability 6.1, 2 any NVIDIA GPU (for testing)
+// Where it runs: by default on NVIDIA GPUs of compute capability 6.1 (the 5-SM P106-090 class it was tuned for); every
+// other GPU, HIP and MUSA keep the per-op path. The kernel itself runs on any NVIDIA GPU, so tests can force it there
+// (=2), natively and through the compute_61 PTX. A layer whose graph carries Flint's MoE down-projection rescale at one
+// token (LLAMA_NO_MOE_DOWN_RESCALE unset) keeps the per-op path, and the first such layer logs a warning saying so.
+// GGML_CUDA_PERSISTENT_MOE:       0 off, 1 compute capability 6.1 (default), 2 any NVIDIA GPU (for testing)
 // GGML_CUDA_PERSISTENT_MOE_CHECK: 1 runs the per-op path as well and compares its results bit for bit on the device
 //                                 with the kernel's: router logits, expert ids and weights, routed activations, routed
 //                                 down outputs, shared activations and ffn_out; the counts are logged per graph
@@ -57,6 +58,7 @@ struct ggml_cuda_moe_layer {
     float               scale_val = 1.0f;    // routing weight scale
     int                 router_prec = 0;     // ggml_prec of the router product (F16 accumulates in half where fast)
     int                 n_nodes   = 0;       // graph nodes from the RMS norm to dst, foreign view nodes included
+    bool                down_rescale = false; // no match: the MoE down-projection rescale sits between GLU and down
     const ggml_tensor * stage[GGML_CUDA_MOE_STAGE_COUNT] = {}; // the per-op path's nodes, for check mode
 };
 
@@ -68,6 +70,9 @@ bool ggml_cuda_moe_persistent_check_mode();
 
 // whether a kernel exists for the layer's shapes, types and alignment
 bool ggml_cuda_moe_persistent_supported(const ggml_cuda_moe_layer & layer);
+
+// A layer kept the per-op path because of the MoE down-projection rescale at one token: warns once per device.
+void ggml_cuda_moe_persistent_rescale_notice(int device);
 
 // Runs the layer into layer.dst. In check mode it writes a scratch output instead and remembers layer.dst; the per-op
 // path then computes dst as usual and ggml_cuda_moe_persistent_check_node compares the two once dst is written.

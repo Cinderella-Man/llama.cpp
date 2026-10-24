@@ -3,6 +3,7 @@
 #include "unary.cuh"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cstdlib>
 #include <cstring>
@@ -868,7 +869,7 @@ static int moep_find_combo(const ggml_type gu, const ggml_type dn, const ggml_ty
 static int moep_mode() {
     static const int mode = [] {
         const char * env = getenv("GGML_CUDA_PERSISTENT_MOE");
-        return env ? atoi(env) : 0;
+        return env ? atoi(env) : 1;
     }();
     return mode;
 }
@@ -947,7 +948,17 @@ static void moep_alloc(ggml_backend_cuda_context & ctx) {
 
 } // namespace
 
-// 1: compute capability 6.1 only; 2: any NVIDIA GPU (testing)
+void ggml_cuda_moe_persistent_rescale_notice(const int device) {
+    static std::atomic<bool> warned[GGML_CUDA_MAX_DEVICES];
+    if (!warned[device].exchange(true)) {
+        GGML_LOG_WARN("%s: CUDA%d: MoE layers at one token keep the per-op path: the graph rescales the MoE down-projection "
+                      "inputs (LLAMA_NO_MOE_DOWN_RESCALE is unset). Set LLAMA_NO_MOE_DOWN_RESCALE=tg to run each layer as "
+                      "one persistent kernel: the Pascal kernels sum activations in FP32, so one-token steps need no "
+                      "rescale\n", __func__, device);
+    }
+}
+
+// 1 (default): compute capability 6.1 only; 2: any NVIDIA GPU (testing)
 bool ggml_cuda_moe_persistent_enabled(const int cc) {
     const int mode = moep_mode();
     return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
@@ -1129,6 +1140,10 @@ bool ggml_cuda_moe_persistent_check_mode() {
 bool ggml_cuda_moe_persistent_supported(const ggml_cuda_moe_layer & layer) {
     GGML_UNUSED(layer);
     return false;
+}
+
+void ggml_cuda_moe_persistent_rescale_notice(int device) {
+    GGML_UNUSED(device);
 }
 
 void ggml_cuda_op_moe_persistent(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_layer & layer) {
