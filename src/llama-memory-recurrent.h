@@ -56,8 +56,8 @@ public:
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
-    // find a contiguous slot of memory cells and emplace the ubatch there
-    bool find_slot(const llama_ubatch & ubatch);
+    // find a contiguous slot of memory cells and emplace the ubatch there; grp: the state group the ubatch writes
+    bool find_slot(const llama_ubatch & ubatch, uint32_t grp = 0);
 
     bool get_can_shift() const override;
 
@@ -78,6 +78,27 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // State groups for pipelined decoding (llama_pipe_*, n_rs_seq 0 only): the tensors hold n_grp groups of size rows,
+    // and each pipe slot's evaluations write their states to the group of the slot's index (llama_decode: group 0), at a
+    // fixed offset in the slot's graph. Every evaluation reads its source state through s_copy, from the group that holds
+    // it. Per cell (row index) ring_pos records which position's state each group holds, so removing a sequence's tail
+    // (a wrong guess) only has to find the group that holds the state at the new end. A slot is reused only once the
+    // executor has read its token, so the states of tokens still in flight stay; the one state before them that a
+    // rollback may need is saved in a last, stash group when its slot is reused (pipe_stash).
+    // set_n_groups keeps each cell's current state (moved to group 0) and forgets the older ones.
+    uint32_t n_grp = 1;
+
+    bool set_n_groups(uint32_t n);
+
+    // the last group (n_grp - 1) is the stash: before a pipe slot's evaluation writes group g of seq_id's row, the
+    // state at position keep (the one before the sequence's oldest token still to be read, which a rollback may need:
+    // a wrong guess behind it, or an executor leaving pipelined decoding) must not be lost if g holds it. Returns the
+    // row whose group g the caller copies into the stash (the ring already says the stash holds it), -1 if none
+    int32_t pipe_stash(llama_seq_id seq_id, uint32_t g, llama_pos keep);
+
+    // the group the next batch context writes (llama_context sets it around init_batch for a pipe slot)
+    uint32_t grp_next = 0;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -90,6 +111,11 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // state groups (see n_grp), properties of the row index rather than of the sequence in it:
+        int32_t                grp      = 0;  // the group holding the state at pos
+        int32_t                src_grp0 = 0;  // the group src0 is read from, staged with src0
+        std::vector<llama_pos> ring_pos;      // per group, the position of the state it holds for this row (-1: none)
 
         std::set<llama_seq_id> seq_id;
 
@@ -122,6 +148,18 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // what the tensors are made of, kept for set_n_groups: per layer its buffer type (null: no state), and the types
+    std::vector<ggml_backend_buffer_type_t> layer_buft;
+    ggml_type type_r = GGML_TYPE_F32;
+    ggml_type type_s = GGML_TYPE_F32;
+
+    // (re)creates r_l, s_l, p_l and ctxs_bufs with n_rows rows each, cleared
+    void alloc_tensors(uint32_t n_rows);
+
+    // a cell's ring after its row was written with the state at pos in group g: the states of positions before p_keep
+    // in the other groups stay valid (0: none, when the row got another sequence's state), the others are forgotten
+    void ring_set(mem_cell & cell, int32_t g, llama_pos pos, llama_pos p_keep) const;
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
@@ -176,6 +214,9 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    // the state group the ubatches' new states are written to (see llama_memory_recurrent::n_grp)
+    uint32_t get_grp() const;
+
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
@@ -197,4 +238,6 @@ private:
     //
 
     const bool is_full = false;
+
+    const uint32_t grp = 0;
 };

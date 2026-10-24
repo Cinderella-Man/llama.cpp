@@ -475,7 +475,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
-        const int64_t s_slot = 0;
+        // the state group this ubatch writes: its pipe slot's, 0 for llama_decode (llama_memory_recurrent::n_grp)
+        const int64_t s_slot = mctx_cur->get_grp();
 
         ggml_tensor * conv_state_last =
             ggml_view_3d(ctx0, conv_input,
@@ -549,10 +550,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
+        // into the state group of this ubatch (see build_conv_state)
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+                        ((size_t) mctx_cur->get_grp() * mem_size + kv_head) * row_size)));
 
         return output;
     }

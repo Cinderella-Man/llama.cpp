@@ -299,6 +299,7 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    uint32_t grp; // the state group the new states are written to (a pipe slot's own)
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
