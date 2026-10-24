@@ -4233,13 +4233,13 @@ struct ggml_tensor * ggml_kq_mask(
         enum ggml_type        type,
         int                   swa_type,
         int                   n_swa) {
-    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
-    GGML_ASSERT(cells->ne[1] == 2 && toks->ne[1] == 2 && cells->ne[2] == toks->ne[2] && cells->ne[3] == 1 && toks->ne[3] == 1);
-    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
+    GGML_ASSERT(cells->type == GGML_TYPE_F32 && toks->type == GGML_TYPE_I32);
+    GGML_ASSERT(cells->ne[0] == 2 && toks->ne[0] == 2 && cells->ne[2] == toks->ne[2] && cells->ne[3] == 1 && toks->ne[3] == 1);
+    GGML_ASSERT(cells->nb[0] == sizeof(float) && ggml_is_contiguous(toks));
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
     GGML_ASSERT(swa_type >= 0 && swa_type <= 3);
 
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, cells->ne[0], toks->ne[0], 1, cells->ne[2]);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, cells->ne[1], toks->ne[1], 1, cells->ne[2]);
 
     int32_t params[] = { swa_type, n_swa };
     ggml_set_op_params(result, params, sizeof(params));

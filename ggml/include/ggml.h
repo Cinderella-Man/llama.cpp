@@ -1828,9 +1828,10 @@ extern "C" {
             float                 max_bias);
 
     // causal attention mask built from KV cell and token positions, so it can be computed on the device that uses it:
-    //   cells: I32 [n_kv, 2, n_stream]: row 0 the cell's position, row 1 a bit mask of the micro-batch's sequences
-    //          (bit b = the sequence of index b) the cell belongs to, 0 for an empty cell
-    //   toks:  I32 [n_tps, 2, n_stream]: row 0 the token's position, row 1 the index (0..31) of its sequence
+    //   cells: F32 [2, n_kv, n_stream] (any strides of dims 1 and 2): per cell its position and a bit mask of the
+    //          sequences it belongs to (bit s = sequence id s), 0 for an empty cell; both are integers, exact in F32
+    //          below 2^24
+    //   toks:  I32 [2, n_tps, n_stream]: per token its position and its sequence id (0..23)
     //   result [n_kv, n_tps, 1, n_stream] of type (F16 or F32): 0 where token i may attend cell j (same sequence,
     //   cell position <= token position, inside the sliding window), -INFINITY elsewhere
     //   swa_type: 0 none, 1 standard (masked when p_tok - p_cell >= n_swa), 2 chunked, 3 symmetric (as llama_swa_type)

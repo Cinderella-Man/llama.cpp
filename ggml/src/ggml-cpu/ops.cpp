@@ -8790,16 +8790,16 @@ static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params
         const int64_t s = r / n_tps;
         const int64_t i = r % n_tps;
 
-        const int32_t * cpos  = (const int32_t *) cells->data + 2*n_kv*s;
-        const int32_t * cbits = cpos + n_kv;
-        const int32_t * tpos  = (const int32_t *) toks->data + 2*n_tps*s;
-        const int32_t   p1    = tpos[i];
-        const int32_t   b     = tpos[n_tps + i];
+        const int32_t * tok = (const int32_t *) toks->data + 2*(n_tps*s + i);
+        const int32_t   p1  = tok[0];
+        const int32_t   sq  = tok[1];
 
+        const char * cs = (const char *) cells->data + s*cells->nb[2];
         T * row = (T *) ((char *) dst->data + i*dst->nb[1] + s*dst->nb[3]);
         for (int64_t j = 0; j < n_kv; ++j) {
-            const int32_t p0 = cpos[j];
-            const bool same_seq = ((uint32_t) cbits[j] >> b) & 1;
+            const float * cell = (const float *) (cs + j*cells->nb[1]);
+            const int32_t p0 = (int32_t) cell[0];
+            const bool same_seq = ((uint32_t) cell[1] >> sq) & 1;
             row[j] = same_seq && p0 <= p1 && !ggml_kq_mask_swa_masked(swa_type, n_swa, p0, p1) ? keep : drop;
         }
     }

@@ -15,23 +15,24 @@ static __device__ __forceinline__ bool kq_mask_swa_masked(const int swa_type, co
     }
 }
 
-// One block row per token row (blockIdx.y = token i of stream blockIdx.z), threads over the KV cells; the token's
-// position and sequence bit are read once per thread, each cell's position and sequence bits once.
+// One block row per token row (blockIdx.y = token i of stream blockIdx.z), threads over the KV cells; each cell's
+// position and sequence bits are read once.
 template <typename T>
 static __global__ void kq_mask_kernel(
-        const int * __restrict__ cells, const int * __restrict__ toks, T * __restrict__ dst,
-        const int n_kv, const int n_tps, const int64_t nb1, const int64_t nb3, const int swa_type, const int n_swa) {
+        const char * __restrict__ cells, const int * __restrict__ toks, T * __restrict__ dst,
+        const int n_kv, const int n_tps, const int64_t cnb1, const int64_t cnb2, const int64_t nb1, const int64_t nb3,
+        const int swa_type, const int n_swa) {
     const int j = blockIdx.x*blockDim.x + threadIdx.x;
     const int i = blockIdx.y;
     const int s = blockIdx.z;
     if (j >= n_kv) {
         return;
     }
-    const int * cpos = cells + 2*(int64_t) n_kv*s;
-    const int * tpos = toks  + 2*(int64_t) n_tps*s;
-    const int p0 = cpos[j];
-    const int p1 = tpos[i];
-    const bool same_seq = ((unsigned int) cpos[n_kv + j] >> tpos[n_tps + i]) & 1;
+    const float2 cell = *(const float2 *) (cells + s*cnb2 + j*cnb1);
+    const int * tok = toks + 2*((int64_t) n_tps*s + i);
+    const int p0 = (int) cell.x;
+    const int p1 = tok[0];
+    const bool same_seq = ((unsigned int) cell.y >> tok[1]) & 1;
     const bool keep = same_seq && p0 <= p1 && !kq_mask_swa_masked(swa_type, n_swa, p0, p1);
     T * row = (T *) ((char *) dst + i*nb1 + s*nb3);
     row[j] = ggml_cuda_cast<T>(keep ? 0.0f : -INFINITY);
@@ -40,8 +41,8 @@ static __global__ void kq_mask_kernel(
 void ggml_cuda_op_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * cells = dst->src[0];
     const ggml_tensor * toks  = dst->src[1];
-    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
+    GGML_ASSERT(cells->type == GGML_TYPE_F32 && toks->type == GGML_TYPE_I32);
+    GGML_ASSERT(cells->nb[0] == sizeof(float) && cells->nb[1] % 8 == 0 && cells->nb[2] % 8 == 0 && ggml_is_contiguous(toks));
 
     const int n_kv     = (int) dst->ne[0];
     const int n_tps    = (int) dst->ne[1];
@@ -54,10 +55,12 @@ void ggml_cuda_op_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
     if (dst->type == GGML_TYPE_F16) {
         kq_mask_kernel<half><<<grid, CUDA_KQ_MASK_BLOCK_SIZE, 0, stream>>>(
-            (const int *) cells->data, (const int *) toks->data, (half *) dst->data, n_kv, n_tps, dst->nb[1], dst->nb[3], swa_type, n_swa);
+            (const char *) cells->data, (const int *) toks->data, (half *) dst->data, n_kv, n_tps, cells->nb[1], cells->nb[2],
+            dst->nb[1], dst->nb[3], swa_type, n_swa);
     } else {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
         kq_mask_kernel<float><<<grid, CUDA_KQ_MASK_BLOCK_SIZE, 0, stream>>>(
-            (const int *) cells->data, (const int *) toks->data, (float *) dst->data, n_kv, n_tps, dst->nb[1], dst->nb[3], swa_type, n_swa);
+            (const char *) cells->data, (const int *) toks->data, (float *) dst->data, n_kv, n_tps, cells->nb[1], cells->nb[2],
+            dst->nb[1], dst->nb[3], swa_type, n_swa);
     }
 }
