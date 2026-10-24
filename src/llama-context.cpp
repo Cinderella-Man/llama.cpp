@@ -2193,6 +2193,18 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
 
     this->n_outputs = save_n_outputs;
 
+    // LLAMA_GPU_KQ_MASK_CHECK=1 reads the devices' cell copies while it sets the inputs: the tokens still in flight
+    // must have written theirs first (as in process_ubatch; only the check needs it, the devices run in order anyway)
+    static const bool kq_mask_check = [] {
+        const char * env = getenv("LLAMA_GPU_KQ_MASK_CHECK");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (kq_mask_check) {
+        for (auto * backend : backend_ptrs) {
+            ggml_backend_synchronize(backend);
+        }
+    }
+
     slot.res->set_inputs(&ubatch);
 
     // same thread settings as graph_compute() uses for a single token
