@@ -374,6 +374,11 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
     cparams.training = false;
 
+    // the MoE down-projection rescale is dropped at one token by default where every device is of compute capability
+    // 6.1, whose Pascal kernels compute the activation block sums in FP32 (llm_graph_moe_down_rescale)
+    cparams.moe_down_rescale_tg = !model.devices.empty() &&
+        llama_backend_dev_has_feature(model.devices[0].dev, "COMPUTE_6_1");
+
     // screened output head: LLAMA_SCREEN_HEAD=1 enables it for models with an output_screen tensor,
     // LLAMA_SCREEN_HEAD_M=<M> overrides the model's number of candidates
     {
