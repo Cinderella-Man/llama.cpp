@@ -5978,6 +5978,65 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+// (ADD +) RMS_NORM + MUL of one row feeding quantized matrix-vector products, as in a transformer layer at one token:
+// the residual sum is read again later (an output projection plus the residual), and the normed row by Q/K-like
+// products, a routed expert pair (MUL_MAT_ID gate/up + SwiGLU), a shared expert pair and an F32 router. The CUDA backend
+// fuses the norm with the Q8_1 quantization of its output (GGML_CUDA_NORM_Q8) for one row whose width is a multiple of
+// 512, up to 4096; other cases run unfused.
+struct test_add_rms_norm_mul_q8 : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const bool with_add;
+    const int64_t n_tokens;
+    std::vector<ggml_tensor *> checked;
+
+    test_add_rms_norm_mul_q8(ggml_type type, int64_t n_embd, bool with_add, int64_t n_tokens)
+        : type(type), n_embd(n_embd), with_add(with_add), n_tokens(n_tokens) {}
+
+    std::string vars() override { return VARS_TO_STR4(type, n_embd, with_add, n_tokens); }
+    std::string op_desc(ggml_tensor *) override { return "ADD_RMS_NORM_MUL_Q8"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        if (with_add) {
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            x = ggml_add(ctx, x, b);
+            checked.push_back(x);
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * q = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, n_embd, 256), normed);
+        ggml_tensor * k = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, n_embd, 64), normed);
+        ggml_tensor * normed3 = ggml_reshape_3d(ctx, normed, n_embd, 1, n_tokens);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n_tokens);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, n_embd, 128, 8);
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type, n_embd, 128, 8);
+        ggml_tensor * routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, normed3, ids), ggml_mul_mat_id(ctx, up, normed3, ids));
+        ggml_tensor * sgate = ggml_new_tensor_2d(ctx, type, n_embd, 128);
+        ggml_tensor * sup = ggml_new_tensor_2d(ctx, type, n_embd, 128);
+        ggml_tensor * shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, sgate, normed), ggml_mul_mat(ctx, sup, normed));
+        ggml_tensor * router = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 16), normed);
+        ggml_tensor * res = ggml_add(ctx, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, 256, n_embd), q), x);
+        for (ggml_tensor * t : { normed, q, k, routed, shared, router, res }) {
+            checked.push_back(t);
+        }
+        ggml_tensor * out = ggml_reshape_2d(ctx, routed, routed->ne[0] * routed->ne[1], n_tokens);
+        for (ggml_tensor * t : { shared, router, k, res }) {
+            out = ggml_concat(ctx, out, t, 0);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -11574,6 +11633,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
+    }
+
+    // the norm writing its output as Q8_1 (one row of width 2048 or 4096), and cases it must leave alone (1536 wide, 2 rows)
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K }) {
+        for (bool with_add : { false, true }) {
+            for (int64_t n_embd : { 2048, 4096 }) {
+                test_cases.emplace_back(new test_add_rms_norm_mul_q8(type, n_embd, with_add, 1));
+            }
+        }
+    }
+    for (bool with_add : { false, true }) {
+        test_cases.emplace_back(new test_add_rms_norm_mul_q8(GGML_TYPE_Q8_0, 1536, with_add, 1));
+        test_cases.emplace_back(new test_add_rms_norm_mul_q8(GGML_TYPE_Q8_0, 2048, with_add, 2));
     }
 
     // one-token products at the shapes of a large MoE model (Flint: hidden 2048, 32 x 128 query heads, 4 x 128 KV

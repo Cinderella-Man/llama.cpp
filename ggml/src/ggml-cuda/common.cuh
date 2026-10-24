@@ -185,6 +185,7 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 // ---------------------------------------------------------------------------------------------------------
 
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
+#define GGML_CUDA_NORM_Q8_MAX_COLS 4096 // widest row a fused norm writes as Q8_1 (GGML_CUDA_NORM_Q8)
 
 #define GGML_CUDA_MAX_STREAMS 8
 
@@ -1521,6 +1522,19 @@ struct ggml_backend_cuda_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    // The Q8_1 copy of one F32 row that a fused RMS norm wrote (GGML_CUDA_NORM_Q8): mul_mat_vec_q skips its own
+    // quantization for every product that reads that row (Q/K/V after the attention norm, routed and shared gate/up
+    // after the FFN norm). src is the norm's output node, nullptr when no copy is valid; cleared at the start of each
+    // graph evaluation and whenever a node writes over src's memory.
+    struct q8_1_row_cache {
+        const ggml_tensor * src = nullptr;
+        int64_t             ne0 = 0;
+        void              * buf = nullptr; // GGML_CUDA_NORM_Q8_MAX_COLS / QK8_1 blocks, allocated on first use
+        // per graph evaluation, logged with GGML_CUDA_NORM_Q8_DEBUG=1: norms that wrote a row (with the residual add),
+        // single-token products that read it, and single-token products that quantized their activations themselves
+        int n_written = 0, n_written_add = 0, n_read = 0, n_quantized = 0;
+    } q8_1_row;
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
@@ -1571,6 +1585,22 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// The Q8_1 copy of src1 in ctx.q8_1_row, if the norm that produced src1 (directly or through a reshape or view of all of
+// it) wrote one and src1 is one row of ne10_padded values; else nullptr.
+static inline const void * ggml_cuda_q8_1_row_lookup(const ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t ne10_padded) {
+    const ggml_tensor * t = ctx.q8_1_row.src;
+    if (t == nullptr || src1->type != GGML_TYPE_F32 || src1->ne[0] != ctx.q8_1_row.ne0 || ne10_padded != ctx.q8_1_row.ne0 ||
+            ggml_nrows(src1) != 1 || !ggml_is_contiguous(src1)) {
+        return nullptr;
+    }
+    const ggml_tensor * s = src1;
+    while (s != t && (s->op == GGML_OP_RESHAPE || s->op == GGML_OP_VIEW) && s->view_src != nullptr && s->view_offs == 0 &&
+            ggml_nelements(s) == ggml_nelements(s->view_src)) {
+        s = s->view_src;
+    }
+    return s == t ? ctx.q8_1_row.buf : nullptr;
+}
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
