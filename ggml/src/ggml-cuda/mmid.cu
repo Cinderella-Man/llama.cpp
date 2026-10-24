@@ -36,7 +36,7 @@ static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids,
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const uint3 tile_width,
-        const int si1, const int sis1, const bool write_inverse) {
+        const int si1, const int sis1, const bool write_inverse, const int tiles_per_expert) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
@@ -118,6 +118,17 @@ static __global__ void mm_ids_helper(
         }
     }
 
+    if (tiles_per_expert > 0) {
+        // The layout before the tile list (GGML_CUDA_MMQ_MOE_LEGACY): tiles_per_expert tiles of tile_width columns from
+        // the expert's first column, the ones past its last column empty.
+        for (int t = threadIdx.x; t < tiles_per_expert; t += warp_size) {
+            const int col_low  = nex_prev + min(t*int(tile_width.z), it_compact);
+            const int col_high = nex_prev + min((t + 1)*int(tile_width.z), it_compact);
+            tile_spec[expert*tiles_per_expert + t] = {expert, col_low, col_high, /*padding =*/ 0};
+        }
+        return;
+    }
+
     if (threadIdx.x != 0) {
         return;
     }
@@ -144,7 +155,7 @@ static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids,
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int tile_width,
-        const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+        const int si1, const int sis1, const bool write_inverse, cudaStream_t stream, const int tiles_per_expert) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
 
@@ -160,46 +171,47 @@ static void launch_mm_ids_helper(
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
-        (ids, ids_src1, ids_dst, tile_spec, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
+        (ids, ids_src1, ids_dst, tile_spec, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse,
+         tiles_per_expert);
 }
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids,
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
-        const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+        const int si1, const int sis1, const bool write_inverse, cudaStream_t stream, const int tiles_per_expert) {
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
         case  4:
             launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
         case  6:
             launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
         case  8:
             launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
         case 10:
             launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
         case 16:
             launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
         case 32:
             launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
         default:
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, tile_spec,
-                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
+                n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream, tiles_per_expert);
             break;
     }
 }

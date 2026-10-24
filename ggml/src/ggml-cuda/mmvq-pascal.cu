@@ -926,6 +926,16 @@ static int mmvqp_mode() {
     return mode;
 }
 
+// GGML_CUDA_MMVQ_PASCAL_MC=0: 2 to MMVQP_MAX_COLS tokens go to llama.cpp's kernels, as before the multi-token kernels;
+// one token keeps the Pascal kernels
+static bool mmvqp_multi_col() {
+    static const bool mc = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_MC");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return mc;
+}
+
 // GGML_CUDA_MMVQ_PASCAL_STAGE_ACT=1: the multi-token kernels stage each token's activations through shared memory
 static bool mmvqp_stage_act() {
     static const bool stage = [] {
@@ -952,7 +962,7 @@ bool ggml_cuda_mmvq_pascal(
         int64_t stride_col_dst, int64_t nchannels_x, int64_t nchannels_y, int64_t nchannels_dst, int64_t stride_channel_x,
         int64_t stride_channel_y, int64_t stride_channel_dst, int64_t nsamples_x, int64_t nsamples_dst, int64_t stride_sample_x,
         int64_t stride_sample_y, int64_t stride_sample_dst, int64_t ids_stride, cudaStream_t stream) {
-    if (ncols_dst < 1 || ncols_dst > MMVQP_MAX_COLS ||
+    if (ncols_dst < 1 || ncols_dst > MMVQP_MAX_COLS || (ncols_dst > 1 && !mmvqp_multi_col()) ||
             !ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
     }
