@@ -779,6 +779,10 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // the samplers' input tensors in this graph (a sampler keeps those of the graph built last; several graphs that use
+    // one sampler, such as pipelined slots, point it back at their own before setting them)
+    std::map<llama_seq_id, std::vector<std::vector<ggml_tensor *>>> sampler_inputs;
 };
 
 //
