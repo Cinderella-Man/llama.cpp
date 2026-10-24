@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-pipe-drafter.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -276,6 +277,11 @@ public:
     llama_token pipe_get_sampled(int32_t i_slot);
     void    pipe_drain();
 
+    // staircase drafter (experimental, see llama_pipe_draft_* in llama.h)
+    int32_t pipe_draft_init(const llama_pipe_draft_params & params);
+    void    pipe_draft_reset(llama_seq_id seq_id, llama_pos n_keep);
+    llama_pipe_drafter * get_pipe_drafter() const { return pipe_drafter.get(); }
+
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -456,6 +462,9 @@ private:
     };
 
     std::vector<pipe_slot> pipe_slots;
+
+    // the staircase drafter fed by the pipe slots' taps and llama_decode's prompt captures (llama_pipe_draft_*)
+    std::unique_ptr<llama_pipe_drafter> pipe_drafter;
 
     // how the slots upload their host inputs (ggml_backend_sched_set_input_upload, LLAMA_PIPE_UPLOAD)
     int pipe_upload = 2;

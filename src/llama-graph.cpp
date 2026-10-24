@@ -1555,6 +1555,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_embd_all    = nullptr;
     t_h_nextn     = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
@@ -1608,6 +1609,18 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
+                ggml_set_output(t_layer_inp[il]);
+            }
+        }
+    }
+    if (t_embd_all != nullptr) {
+        ggml_set_output(t_embd_all);
+    }
+    {
+        // the staircase drafter's taps: kept until the pipe evaluation has copied them out
+        const auto & tap = params.cparams.pipe_tap_layer;
+        for (size_t il = 0; il < tap.size() && il < t_layer_inp.size(); ++il) {
+            if (tap[il] && t_layer_inp[il] != nullptr) {
                 ggml_set_output(t_layer_inp[il]);
             }
         }

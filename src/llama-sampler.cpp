@@ -1492,6 +1492,16 @@ bool llama_sampler_chain_on_backend(const struct llama_sampler * smpl) {
     return true;
 }
 
+// splitmix64 of (seed, pos): the draw depends on the position only, not on how many draws came before
+static uint32_t llama_sampler_pos_seed(uint32_t seed, llama_pos pos) {
+    uint64_t x = ((uint64_t) seed << 32) ^ (uint64_t) (uint32_t) pos;
+    x += 0x9e3779b97f4a7c15ULL;
+    x  = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x  = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x ^=  x >> 31;
+    return (uint32_t) (x ^ (x >> 32));
+}
+
 void llama_sampler_set_pos(struct llama_sampler * smpl, llama_pos pos) {
     GGML_ASSERT(smpl != nullptr);
 
@@ -1503,17 +1513,34 @@ void llama_sampler_set_pos(struct llama_sampler * smpl, llama_pos pos) {
     } else if (smpl->iface == &llama_sampler_dist_i) {
         auto * ctx = (llama_sampler_dist *) smpl->ctx;
 
-        // splitmix64 of (seed, pos): the draw depends on the position only, not on how many draws came before
-        uint64_t x = ((uint64_t) ctx->seed_cur << 32) ^ (uint64_t) (uint32_t) pos;
-        x += 0x9e3779b97f4a7c15ULL;
-        x  = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        x  = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-        x ^=  x >> 31;
-
         ctx->pos_keyed = true;
-        ctx->rng_backend.seed((uint32_t) (x ^ (x >> 32)));
+        ctx->rng_backend.seed(llama_sampler_pos_seed(ctx->seed_cur, pos));
         ctx->n_backend_draws_generated = 0;
     }
+}
+
+float llama_sampler_pos_uniform(const struct llama_sampler * smpl, llama_pos pos) {
+    if (smpl == nullptr) {
+        return -1.0f;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+        for (const auto & entry : chain->samplers) {
+            const float u = llama_sampler_pos_uniform(entry.ptr, pos);
+            if (u >= 0.0f) {
+                return u;
+            }
+        }
+        return -1.0f;
+    }
+    if (smpl->iface == &llama_sampler_dist_i) {
+        const auto * ctx = (const llama_sampler_dist *) smpl->ctx;
+        // the first draw after llama_sampler_set_pos, as llama_sampler_dist_backend_set_input takes it
+        std::mt19937 rng(llama_sampler_pos_seed(ctx->seed_cur, pos));
+        std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+        return (float) dist(rng);
+    }
+    return -1.0f;
 }
 
 // top-k

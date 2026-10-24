@@ -1717,11 +1717,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_PIPE_DEPTH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--pipe-guess"}, "TYPE",
-        string_format("guesses for --pipe-depth: none, copy (the token after the longest earlier match of the text's end) "
-            "or cont (copy, else the most frequent continuation of the last 1-8 tokens in the request) (default: %s)",
+        string_format("guesses for --pipe-depth: none, copy (the token after the longest earlier match of the text's end), "
+            "cont (copy, else the most frequent continuation of the last 1-8 tokens in the request) or staircase "
+            "(copy, else the staircase drafter of --pipe-draft) (default: %s)",
             params.pipe_guess.c_str()),
         [](common_params & params, const std::string & value) {
-            if (value != "none" && value != "copy" && value != "cont") {
+            if (value != "none" && value != "copy" && value != "cont" && value != "staircase") {
                 throw std::invalid_argument("invalid value");
             }
             params.pipe_guess = value;
@@ -1742,6 +1743,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.pipe_floor = value;
         }
     ).set_env("LLAMA_ARG_PIPE_FLOOR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-draft"}, "FNAME",
+        "staircase drafter file for --pipe-guess staircase: a small head on one GPU that guesses the next token from the "
+        "hidden states of the tokens in flight",
+        [](common_params & params, const std::string & value) {
+            params.pipe_draft = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_DRAFT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-draft-dev"}, "N",
+        string_format("GPU index of the staircase drafter (default: %d, the first layer's GPU)", params.pipe_draft_dev),
+        [](common_params & params, int value) {
+            params.pipe_draft_dev = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-draft-ctx"}, "N",
+        string_format("committed positions the staircase drafter attends to (default: %d)", params.pipe_draft_ctx),
+        [](common_params & params, int value) {
+            params.pipe_draft_ctx = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-draft-alpha"}, "A",
+        "sharpening of the staircase drafter's distribution before its draw (default: the file's value)",
+        [](common_params & params, const std::string & value) {
+            params.pipe_draft_alpha = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-draft-stair"}, "LIST",
+        "anchors of the tokens in flight for the staircase drafter, newest first, e.g. L9,L17,L33,L41 (default: the file's)",
+        [](common_params & params, const std::string & value) {
+            params.pipe_draft_stair = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
