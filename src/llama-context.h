@@ -440,6 +440,10 @@ private:
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
+    // a graph was handed to the scheduler since the last synchronize(), so with pipeline parallelism it may still be
+    // computing on the devices
+    mutable bool gf_in_flight = false;
+
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
 
