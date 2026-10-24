@@ -1074,6 +1074,12 @@ extern "C" {
     // With a backend sampler: waits for the token sampled after the token last submitted in this slot
     LLAMA_API llama_token llama_pipe_get_sampled(struct llama_context * ctx, int32_t slot);
 
+    // True if the evaluation last submitted in this slot is complete, so that llama_pipe_get_logits and
+    // llama_pipe_get_sampled return without waiting; false while it runs or if its device cannot tell without waiting.
+    // Evaluations complete in submission order on one stream; with LLAMA_PIPE_CHUNK_STREAM=1 the chunk slots run on
+    // streams of their own (below the priority of the one-token slots), so a token can complete before an earlier chunk
+    LLAMA_API bool llama_pipe_ready(struct llama_context * ctx, int32_t slot);
+
     // Waits for all submitted tokens
     LLAMA_API void llama_pipe_drain(struct llama_context * ctx);
 

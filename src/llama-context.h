@@ -275,6 +275,7 @@ public:
     int32_t pipe_submit_fed(int32_t i_slot, int32_t i_slot_src, llama_pos pos, llama_seq_id seq_id);
     float * pipe_get_logits(int32_t i_slot);
     llama_token pipe_get_sampled(int32_t i_slot);
+    bool    pipe_ready(int32_t i_slot);
     void    pipe_drain();
 
     // staircase drafter (experimental, see llama_pipe_draft_* in llama.h)
@@ -459,7 +460,21 @@ private:
         // the token ids (set when the graph is allocated); a fed submission writes the token there
         ggml_tensor *           tok_cpy     = nullptr;
         ggml_backend_t          tok_backend = nullptr;
+
+        // the backends of the slot's scheduler: the context's, or for a chunk slot with LLAMA_PIPE_CHUNK_STREAM the
+        // chunk backends in place of the GPU ones
+        std::vector<ggml_backend_t> backends;
+
+        // ggml_backend_event_query of the output device, if it has one
+        bool (*ev_query)(ggml_backend_event_t) = nullptr;
     };
+
+    // LLAMA_PIPE_CHUNK_STREAM=1: a second backend per GPU for the chunk slots, so that prompt chunks run on streams of
+    // their own; the context's GPU backends are created with the greatest stream priority, these with the default
+    // (lowest), so a token's kernels are scheduled ahead of a chunk's on every card. Declared before pipe_slots, whose
+    // schedulers use them, so that it is destroyed after them
+    bool pipe_chunk_stream = false;
+    std::vector<ggml_backend_ptr> pipe_chunk_backends;
 
     std::vector<pipe_slot> pipe_slots;
 

@@ -455,9 +455,16 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
+        // LLAMA_PIPE_CHUNK_STREAM=1: the pipe's prompt chunks get streams of their own below these backends' priority
+        // (pipe_init)
+        {
+            const char * env = getenv("LLAMA_PIPE_CHUNK_STREAM");
+            pipe_chunk_stream = env != nullptr && atoi(env) != 0;
+        }
+
         // GPU backends
         for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, pipe_chunk_stream ? "priority=high" : nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
@@ -1739,6 +1746,27 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
     pipe_slots.clear();
     pipe_slots.resize(n_slots + n_chunk_slots);
 
+    // the chunk slots' backends: a second backend per GPU with LLAMA_PIPE_CHUNK_STREAM, else the context's
+    pipe_chunk_backends.clear();
+    std::vector<ggml_backend_t> chunk_backend_ptrs = backend_ptrs;
+    if (n_chunk_slots > 0 && pipe_chunk_stream) {
+        for (size_t i = 0; i < backend_ptrs.size(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to initialize a chunk backend on %s\n", __func__, ggml_backend_dev_name(dev));
+                pipe_slots.clear();
+                pipe_chunk_backends.clear();
+                return -1;
+            }
+            pipe_chunk_backends.emplace_back(backend);
+            chunk_backend_ptrs[i] = backend;
+        }
+    }
+
     const int64_t n_vocab   = model.vocab.n_tokens();
     const size_t  max_nodes = gf_res_reserve->get_max_nodes();
 
@@ -1776,9 +1804,10 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
     for (size_t i_slot = 0; i_slot < pipe_slots.size(); i_slot++) {
         auto & slot = pipe_slots[i_slot];
         slot.n_tokens_max = i_slot < (size_t) n_slots ? 1 : n_chunk_tokens;
+        slot.backends     = i_slot < (size_t) n_slots ? backend_ptrs : chunk_backend_ptrs;
 
         slot.sched.reset(ggml_backend_sched_new(
-                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                slot.backends.data(), backend_buft.data(), slot.backends.size(), max_nodes, false, cparams.op_offload));
         ggml_backend_sched_set_copy_callback(slot.sched.get(), sched_copy_experts, this);
         ggml_backend_sched_set_caller_sync(slot.sched.get(), true);
         ggml_backend_sched_set_input_upload(slot.sched.get(), pipe_upload);
@@ -1807,7 +1836,7 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
         slot.res->reset();
         slot.res_valid = false;
 
-        for (auto * backend : backend_ptrs) {
+        for (auto * backend : slot.backends) {
             size_total += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
         }
 
@@ -1824,8 +1853,9 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
     this->n_outputs = save_n_outputs;
 
     LLAMA_LOG_INFO("%s: %d slots + %d chunk slots of %d tokens, compute buffers %.2f MiB in total, %d splits per token, "
-            "input upload %d\n", __func__, n_slots, n_chunk_slots, n_chunk_tokens, size_total/1024.0/1024.0,
-            ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()), pipe_upload);
+            "input upload %d, chunk streams %zu\n", __func__, n_slots, n_chunk_slots, n_chunk_tokens,
+            size_total/1024.0/1024.0, ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()), pipe_upload,
+            pipe_chunk_backends.size());
 
     return 0;
 }
@@ -2012,7 +2042,7 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
             }
         }
         int n_dev_copies = 0;
-        for (auto * backend : backend_ptrs) {
+        for (auto * backend : slot.backends) {
             ggml_tensor * cpy = t_tok ? ggml_backend_sched_get_input_copy(slot.sched.get(), t_tok, backend) : nullptr;
             if (cpy != nullptr && backend != backend_cpu) {
                 slot.tok_cpy     = cpy;
@@ -2108,8 +2138,10 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
         if (slot.ev_out) {
             ggml_backend_event_free(slot.ev_out);
         }
-        slot.ev_out = ggml_backend_event_new(dev_res);
-        slot.ev_dev = dev_res;
+        slot.ev_out   = ggml_backend_event_new(dev_res);
+        slot.ev_dev   = dev_res;
+        slot.ev_query = (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev_res), "ggml_backend_event_query");
     }
 
     if (slot.ev_out) {
@@ -2151,6 +2183,23 @@ llama_token llama_context::pipe_get_sampled(int32_t i_slot) {
     memcpy(&id, out, sizeof(id));
 
     return id;
+}
+
+bool llama_context::pipe_ready(int32_t i_slot) {
+    if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size()) {
+        return false;
+    }
+
+    auto & slot = pipe_slots[i_slot];
+
+    if (slot.busy) {
+        if (slot.ev_query == nullptr || !slot.ev_query(slot.ev_out)) {
+            return false;
+        }
+        slot.busy = false;
+    }
+
+    return true;
 }
 
 void llama_context::pipe_drain() {
@@ -3456,11 +3505,13 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_graph) const
         //   computes it once and copies it between devices, which is the transfer it exists to avoid
         if ((ubatch.n_tokens < 32 || full_offload || strcmp(name, "kq_mask") == 0) && il != -1) {
             if (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || strcmp(name, "kq_mask") == 0) {
+                // the scheduler's own backends: a chunk slot's are not the context's with LLAMA_PIPE_CHUNK_STREAM
                 const auto & dev_layer = model.dev_layer(il);
-                for (const auto & backend : backends) {
-                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
-                        if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched_graph, cur, backend.get());
+                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched_graph); i++) {
+                    ggml_backend_t backend = ggml_backend_sched_get_backend(sched_graph, i);
+                    if (ggml_backend_get_device(backend) == dev_layer) {
+                        if (ggml_backend_supports_op(backend, cur)) {
+                            ggml_backend_sched_set_tensor_backend(sched_graph, cur, backend);
                         }
                     }
                 }
@@ -5273,6 +5324,10 @@ float * llama_pipe_get_logits(llama_context * ctx, int32_t slot) {
 
 llama_token llama_pipe_get_sampled(llama_context * ctx, int32_t slot) {
     return ctx->pipe_get_sampled(slot);
+}
+
+bool llama_pipe_ready(llama_context * ctx, int32_t slot) {
+    return ctx->pipe_ready(slot);
 }
 
 void llama_pipe_drain(llama_context * ctx) {
