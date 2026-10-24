@@ -1738,6 +1738,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // the sliding-window cache is a ring of n_swa + n_ubatch cells per sequence, padded to 256 (check_swa_wrap.sh)
+    LOG_INF("window cache: n_swa = %d, n_ubatch = %u, n_ctx = %u, n_seq_max = %u\n", llama_model_n_swa(model),
+            llama_n_ubatch(ctx), llama_n_ctx(ctx), llama_n_seq_max(ctx));
+
     if (g_backend_greedy && params.sampling.temp > 0.0f) {
         LOG_ERR("%s: --pipe-backend-greedy needs --temp 0\n", __func__);
         return 1;
