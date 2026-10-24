@@ -12771,8 +12771,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 2 KV heads), 8 query heads per KV head, F16 and Q8_0 caches viewed as in the KV cache. The compute-6.1 prompt kernel
     // (fattn-tile-pascal.cu; GGML_CUDA_FATTN_TILE_PASCAL=2 runs it on any GPU) takes these from 9 tokens (3 with Q8_0).
     // The random mask's -inf blocks cover whole key tiles; the prompt masks are causal at depth and a 513-key sliding
-    // window; large logits make the online softmax rescale; 16 query heads per KV head and two sequences give more block
-    // columns. ALiBi, softcap, 4 query heads per KV head and an unpadded length fall through to the stock kernels.
+    // window (at 1024 tokens with the per-block key bound); large logits make the online softmax rescale; 16 query heads
+    // per KV head and two sequences give more block columns. ALiBi, softcap, 4 query heads per KV head and an unpadded
+    // length fall through to the stock kernels.
     for (int hs : { 128, 256 }) {
         const int nh = hs == 128 ? 4 : 2;
         for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
@@ -12788,6 +12789,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_flash_attn_ext_prompt(hs, nh, {8, 1}, 1280, 512, true,  type_KV, 513));
             test_cases.emplace_back(new test_flash_attn_ext_prompt(hs, nh, {8, 1}, 1024, 512, false, type_KV, 0));
+            // 1024 tokens: launch_fattn scans the mask and bounds each block's keys (KV_max)
+            test_cases.emplace_back(new test_flash_attn_ext_prompt(hs, nh, {8, 1}, 2048, 1024, true, type_KV, 0));
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {16, 1}, 512, 33, true, true,  0,    0,     GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 8, 2}, 512, 33, true, true,  0,    0,     GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, { 8, 1}, 512, 33, true, false, 0,    0,     GGML_PREC_F32, type_KV, type_KV));
