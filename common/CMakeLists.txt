@@ -109,6 +109,8 @@ add_library(${TARGET}
     sampling.h
     pipe-guess.cpp
     pipe-guess.h
+    pipe-store.cpp
+    pipe-store.h
     speculative.cpp
     speculative.h
     subproc.cpp
