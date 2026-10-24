@@ -1040,7 +1040,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
+        // but not when head is on a free cell: a removed tail of the sequence left it there for the next token (seq_rm),
+        // and the cells it freed after head are no sign of free space before it. Restarting from cell 0 would put the
+        // re-decoded tail into other cells than before, which changes the order in which attention sums the keys
+        if (head_cur > cells.get_used() + 2*n_tokens && !(head_cur < cells.size() && cells.is_empty(head_cur))) {
             head_cur = 0;
         }
 
