@@ -1706,6 +1706,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--pipe-depth"}, "N",
+        string_format("pipelined speculation: up to N guessed tokens enter the first GPUs while the later ones still work "
+            "on the current token, each checked by sampling the real token (output unchanged); for a slot that "
+            "generates alone, with backend sampling (-bs) and no grammar, penalties or token probabilities "
+            "(default: %d, off)", params.pipe_depth),
+        [](common_params & params, int value) {
+            params.pipe_depth = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_DEPTH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-guess"}, "TYPE",
+        string_format("guesses for --pipe-depth: none, copy (the token after the longest earlier match of the text's end) "
+            "or cont (copy, else the most frequent continuation of the last 1-8 tokens in the request) (default: %s)",
+            params.pipe_guess.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "none" && value != "copy" && value != "cont") {
+                throw std::invalid_argument("invalid value");
+            }
+            params.pipe_guess = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_GUESS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-copy-min"}, "N",
+        string_format("shortest copy match that makes a guess for --pipe-depth (default: %d)", params.pipe_copy_min),
+        [](common_params & params, int value) {
+            params.pipe_copy_min = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_COPY_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
