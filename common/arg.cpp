@@ -1780,6 +1780,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--pipe-store"}, "FNAME",
+        "continuation store for --pipe-guess cont: the generated tokens of other answers of the same model, memory-mapped "
+        "(built by bench/ngram_replay/datastore.cpp, 8 bytes per token); asked after the request's own continuations of "
+        "2-token or longer contexts (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.pipe_store = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_STORE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {

@@ -1,4 +1,5 @@
 #include "pipe-guess.h"
+#include "pipe-store.h"
 
 #include <algorithm>
 
@@ -91,9 +92,9 @@ llama_token common_pipe_guesser::copy_guess() const {
     return hist[best_end + 1];
 }
 
-llama_token common_pipe_guesser::cont_guess() const {
+llama_token common_pipe_guesser::cont_guess(int min_len) const {
     const int n = (int) hist.size();
-    for (int ln = std::min(max_ctx, n); ln >= 1; ln--) {
+    for (int ln = std::min(max_ctx, n); ln >= min_len; ln--) {
         const auto it = counts.find(key(&hist[n - ln], ln));
         if (it == counts.end()) {
             continue;
@@ -128,6 +129,13 @@ llama_token common_pipe_guesser::guess(const llama_token * inflight, size_t n_in
     }
 
     llama_token g = copy_guess();
+    if (g < 0 && kind == CONT && store) {
+        g = cont_guess(2);
+        if (g < 0) {
+            g = common_pipe_store_guess(store, hist.data(), (int) hist.size());
+            n_store += g >= 0;
+        }
+    }
     if (g < 0 && kind == CONT) {
         g = cont_guess();
     }

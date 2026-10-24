@@ -19,6 +19,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "pipe-guess.h"
+#include "pipe-store.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
@@ -468,6 +469,7 @@ struct server_slot {
         pipe_n_draft     = 0;
         pipe_n_draft_hit = 0;
         pipe_draft_pending = -1;
+        pipe_guesser.n_store = 0;
 
         n_predict_max = -1;
 
@@ -799,8 +801,8 @@ struct server_slot {
 
         if (pipe_n_guess > 0 || pipe_draws) {
             SLT_INF(*this,
-                    "       pipelined = %10d guesses, %d right, %d wrong; drafter %d guesses, %d right\n",
-                    pipe_n_guess, pipe_n_hit, pipe_n_miss, pipe_n_draft, pipe_n_draft_hit);
+                    "       pipelined = %10d guesses, %d right, %d wrong, %d from the store; drafter %d guesses, %d right\n",
+                    pipe_n_guess, pipe_n_hit, pipe_n_miss, pipe_guesser.n_store, pipe_n_draft, pipe_n_draft_hit);
         }
 
         SLT_INF(*this,
@@ -1109,6 +1111,9 @@ private:
     // --pipe-guess staircase: the drafter is loaded, and the slot whose sequence it follows (-1: none)
     bool         pipe_draft_on  = false;
     llama_seq_id pipe_draft_seq = -1;
+
+    // the continuation store of --pipe-store, shared by the slots' guessers
+    std::unique_ptr<common_pipe_store, void (*)(common_pipe_store *)> pipe_store { nullptr, common_pipe_store_free };
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1617,7 +1622,19 @@ private:
                 SRV_INF("pipelined speculation: up to %d guesses (%s, copy >= %d, floor %d), %d pipe slots\n",
                         params_base.pipe_depth, params_base.pipe_guess.c_str(), params_base.pipe_copy_min,
                         params_base.pipe_floor, n_pipe);
+                pipe_store.reset();
+                if (!params_base.pipe_store.empty()) {
+                    pipe_store.reset(common_pipe_store_load(params_base.pipe_store));
+                    if (pipe_store) {
+                        SRV_INF("continuation store %s: %lld tokens\n", params_base.pipe_store.c_str(),
+                                (long long) common_pipe_store_size(pipe_store.get()));
+                    } else {
+                        SRV_WRN("cannot read the continuation store %s: guessing without it\n",
+                                params_base.pipe_store.c_str());
+                    }
+                }
                 for (auto & slot : slots) {
+                    slot.pipe_guesser.store = pipe_store.get();
                     slot.pipe_draws = true;
                     // staircase: the copy lookup first, the drafter for the rest
                     slot.pipe_guesser.kind = params_base.pipe_guess == "none" ? common_pipe_guesser::NONE :
