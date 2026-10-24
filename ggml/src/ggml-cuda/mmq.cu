@@ -90,6 +90,17 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// GGML_CUDA_MMQ_MOE_LEGACY=1: MUL_MAT_ID as before the MoE tile list (llama.cpp PR #31047), for measuring it inside one
+// build: the tile width chosen against all tokens instead of the tokens per expert, and ceil(tokens / tile width) tiles
+// for every expert, each from the expert's first column, the ones past its last column empty.
+static bool ggml_cuda_mmq_moe_legacy() {
+    static const bool legacy = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_MOE_LEGACY");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return legacy;
+}
+
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one
 static ggml_prec ggml_cuda_mmq_get_prec_env() {
     const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
@@ -195,7 +206,9 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = ne12;
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            if (!ggml_cuda_mmq_moe_legacy()) {
+                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            }
         }
 
         int ntiles_J_best = INT_MAX;
@@ -283,7 +296,10 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
 
-    const int ntj = (ne_get_rows + J_best - 1) / J_best + ne02;
+    // legacy: one tile column per J tokens for every expert (as many as the CUDA grid's y dimension allows)
+    const int tiles_per_expert = ggml_cuda_mmq_moe_legacy() && ne02*((ne12 + J_best - 1) / J_best) <= 65535 ?
+        (ne12 + J_best - 1) / J_best : 0;
+    const int ntj = tiles_per_expert > 0 ? ne02*tiles_per_expert : (ne_get_rows + J_best - 1) / J_best + ne02;
     ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), ntj);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
@@ -296,7 +312,7 @@ void ggml_cuda_mul_mat_q(
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(),
-            ne02, ne12, n_expert_used, ne11, J_best, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, J_best, si1, sis1, /*write_inverse =*/ dedup_bcast, stream, tiles_per_expert);
         CUDA_CHECK(cudaGetLastError());
     }
 
