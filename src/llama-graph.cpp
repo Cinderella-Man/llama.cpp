@@ -71,10 +71,12 @@ static bool llama_kq_mask_check_enabled() {
 }
 
 // whether this ubatch's masks can be built on the device, given caches that keep cell copies; the host mask covers
-// everything else
+// everything else. M-RoPE positions (Qwen3.5/3.6, Ornith, Qwen3.8) count for a token batch too: the host mask's 2D
+// rule only orders a cell and a token at the same position, which text never has (images come as embeddings)
 static bool llama_kq_mask_on_device(const llama_hparams & hparams, const llama_cparams & cparams, const llama_ubatch & ubatch) {
     const uint32_t n_min = llama_kq_mask_dev_min_tokens();
-    return n_min > 0 && ubatch.n_tokens >= n_min && cparams.causal_attn && !hparams.use_alibi && !ubatch.is_pos_2d();
+    const bool text = ubatch.token != nullptr && !ubatch.is_mixed();
+    return n_min > 0 && ubatch.n_tokens >= n_min && cparams.causal_attn && !hparams.use_alibi && (!ubatch.is_pos_2d() || text);
 }
 
 void llm_graph_kq_dev::build_inputs(ggml_context * ctx, const llama_ubatch & ubatch, const llama_cparams & cparams,
