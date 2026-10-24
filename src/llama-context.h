@@ -364,7 +364,15 @@ private:
 
         // optimization
         std::vector<llama_token> token_ids_full_vocab;
+
+        // the attached chains when the scheduler was last reserved, by their samplers' names, sorted: a later set
+        // within these needs no new reserve (LLAMA_SAMPLER_RESERVE=1: every attach and detach reserves, as stock)
+        std::vector<std::string> reserved_chains;
+        bool                     reserve_always = false;
     };
+
+    // whether the reserve covers the attached samplers' graphs
+    bool sampler_reserve_covered() const;
 
     sampling_info sampling;
 
