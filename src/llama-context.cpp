@@ -1654,16 +1654,25 @@ static void ubatch_prepare_reserve(
         const std::map<llama_seq_id, llama_sampler *> & samplers,
               uint32_t                                  n_outputs_max_per_seq);
 
-int32_t llama_context::pipe_init(int32_t n_slots) {
+// the backend sampler of one sequence, as the samplers of a pipelined token's graph: each slot's graph samples only for
+// the sequence it serves
+static std::map<llama_seq_id, llama_sampler *> pipe_samplers(const std::map<llama_seq_id, llama_sampler *> & all, llama_seq_id seq_id) {
+    std::map<llama_seq_id, llama_sampler *> res;
+    const auto it = all.find(seq_id);
+    if (it != all.end()) {
+        res[seq_id] = it->second;
+    }
+    return res;
+}
+
+int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t n_chunk_tokens) {
     if (!memory || cparams.embeddings || !cparams.causal_attn) {
         LLAMA_LOG_ERROR("%s: pipelined decoding needs a causal decoder context with a memory module\n", __func__);
         return -1;
     }
-    if (sampling.samplers.size() > 1) {
-        LLAMA_LOG_ERROR("%s: pipelined decoding supports backend sampling for one sequence only\n", __func__);
-        return -1;
-    }
-    if (n_slots < 1) {
+    if (n_slots < 1 || n_chunk_slots < 0 || (n_chunk_slots > 0 && (n_chunk_tokens < 1 || n_chunk_tokens > (int32_t) cparams.n_ubatch))) {
+        LLAMA_LOG_ERROR("%s: invalid slots (%d, %d chunk slots of %d tokens, n_ubatch %u)\n", __func__, n_slots,
+                n_chunk_slots, n_chunk_tokens, cparams.n_ubatch);
         return -1;
     }
     if (model.hparams.n_swa > 0 && cparams.n_ubatch < (uint32_t) n_slots) {
@@ -1685,7 +1694,7 @@ int32_t llama_context::pipe_init(int32_t n_slots) {
         }
     }
     pipe_slots.clear();
-    pipe_slots.resize(n_slots);
+    pipe_slots.resize(n_slots + n_chunk_slots);
 
     const int64_t n_vocab   = model.vocab.n_tokens();
     const size_t  max_nodes = gf_res_reserve->get_max_nodes();
@@ -1707,12 +1716,24 @@ int32_t llama_context::pipe_init(int32_t n_slots) {
         return -1;
     }
 
+    // with one KV stream per sequence a graph over the full memory covers every stream, so the reserve takes one
+    // sequence per stream, as sched_reserve does: 1 token per stream for a one-token slot, chunk / streams for a chunk
+    // slot (the attention work and the buffers are those of the real evaluation or larger)
+    const uint32_t n_stream = cparams.kv_unified ? 1 : cparams.n_seq_max;
+
     const auto save_n_outputs = this->n_outputs;
-    this->n_outputs = 1;
+    this->n_outputs = n_stream;
 
     size_t size_total = 0;
 
-    for (auto & slot : pipe_slots) {
+    // the samplers of one sequence, for the reserve
+    const auto reserve_samplers = sampling.samplers.empty() ? sampling.samplers
+                                                            : pipe_samplers(sampling.samplers, sampling.samplers.begin()->first);
+
+    for (size_t i_slot = 0; i_slot < pipe_slots.size(); i_slot++) {
+        auto & slot = pipe_slots[i_slot];
+        slot.n_tokens_max = i_slot < (size_t) n_slots ? 1 : n_chunk_tokens;
+
         slot.sched.reset(ggml_backend_sched_new(
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
         ggml_backend_sched_set_copy_callback(slot.sched.get(), sched_copy_experts, this);
@@ -1721,12 +1742,14 @@ int32_t llama_context::pipe_init(int32_t n_slots) {
         slot.res.reset(new llm_graph_result(max_nodes));
 
         llama_batch_allocr balloc_reserve(model.hparams.n_pos_per_embd());
-        llama_ubatch ubatch = balloc_reserve.ubatch_reserve(1, 1);
+        llama_ubatch ubatch = balloc_reserve.ubatch_reserve((slot.n_tokens_max + n_stream - 1)/n_stream, n_stream);
 
-        ubatch_prepare_reserve(ubatch, 1, sampling.samplers, cparams.n_outputs_max_per_seq);
+        ubatch_prepare_reserve(ubatch, n_stream, reserve_samplers, cparams.n_outputs_max_per_seq);
 
         auto gparams = graph_params(slot.res.get(), ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
-        gparams.sched = slot.sched.get();
+        gparams.sched    = slot.sched.get();
+        gparams.cb       = graph_get_cb(slot.sched.get());
+        gparams.samplers = reserve_samplers;
 
         slot.res->reset();
 
@@ -1756,13 +1779,14 @@ int32_t llama_context::pipe_init(int32_t n_slots) {
 
     this->n_outputs = save_n_outputs;
 
-    LLAMA_LOG_INFO("%s: %d slots, compute buffers %.2f MiB in total, %d splits per token\n", __func__,
-            n_slots, size_total/1024.0/1024.0, ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()));
+    LLAMA_LOG_INFO("%s: %d slots + %d chunk slots of %d tokens, compute buffers %.2f MiB in total, %d splits per token\n",
+            __func__, n_slots, n_chunk_slots, n_chunk_tokens, size_total/1024.0/1024.0,
+            ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()));
 
     return 0;
 }
 
-int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos pos, llama_seq_id seq_id) {
+int32_t llama_context::pipe_submit(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id) {
     if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size()) {
         LLAMA_LOG_ERROR("%s: invalid slot %d\n", __func__, i_slot);
         return -1;
@@ -1770,20 +1794,30 @@ int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos 
 
     auto & slot = pipe_slots[i_slot];
 
+    if (n_tokens < 1 || n_tokens > slot.n_tokens_max) {
+        LLAMA_LOG_ERROR("%s: slot %d takes 1..%d tokens, got %d\n", __func__, i_slot, slot.n_tokens_max, n_tokens);
+        return -1;
+    }
+
     // the slot's scheduler runs with caller_sync: its previous evaluation must be complete before it is reused
     if (slot.busy) {
         ggml_backend_event_synchronize(slot.ev_out);
         slot.busy = false;
     }
 
-    llama_token  tok  = token;
-    llama_pos    p    = pos;
-    int32_t      n_sq = 1;
-    llama_seq_id sid  = seq_id;
-    llama_seq_id * sids[1] = { &sid };
-    int8_t       out  = 1;
+    // n_tokens tokens of one sequence at pos, pos + 1, ...; only the last one is output
+    std::vector<llama_token>    toks(tokens, tokens + n_tokens);
+    std::vector<llama_pos>      ps(n_tokens);
+    std::vector<int32_t>        n_sq(n_tokens, 1);
+    llama_seq_id                sid = seq_id;
+    std::vector<llama_seq_id *> sids(n_tokens, &sid);
+    std::vector<int8_t>         outs(n_tokens, 0);
+    for (int32_t i = 0; i < n_tokens; i++) {
+        ps[i] = pos + i;
+    }
+    outs[n_tokens - 1] = 1;
 
-    const llama_batch batch = { 1, &tok, nullptr, &p, &n_sq, sids, &out };
+    const llama_batch batch = { n_tokens, toks.data(), nullptr, ps.data(), n_sq.data(), sids.data(), outs.data() };
 
     llama_batch_compat compat(this, batch);
 
@@ -1808,7 +1842,8 @@ int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos 
         return -2;
     }
 
-    for (const auto & entry : sampling.samplers) {
+    const auto samplers = pipe_samplers(sampling.samplers, seq_id);
+    for (const auto & entry : samplers) {
         llama_sampler_backend_begin(entry.second);
     }
 
@@ -1816,7 +1851,9 @@ int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos 
     this->n_outputs = 1;
 
     auto gparams = graph_params(slot.res.get(), ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
-    gparams.sched = slot.sched.get();
+    gparams.sched    = slot.sched.get();
+    gparams.cb       = graph_get_cb(slot.sched.get());
+    gparams.samplers = samplers;
 
     ggml_cgraph * gf = slot.res->get_gf();
 
@@ -1864,7 +1901,7 @@ int32_t llama_context::pipe_submit(int32_t i_slot, llama_token token, llama_pos 
     // with a backend sampler only the sampled token comes back, otherwise the logits
     ggml_tensor * t_out = nullptr;
     size_t        n_out = 0;
-    if (!sampling.samplers.empty()) {
+    if (!samplers.empty()) {
         GGML_ASSERT(!slot.res->t_sampled.empty() && slot.res->t_sampled[0] != nullptr);
         t_out = slot.res->t_sampled[0];
         n_out = sizeof(llama_token);
@@ -1919,6 +1956,7 @@ llama_token llama_context::pipe_get_sampled(int32_t i_slot) {
     if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size() || sampling.samplers.empty()) {
         return LLAMA_TOKEN_NULL;
     }
+    // note: the slot's last token must belong to a sequence with a backend sampler
 
     const float * out = pipe_get_logits(i_slot);
 
@@ -3205,7 +3243,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+    return graph_get_cb(sched.get());
+}
+
+llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_graph) const {
+    // sched_graph: the scheduler of the graph being built (a pipe slot has its own)
+    return [this, sched_graph](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -3224,7 +3267,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched_graph, cur, backend.get());
                         }
                     }
                 }
@@ -5008,7 +5051,11 @@ int32_t llama_decode(
 }
 
 int32_t llama_pipe_init(llama_context * ctx, int32_t n_slots) {
-    return ctx->pipe_init(n_slots);
+    return ctx->pipe_init(n_slots, 0, 0);
+}
+
+int32_t llama_pipe_init_ext(llama_context * ctx, int32_t n_slots, int32_t n_chunk_slots, int32_t n_chunk_tokens) {
+    return ctx->pipe_init(n_slots, n_chunk_slots, n_chunk_tokens);
 }
 
 int32_t llama_pipe_n_slots(const llama_context * ctx) {
@@ -5016,7 +5063,11 @@ int32_t llama_pipe_n_slots(const llama_context * ctx) {
 }
 
 int32_t llama_pipe_submit(llama_context * ctx, int32_t slot, llama_token token, llama_pos pos, llama_seq_id seq_id) {
-    return ctx->pipe_submit(slot, token, pos, seq_id);
+    return ctx->pipe_submit(slot, &token, 1, pos, seq_id);
+}
+
+int32_t llama_pipe_submit_tokens(llama_context * ctx, int32_t slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id) {
+    return ctx->pipe_submit(slot, tokens, n_tokens, pos, seq_id);
 }
 
 float * llama_pipe_get_logits(llama_context * ctx, int32_t slot) {
