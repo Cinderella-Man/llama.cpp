@@ -16,6 +16,9 @@
 // the same order, so ffn_out is bit-identical to it. bench/persistent_pascal of
 // github.com/Cinderella-Man/llms-on-crypto-mining-rigs has the prototype and the argument why it cannot deadlock.
 //
+// Where it runs: only on NVIDIA GPUs of compute capability 6.1 (the 5-SM P106-090 class it was tuned for), and only when
+// switched on; every other GPU, HIP and MUSA keep the per-op path. The kernel itself runs on any NVIDIA GPU, so tests
+// can force it there (=2), natively and through the compute_61 PTX.
 // GGML_CUDA_PERSISTENT_MOE:       0 off (default), 1 compute capability 6.1, 2 any NVIDIA GPU (for testing)
 // GGML_CUDA_PERSISTENT_MOE_CHECK: 1 runs the per-op path as well and compares its results bit for bit on the device
 //                                 with the kernel's: router logits, expert ids and weights, routed activations, routed
