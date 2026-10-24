@@ -407,6 +407,12 @@ struct server_slot_stats {
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
 
+    // where the reused cells came from: none, the slot's live cells, a context checkpoint, a saved prefix
+    int32_t  cache_src          = 0;
+    int64_t  n_ckpt_pos         = -1; // the restored checkpoint's token count
+    uint64_t n_ckpt_created     = 0;  // checkpoints created for this task (prompt and generation)
+    int64_t  t_restore_us       = 0;  // checkpoint and prefix restores
+
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result
     uint64_t n_draft_tokens      = 0;

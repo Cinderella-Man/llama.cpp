@@ -1799,6 +1799,68 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-tail2"},
+        "two context checkpoints at the end of each prompt, 4 + n_ubatch and 4 tokens before it, as stock llama.cpp; "
+        "by default a sliding-window model takes only the second, with its whole window ring, which also serves the first's restores",
+        [](common_params & params) {
+            params.checkpoint_tail2 = true;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_TAIL2").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-gen"},
+        "context checkpoints while generating, at the tokens of --checkpoint-gen-at, so that a client's re-rendered "
+        "reply that differs from the generated one re-reads only from there (sliding-window models; default: off)",
+        [](common_params & params) {
+            params.checkpoint_gen = true;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_GEN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-gen-at"}, "TOKENS",
+        string_format("comma-separated texts of single tokens that start a generation checkpoint (default: %s)",
+            params.checkpoint_gen_at.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.checkpoint_gen_at = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_GEN_AT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-gen-min"}, "N",
+        string_format("a generation checkpoint needs at least N tokens since the slot's last checkpoint (default: %d)",
+            params.checkpoint_gen_min),
+        [](common_params & params, int value) {
+            params.checkpoint_gen_min = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_GEN_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache"}, "DIR",
+        "save the state of each prompt's shared prefix (everything before the first user message: system and tool "
+        "prompt) to a file in DIR the first time it is processed, and restore it into any slot whose prompt starts "
+        "with it; the files outlive the server (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache_dir = value;
+            if (!fs_is_directory(params.prefix_cache_dir)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            if (params.prefix_cache_dir.back() != DIRECTORY_SEPARATOR) {
+                params.prefix_cache_dir += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-min"}, "N",
+        string_format("shortest prefix saved by --prefix-cache, in tokens (default: %d)", params.prefix_cache_min),
+        [](common_params & params, int value) {
+            params.prefix_cache_min = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-max"}, "N",
+        string_format("files kept by --prefix-cache, the least recently used are deleted first (default: %d)",
+            params.prefix_cache_max),
+        [](common_params & params, int value) {
+            params.prefix_cache_max = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

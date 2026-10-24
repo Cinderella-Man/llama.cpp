@@ -659,6 +659,19 @@ struct common_params {
     std::string pipe_store;              // continuation store for cont (common_pipe_store), empty = none
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool    checkpoint_tail2    = false; // two checkpoints at a prompt's end (4 + n_ubatch and 4 tokens before it), as stock
+
+    // agent sessions: checkpoints while generating, at tokens that end a reasoning block or start a tool call
+    bool        checkpoint_gen     = false;
+    std::string checkpoint_gen_at  = "</think>,<tool_call>"; // comma-separated, each must be one token
+    int32_t     checkpoint_gen_min = 512;                     // tokens since the slot's last checkpoint
+
+    // saved states of shared prompt prefixes (the system and tool prompt before the first user message), in files that
+    // any slot restores and that outlive the server
+    std::string prefix_cache_dir;
+    int32_t     prefix_cache_min = 1024; // shortest prefix in tokens worth a file
+    int32_t     prefix_cache_max = 16;   // files kept, the least recently used go first
+
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
@@ -1305,6 +1318,10 @@ struct common_prompt_checkpoint {
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
+
+    // the target data holds the whole sliding-window ring (LLAMA_STATE_SEQ_FLAGS_SWA_RING): every position from pos_min
+    // to pos_max, so it also serves a prompt that diverges before pos_max, within its window
+    bool ring = false;
 
     llama_pos pos_min;
     llama_pos pos_max;

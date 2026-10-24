@@ -1061,6 +1061,171 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 }
 
 //
+// --prefix-cache: saved states of shared prompt prefixes
+//
+// One file per prefix, written by llama_state_seq_save_file (magic, version, token count, the tokens, then the sequence
+// state: every layer's cells of the prefix), found by its tokens. A prefix is saved when a slot processes it from the
+// first token and the batch stops at its end, so a restore gives exactly the cells a cold server computes for it.
+//
+
+struct server_prefix_store {
+    struct entry {
+        std::string  path;
+        llama_tokens tokens;
+    };
+
+    std::string dir;
+    std::string fp;      // the model and the settings that shape its cells: a file of another one is never used
+    int32_t     n_min   = 0;
+    int32_t     n_files = 0;
+
+    std::vector<entry> entries; // the least recently used first
+
+    bool enabled() const {
+        return !dir.empty();
+    }
+
+    static uint64_t hash_bytes(uint64_t h, const void * data, size_t n) {
+        const uint8_t * p = (const uint8_t *) data;
+        for (size_t i = 0; i < n; i++) {
+            h ^= p[i]; // FNV-1a
+            h *= 0x100000001b3ULL;
+        }
+        return h;
+    }
+
+    static uint64_t hash(const llama_tokens & tokens) {
+        return hash_bytes(0xcbf29ce484222325ULL, tokens.data(), tokens.size()*sizeof(llama_token));
+    }
+
+    // the model file (description, size, parameters) and the context settings that change the cells' values: the batch
+    // and micro-batch sizes (where a prompt's evaluations split), flash attention and the cache types
+    static std::string fingerprint(const llama_model * model, const llama_context * ctx, const common_params & params) {
+        char desc[256] = { 0 };
+        llama_model_desc(model, desc, sizeof(desc));
+        const std::string s = string_format("%s|%" PRIu64 "|%" PRIu64 "|%u|%u|%d|%d|%d", desc, llama_model_size(model),
+                llama_model_n_params(model), llama_n_batch(ctx), llama_n_ubatch(ctx), (int) params.flash_attn_type,
+                (int) params.cache_type_k, (int) params.cache_type_v);
+        return string_format("%016" PRIx64, hash_bytes(0xcbf29ce484222325ULL, s.data(), s.size()));
+    }
+
+    std::string path_of(const llama_tokens & tokens) const {
+        return dir + string_format("%s-%016" PRIx64 "-%zu.prefix", fp.c_str(), hash(tokens), tokens.size());
+    }
+
+    // the token list of a state file, empty if it is not one
+    static llama_tokens read_tokens(const std::string & path) {
+        std::ifstream ifs(std::filesystem::u8path(path), std::ios::binary);
+        uint32_t hdr[3] = { 0, 0, 0 };
+        if (!ifs.read((char *) hdr, sizeof(hdr)) || hdr[0] != LLAMA_STATE_SEQ_MAGIC || hdr[1] != LLAMA_STATE_SEQ_VERSION ||
+            hdr[2] == 0 || hdr[2] > (1u << 24)) {
+            return {};
+        }
+        llama_tokens tokens(hdr[2]);
+        if (!ifs.read((char *) tokens.data(), tokens.size()*sizeof(llama_token))) {
+            return {};
+        }
+        return tokens;
+    }
+
+    void init(const std::string & path, const std::string & fingerprint, int32_t min_tokens, int32_t max_files) {
+        dir     = path;
+        fp      = fingerprint;
+        n_min   = min_tokens;
+        n_files = std::max(1, max_files);
+        entries.clear();
+
+        std::vector<std::pair<std::filesystem::file_time_type, entry>> found;
+        std::error_code ec;
+        for (const auto & de : std::filesystem::directory_iterator(std::filesystem::u8path(dir), ec)) {
+            if (!de.is_regular_file() || de.path().extension() != ".prefix" ||
+                de.path().filename().string().rfind(fp + "-", 0) != 0) {
+                continue;
+            }
+            entry e;
+            e.path   = de.path().string();
+            e.tokens = read_tokens(e.path);
+            if (e.tokens.empty()) {
+                SRV_WRN("prefix cache: '%s' is not a state file - ignored\n", e.path.c_str());
+                continue;
+            }
+            found.emplace_back(de.last_write_time(ec), std::move(e));
+        }
+        std::sort(found.begin(), found.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        for (auto & f : found) {
+            entries.push_back(std::move(f.second));
+        }
+        trim();
+    }
+
+    // the longest saved prefix that the prompt starts with and continues after
+    const entry * find(const server_tokens & prompt) const {
+        const entry * best = nullptr;
+        for (const auto & e : entries) {
+            if (e.tokens.size() >= prompt.size() || (best && best->tokens.size() >= e.tokens.size())) {
+                continue;
+            }
+            bool match = true;
+            for (size_t i = 0; i < e.tokens.size() && match; i++) {
+                match = prompt[i] == e.tokens[i];
+            }
+            if (match) {
+                best = &e;
+            }
+        }
+        return best;
+    }
+
+    bool has(const llama_tokens & tokens) const {
+        for (const auto & e : entries) {
+            if (e.tokens == tokens) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // the entry becomes the most recently used, in memory and by its file's time
+    void touch(const std::string & path) {
+        for (size_t i = 0; i < entries.size(); i++) {
+            if (entries[i].path == path) {
+                entry e = std::move(entries[i]);
+                entries.erase(entries.begin() + i);
+                entries.push_back(std::move(e));
+                std::error_code ec;
+                std::filesystem::last_write_time(std::filesystem::u8path(path), std::filesystem::file_time_type::clock::now(), ec);
+                return;
+            }
+        }
+    }
+
+    void add(entry e) {
+        entries.push_back(std::move(e));
+        trim();
+    }
+
+    void remove(const std::string & path) {
+        for (size_t i = 0; i < entries.size(); i++) {
+            if (entries[i].path == path) {
+                entries.erase(entries.begin() + i);
+                break;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::u8path(path), ec);
+    }
+
+    void trim() {
+        while ((int32_t) entries.size() > n_files) {
+            SRV_INF("prefix cache: deleting the least recently used '%s' (%zu tokens)\n", entries.front().path.c_str(), entries.front().tokens.size());
+            std::error_code ec;
+            std::filesystem::remove(std::filesystem::u8path(entries.front().path), ec);
+            entries.erase(entries.begin());
+        }
+    }
+};
+
+//
 // server_context_impl (private implementation)
 //
 
@@ -1169,6 +1334,13 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // agent sessions (Q111): saved shared prefixes, generation checkpoints, and whether a ring checkpoint taken after
+    // the divergence still serves it (a sliding-window model whose cells can be removed from the end: the restore
+    // removes the cells past the divergence, and the ring holds a complete window before it)
+    server_prefix_store      prefix_store;
+    std::vector<llama_token> ckpt_gen_tokens;
+    bool                     ckpt_trim = false;
 
     server_metrics metrics;
 
@@ -1726,6 +1898,37 @@ private:
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        ckpt_trim = n_swa > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && ctx_dft == nullptr;
+
+        if (!params_base.prefix_cache_dir.empty()) {
+            if (ctx_dft != nullptr || mctx != nullptr || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                SRV_WRN("%s", "prefix cache: not with a draft model, a multimodal projector or a context without memory - off\n");
+            } else {
+                prefix_store.init(params_base.prefix_cache_dir, server_prefix_store::fingerprint(model_tgt, ctx_tgt, params_base),
+                        params_base.prefix_cache_min, params_base.prefix_cache_max);
+                SRV_INF("prefix cache: '%s' holds %zu saved prefixes for this model and settings (%s-*); prefixes of %d tokens or more are saved, up to %d files\n",
+                        params_base.prefix_cache_dir.c_str(), prefix_store.entries.size(), prefix_store.fp.c_str(), prefix_store.n_min, prefix_store.n_files);
+            }
+        }
+
+        ckpt_gen_tokens.clear();
+        if (params_base.checkpoint_gen) {
+            if (!ckpt_trim || params_base.n_ctx_checkpoints <= 0) {
+                SRV_WRN("%s", "--checkpoint-gen needs a sliding-window model and context checkpoints - off\n");
+            } else {
+                for (const auto & text : string_split<std::string>(params_base.checkpoint_gen_at, ',')) {
+                    const auto toks = common_tokenize(vocab, text, false, true);
+                    if (toks.size() == 1) {
+                        ckpt_gen_tokens.push_back(toks[0]);
+                    } else {
+                        SRV_WRN("--checkpoint-gen-at: '%s' is %zu tokens, not one - ignored\n", text.c_str(), toks.size());
+                    }
+                }
+                SRV_INF("generation checkpoints at %zu token(s) of '%s', %d tokens or more after the last checkpoint\n",
+                        ckpt_gen_tokens.size(), params_base.checkpoint_gen_at.c_str(), params_base.checkpoint_gen_min);
+            }
         }
 
         if (!params_base.model_alias.empty()) {
@@ -2802,9 +3005,116 @@ private:
         return true;
     }
 
+    // --prefix-cache: the longest saved prefix of the slot's new prompt, if the request may use one
+    const server_prefix_store::entry * find_prefix(const server_slot & slot, int32_t n_decision_first) const {
+        if (!prefix_store.enabled() || !slot.task->params.cache_prompt || slot.task->is_stateless() ||
+            slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->n_tokens_shared > 0 || n_decision_first >= 0 ||
+            slot.alora_invocation_start > 0 || slot.task->tokens.has_mtmd) {
+            return nullptr;
+        }
+        return prefix_store.find(slot.task->tokens);
+    }
+
+    // replaces the slot's cells and tokens with a saved prefix; returns its token count, or 0 with the slot empty
+    // (the entry may move or go: do not use it afterwards)
+    int32_t prefix_restore(server_slot & slot, const server_prefix_store::entry & e) {
+        const int64_t t_start = ggml_time_us();
+        const std::string  path     = e.path;
+        const llama_tokens expected = e.tokens;
+
+        slot.mem.seq_rm(slot.id, -1, -1);
+        slot.prompt.clear();
+
+        llama_tokens tokens(expected.size());
+        size_t n_tokens = 0;
+        const size_t nread = llama_state_seq_load_file(ctx_tgt, path.c_str(), slot.id, tokens.data(), tokens.size(), &n_tokens);
+        if (nread == 0 || n_tokens != expected.size() || tokens != expected) {
+            SLT_WRN(slot, "prefix cache: failed to restore '%s' - deleted, the prompt is processed in full\n", path.c_str());
+            slot.mem.seq_rm(slot.id, -1, -1);
+            prefix_store.remove(path);
+            slot.stats.cache_src = 0;
+            return 0;
+        }
+
+        // no checkpoints: a cold slot has none before this point either, and the batch at the prefix's end takes one
+        slot.prompt.tokens = server_tokens(tokens, false);
+
+        const int64_t t_us = ggml_time_us() - t_start;
+        SLT_INF(slot, "prefix cache: restored %zu tokens (%.1f MiB) from '%s' in %.1f ms\n",
+                n_tokens, nread / 1024.0 / 1024.0, path.c_str(), t_us / 1000.0);
+
+        prefix_store.touch(path);
+
+        slot.stats.cache_src     = 3;
+        slot.stats.t_restore_us += t_us;
+        return (int32_t) n_tokens;
+    }
+
+    // --prefix-cache: called before the batch that starts at n_tokens_start is decoded, when the slot holds exactly the
+    // cells of the tokens before it; saves them if they are a prompt's shared prefix processed from the first token
+    void prefix_maybe_save(server_slot & slot, int32_t n_tokens_start, int32_t first_user_pos) {
+        if (!prefix_store.enabled() || n_tokens_start != first_user_pos || n_tokens_start < prefix_store.n_min ||
+            slot.stats.n_prompt_cached != 0 || slot.task->type != SERVER_TASK_TYPE_COMPLETION ||
+            slot.task->is_stateless() || slot.task->n_tokens_shared > 0 || slot.task->tokens.has_mtmd ||
+            slot.alora_invocation_start > 0) {
+            return;
+        }
+        const llama_tokens & all = slot.task->tokens.get_tokens();
+        llama_tokens prefix(all.begin(), all.begin() + n_tokens_start);
+        if (prefix_store.has(prefix)) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        const std::string path = prefix_store.path_of(prefix);
+        const std::string tmp  = path + ".tmp";
+
+        const size_t nwrite = llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, prefix.data(), prefix.size());
+        std::error_code ec;
+        if (nwrite == 0) {
+            SLT_WRN(slot, "prefix cache: failed to write '%s'\n", tmp.c_str());
+            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+            return;
+        }
+        std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(path), ec);
+        if (ec) {
+            SLT_WRN(slot, "prefix cache: failed to rename '%s': %s\n", tmp.c_str(), ec.message().c_str());
+            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+            return;
+        }
+
+        SLT_INF(slot, "prefix cache: saved %zu tokens (%.1f MiB) to '%s' in %.1f ms\n",
+                prefix.size(), nwrite / 1024.0 / 1024.0, path.c_str(), (ggml_time_us() - t_start) / 1000.0);
+
+        prefix_store.add({ path, std::move(prefix) });
+    }
+
+    // --checkpoint-gen: called before a generating slot's sampled token goes into the batch, when the slot holds the
+    // cells of the tokens before it; a checkpoint there lets a client's re-rendered reply that differs from what was
+    // generated after this point re-read only from here
+    void checkpoint_gen_maybe(server_slot & slot) {
+        if (ckpt_gen_tokens.empty() || !slot.spec_draft.empty() || !slot.pipe_win.empty() || !slot.inp_embd.empty() ||
+            slot.task->type != SERVER_TASK_TYPE_COMPLETION ||
+            std::find(ckpt_gen_tokens.begin(), ckpt_gen_tokens.end(), slot.sampled) == ckpt_gen_tokens.end()) {
+            return;
+        }
+        const int64_t n_last = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens;
+        if (slot.prompt.n_tokens() < n_last + params_base.checkpoint_gen_min) {
+            return;
+        }
+        const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0) {
+            return;
+        }
+        create_checkpoint(slot, 0, pos_min, pos_max, true);
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool ring = false) {
         const int id_task = slot.task->id;
+
+        slot.stats.n_ckpt_created++;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2857,7 +3167,8 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.ring = ring;
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ring ? LLAMA_STATE_SEQ_FLAGS_SWA_RING : 0));
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -4260,6 +4571,7 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
+            checkpoint_gen_maybe(slot);
             slot.handle_last_sampled_token(batch);
         });
 
@@ -4478,6 +4790,16 @@ private:
                                 n_past = 0;
                             }
 
+                            // a saved prefix longer than what the slot shares with the prompt replaces the slot's
+                            // cells now; one within the shared part only if the slot cannot reuse that far (below)
+                            const server_prefix_store::entry * pfx = find_prefix(slot, n_decision_first);
+                            if (pfx && (int32_t) pfx->tokens.size() > n_past) {
+                                n_past = prefix_restore(slot, *pfx);
+                                pfx = nullptr;
+                            } else if (n_past > 0) {
+                                slot.stats.cache_src = 1;
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // number of cached tokens shared with the new prompt, before any checkpoint is restored
@@ -4552,7 +4874,12 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
+                                            // a ring checkpoint (every position from pos_min to pos_max) past the
+                                            // divergence still serves it when its window reaches back far enough: the
+                                            // cells from pos_next on are removed before the batch (seq_rm below), and
+                                            // the window before it is the one the prompt had then. A default one holds
+                                            // only the last n_swa positions, whatever pos_min says
+                                            if (cur.pos_max > pos_next && !(ckpt_trim && cur.ring)) {
                                                 return false;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
@@ -4560,6 +4887,8 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+
+                                    const int64_t t_ckpt_start = ggml_time_us();
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
@@ -4580,14 +4909,19 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, %.1f ms)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024, (ggml_time_us() - t_ckpt_start) / 1000.0);
+
+                                        slot.stats.cache_src     = 2;
+                                        slot.stats.n_ckpt_pos    = it->n_tokens;
+                                        slot.stats.t_restore_us += ggml_time_us() - t_ckpt_start;
                                     }
 
                                     if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        SLT_INF(slot, "forcing full prompt re-processing due to lack of cache data (shared %d tokens, no checkpoint below %d)\n",
+                                                n_past, pos_min_thold);
                                         pos_next = 0;
                                         n_past = 0;
+                                        slot.stats.cache_src = 0;
                                     }
                                 }
                             }
@@ -4603,6 +4937,11 @@ private:
                                         ++it;
                                     }
                                 }
+                            }
+
+                            // the slot fell back to fewer cells than a saved prefix holds
+                            if (pfx && n_past < (int32_t) pfx->tokens.size()) {
+                                n_past = prefix_restore(slot, *pfx);
                             }
                         }
 
@@ -4758,6 +5097,18 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // --prefix-cache: a prompt processed from its first token stops at its first user message, where
+                    // its shared prefix is saved (a cold slot with checkpoints stops there anyway)
+                    int32_t first_user_pos = -1;
+                    for (const auto & span : spans.spans) {
+                        if (span.role == COMMON_CHAT_ROLE_USER) {
+                            first_user_pos = (int32_t) span.pos;
+                            break;
+                        }
+                    }
+                    const bool prefix_break = prefix_store.enabled() && slot.stats.n_prompt_cached == 0 &&
+                                              first_user_pos >= prefix_store.n_min;
+
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
@@ -4809,13 +5160,20 @@ private:
                             }
                         }
 
+                        if (prefix_break && (int32_t) slot.prompt.n_tokens() == first_user_pos) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        // a sliding-window model needs only the second, taken with its whole ring of n_swa + n_ubatch cells:
+                        // it serves every restore the first would (ckpt_trim); --checkpoint-tail2 takes both, as stock
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const bool tail2 = !ckpt_trim || params_base.checkpoint_tail2;
+                            const int checkpoint_offsets[] = {tail2 ? 4 + n_ubatch : 4, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -4841,6 +5199,10 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    // one tail checkpoint with the whole sliding-window ring instead of two (--checkpoint-tail2): it serves
+                    // the restores of both
+                    const bool tail1 = ckpt_trim && !params_base.checkpoint_tail2;
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -4861,7 +5223,8 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // (one tail checkpoint: only the last batch, 4 tokens before the end, takes it)
+                        if (!is_user_start && (!near_prompt_end || tail1)) {
                             do_checkpoint = false;
                         }
                     }
@@ -4888,7 +5251,11 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, tail1 && slot.state == SLOT_STATE_DONE_PROMPT);
+                    }
+
+                    if (prefix_break && !has_mtmd) {
+                        prefix_maybe_save(slot, n_tokens_start, first_user_pos);
                     }
                 }
 
