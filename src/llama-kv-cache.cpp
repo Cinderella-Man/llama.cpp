@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -109,13 +110,14 @@ llama_kv_cache::llama_kv_cache(
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<ggml_context *, ggml_tensor *> kq_cells_ctx;
 
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 1)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -126,6 +128,15 @@ llama_kv_cache::llama_kv_cache(
             }
 
             ctx_map.emplace(buft, ctx);
+
+            // the cells' positions and sequences for the mask built on the device, one copy per buffer type; not with
+            // tensor split, whose buffers split each tensor across the devices by its name
+            if (!other && offload && n_seq_max <= 24 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+                ggml_tensor * kq_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, (int64_t) kv_size*n_stream + 1);
+                ggml_format_name(kq_cells, "cache_%skq_cells_%zu", name_tag, kq_cells_devs.size());
+                kq_cells_devs.push_back(kq_cells);
+                kq_cells_ctx[ctx] = kq_cells;
+            }
 
             return ctx;
         }
@@ -247,7 +258,12 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, kq_cells_ctx.count(ctx) ? kq_cells_ctx.at(ctx) : nullptr });
+
+        // a copy is made with its device's first layer
+        if (kq_cells_il.size() < kq_cells_devs.size()) {
+            kq_cells_il.push_back(il);
+        }
     }
 
     if (reuse) {
@@ -390,6 +406,8 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    kq_cells_stale = true;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -434,9 +452,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 continue;
             }
 
+            if (!cells.seq_has(i, seq_id)) {
+                continue;
+            }
+
             const llama_pos pos_i = cells.pos_get(i);
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+            kq_cells_mark(seq_to_stream[seq_id], i);
+
+            if (cells.seq_rm(i, seq_id)) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -470,6 +494,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 cells.rm(i);
+                kq_cells_mark(s, i);
 
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -523,11 +548,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
             if (cells.seq_has(i, seq_id_src)) {
                 cells.seq_add(i, seq_id_dst);
+                kq_cells_mark(s0, i);
             }
         }
 
         return;
     }
+
+    kq_cells_stale = true;
 
     // cross-stream sequence copies require to copy the actual buffer data
 
@@ -584,6 +612,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
+    kq_cells_stale = true;
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -610,6 +640,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (other) {
         return;
     }
+
+    kq_cells_stale = true;
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
@@ -660,6 +692,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (other) {
         return;
     }
+
+    kq_cells_stale = true;
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
@@ -854,6 +888,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
+    }
+
+    if (do_shift || !sc_info.empty()) {
+        kq_cells_stale = true;
     }
 
     bool updated = false;
@@ -1217,7 +1255,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
+            // the purged cells keep their old values in the device copies (see get_kq_cells_resident), which mask
+            // them as well: they lie outside the window of every later token of the sequence, as the overwritten
+            // cells do, and any other token holds no bit for them; so the purge needs no update of the copies
+            kq_cells_track = false;
             seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            kq_cells_track = true;
         }
     }
 
@@ -1794,6 +1837,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const int64_t n_kv     = dst->ne[0];
@@ -1861,42 +1905,179 @@ void llama_kv_cache::fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stre
     set_input_kq_mask_impl<float>(args, data, causal_attn);
 }
 
-void llama_kv_cache::set_input_kq_cells(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[1] == 2);
-    GGML_ASSERT(ubatch->n_seqs_unq <= 32);
+// a cell's entry in the device copies: its position and, as bit s, whether it holds sequence s; an empty cell holds none
+static void kq_cell_values(const llama_kv_cells & cells, uint32_t j, float * dst) {
+    static const llama_kv_cells::seq_set_t seq_mask(0xFFFFFFull);
 
-    const int64_t  n_kv     = dst->ne[0];
-    const int64_t  n_stream = dst->ne[2];
-    const uint32_t n_tps    = ubatch->n_tokens/n_stream;
+    if (cells.is_empty(j)) {
+        dst[0] = 0.0f;
+        dst[1] = 0.0f;
+        return;
+    }
 
-    int32_t * data = (int32_t *) dst->data;
+    const llama_pos p = cells.pos_get(j);
+    GGML_ASSERT(p >= 0 && p < (1 << 24) && "the device copies hold positions below 2^24");
 
-    for (int64_t s = 0; s < n_stream; ++s) {
-        // every token of a stream's rows reads the cells of that stream
-        const uint32_t stream = seq_to_stream[ubatch->seq_id[s*n_tps][0]];
-        for (uint32_t ii = 1; ii < n_tps; ++ii) {
-            GGML_ASSERT(seq_to_stream[ubatch->seq_id[s*n_tps + ii][0]] == stream);
+    dst[0] = (float) p;
+    dst[1] = (float) (cells.seq_get_all(j) & seq_mask).to_ulong();
+}
+
+void llama_kv_cache::kq_cells_mark(uint32_t strm, uint32_t idx) {
+    if (!kq_cells_track || kq_cells_stale) {
+        return;
+    }
+
+    if (kq_cells_changed.size() == kq_cells_n_changed_max) {
+        kq_cells_stale = true;
+        kq_cells_changed.clear();
+        return;
+    }
+
+    kq_cells_changed.push_back(strm*get_size() + idx);
+}
+
+bool llama_kv_cache::get_kq_cells_resident() const {
+    return !kq_cells_devs.empty();
+}
+
+ggml_tensor * llama_kv_cache::get_kq_cells(int32_t il) const {
+    return il < 0 ? kq_cells_devs.at(0) : layers[map_layer_ids.at(il)].kq_cells;
+}
+
+ggml_tensor * llama_kv_cache::build_input_kq_cells_all(ggml_context * ctx) const {
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, (int64_t) get_size()*n_stream + 1);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kq_cells_all");
+
+    return res;
+}
+
+ggml_tensor * llama_kv_cache::update_kq_cells(ggml_context * ctx, ggml_tensor * cells, ggml_tensor * cells_all, ggml_tensor * vals, ggml_tensor * rows) const {
+    ggml_tensor * cur = cells;
+
+    if (cells_all) {
+        cur = ggml_cpy(ctx, cells_all, cur);
+    }
+
+    return ggml_set_rows(ctx, cur, vals, rows);
+}
+
+ggml_tensor * llama_kv_cache::view_kq_cells(ggml_context * ctx, ggml_tensor * cells, uint32_t n_kv, const slot_info & sinfo) const {
+    const uint64_t kv_size = get_size();
+    const uint32_t ns      = sinfo.s1 - sinfo.s0 + 1;
+
+    return ggml_view_3d(ctx, cells, 2, n_kv, ns, 2*sizeof(float), 2*sizeof(float)*kv_size, 2*sizeof(float)*kv_size*sinfo.s0);
+}
+
+void llama_kv_cache::fill_kq_cells_upd(float * rows, float * vals, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    GGML_ASSERT(ubatch->n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(kq_cells_changed.size() <= kq_cells_n_changed_max);
+
+    const uint32_t kv_size = get_size();
+
+    uint32_t i = 0;
+
+    // the step's cells
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii, ++i) {
+            rows[i] = (float) ((uint64_t) sinfo.strm[s]*kv_size + sinfo.idxs[s][ii]);
+            kq_cell_values(v_cells[sinfo.strm[s]], sinfo.idxs[s][ii], vals + 2*i);
         }
-        const auto & cells = v_cells.at(stream);
+    }
 
-        int32_t * pos  = data + 2*n_kv*s;
-        int32_t * seqs = pos + n_kv;
-        for (int64_t j = 0; j < n_kv; ++j) {
-            int32_t  p = 0;
-            uint32_t m = 0;
-            if (!cells.is_empty(j)) {
-                p = cells.pos_get(j);
-                for (uint32_t b = 0; b < ubatch->n_seqs_unq; ++b) {
-                    const llama_seq_id seq_id = ubatch->seq_id_unq[b];
-                    if (cells.seq_has(j, seq_id)) {
-                        m |= 1u << ubatch->seq_idx[seq_id];
+    // the cells changed since the last step, then the scratch row
+    for (uint32_t k = 0; k < kq_cells_n_changed_max; ++k, ++i) {
+        if (k < kq_cells_changed.size()) {
+            const uint32_t r = kq_cells_changed[k];
+            rows[i] = (float) r;
+            kq_cell_values(v_cells[r / kv_size], r % kv_size, vals + 2*i);
+        } else {
+            rows[i] = (float) ((uint64_t) kv_size*n_stream);
+            vals[2*i + 0] = 0.0f;
+            vals[2*i + 1] = 0.0f;
+        }
+    }
+}
+
+void llama_kv_cache::set_input_kq_cells_all(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const uint32_t kv_size = get_size();
+
+    float * data = (float *) dst->data;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint32_t j = 0; j < kv_size; ++j) {
+            kq_cell_values(v_cells[s], j, data + 2*((uint64_t) s*kv_size + j));
+        }
+    }
+
+    // the scratch row
+    data[2*(uint64_t) kv_size*n_stream + 0] = 0.0f;
+    data[2*(uint64_t) kv_size*n_stream + 1] = 0.0f;
+}
+
+void llama_kv_cache::check_kq_cells(const float * cells_all, const float * rows, const float * vals, uint32_t n_upd, const float * toks, uint32_t n_tps,
+        uint32_t n_kv, const slot_info & sinfo, const llama_ubatch * ubatch, bool causal_attn) const {
+    const int64_t kv_size = get_size();
+    const int64_t ns      = sinfo.s1 - sinfo.s0 + 1;
+
+    GGML_ASSERT((int64_t) n_tps*ns == ubatch->n_tokens);
+
+    std::vector<float> host((size_t) (n_kv*n_tps*ns));
+    fill_kq_mask_f32(host.data(), n_kv, ns, ubatch, causal_attn);
+
+    std::vector<float> copy((size_t) (2*(kv_size*n_stream + 1)));
+    for (size_t d = 0; d < kq_cells_devs.size(); ++d) {
+        // the copy as this step leaves it: the device's (from the steps before) or all cells, then the update
+        if (cells_all) {
+            memcpy(copy.data(), cells_all, copy.size()*sizeof(float));
+        } else {
+            ggml_backend_tensor_get(kq_cells_devs[d], copy.data(), 0, copy.size()*sizeof(float));
+        }
+        for (uint32_t t = 0; t < n_upd; ++t) {
+            const int64_t r = (int64_t) rows[t];
+            copy[2*r + 0] = vals[2*t + 0];
+            copy[2*r + 1] = vals[2*t + 1];
+        }
+
+        int64_t n_diff = 0;
+        for (int64_t s = 0; s < ns; ++s) {
+            const float * cs = copy.data() + 2*kv_size*(sinfo.s0 + s);
+            for (int64_t i = 0; i < n_tps; ++i) {
+                const int32_t p1 = (int32_t) toks[2*(n_tps*s + i) + 0];
+                const int32_t sq = (int32_t) toks[2*(n_tps*s + i) + 1];
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const int32_t p0   = (int32_t) cs[2*j + 0];
+                    const bool    keep = (((uint32_t) cs[2*j + 1] >> sq) & 1) && p0 <= p1 && !llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1);
+                    const float   want = host[(size_t) ((s*n_tps + i)*n_kv + j)];
+                    if ((keep ? 0.0f : -INFINITY) != want) {
+                        if (n_diff++ < 8) {
+                            LLAMA_LOG_ERROR("%s: %s copy %zu: stream %" PRId64 " token %" PRId64 " (pos %d, seq %d) cell %" PRId64 " (pos %d, seqs 0x%x): device %s, host %f\n",
+                                    __func__, ggml_backend_buffer_name(kq_cells_devs[d]->buffer), d, sinfo.s0 + s, i, p1, sq, j, p0, (unsigned) cs[2*j + 1],
+                                    keep ? "keep" : "drop", want);
+                        }
                     }
                 }
             }
-            pos[j]  = p;
-            seqs[j] = (int32_t) m;
         }
+        if (n_diff != 0) {
+            GGML_ABORT("%s: %" PRId64 " of %" PRId64 " mask values differ from the host mask", __func__, n_diff, (int64_t) n_kv*n_tps*ns);
+        }
+
+        // cells whose entry differs from the host cells: purged cells keep theirs (see apply_ubatch)
+        int64_t n_old = 0;
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t j = 0; j < kv_size; ++j) {
+                float want[2];
+                kq_cell_values(v_cells[s], j, want);
+                n_old += want[1] != copy[2*(kv_size*s + j) + 1] || (want[1] != 0.0f && want[0] != copy[2*(kv_size*s + j) + 0]);
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: %s copy %zu: %u tokens x %u cells x %" PRId64 " streams (swa type %d, %s, %zu changed cells, %" PRId64 " old cells): identical to the host mask\n",
+                __func__, ggml_backend_buffer_name(kq_cells_devs[d]->buffer), d, n_tps, n_kv, ns, (int) swa_type,
+                cells_all ? "all cells uploaded" : "resident", kq_cells_changed.size(), n_old);
     }
 }
 
@@ -2254,6 +2435,8 @@ const slot_info_vec_t *   sinfos_in) {
     if (other) {
         return;
     }
+
+    kq_cells_stale = true;
 
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
         return;
@@ -2801,6 +2984,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 }
 
 void llama_kv_cache::state_clear(llama_seq_id seq_id) {
+    kq_cells_stale = true;
+
     if (seq_id == -1) {
         clear(true);
         return;
@@ -2968,6 +3153,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    kv->set_kq_cells_applied();
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
     return true;
@@ -3043,8 +3229,57 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 
-void llama_kv_cache_context::set_input_kq_cells(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    kv->set_input_kq_cells(dst, ubatch);
+bool llama_kv_cache_context::get_kq_cells_resident() const {
+    return kv->get_kq_cells_resident();
+}
+
+bool llama_kv_cache_context::get_kq_cells_stale() const {
+    return kv->get_kq_cells_stale();
+}
+
+size_t llama_kv_cache_context::get_kq_cells_n_copies() const {
+    return kv->get_kq_cells_n_copies();
+}
+
+ggml_tensor * llama_kv_cache_context::get_kq_cells(int32_t il) const {
+    return kv->get_kq_cells(il);
+}
+
+int32_t llama_kv_cache_context::get_kq_cells_il0() const {
+    return kv->get_kq_cells_il0();
+}
+
+uint32_t llama_kv_cache_context::get_kq_cells_n_upd(const llama_ubatch & ubatch) const {
+    return kv->get_kq_cells_n_upd(ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_kq_cells_all(ggml_context * ctx) const {
+    return kv->build_input_kq_cells_all(ctx);
+}
+
+ggml_tensor * llama_kv_cache_context::update_kq_cells(ggml_context * ctx, ggml_tensor * cells, ggml_tensor * cells_all, ggml_tensor * vals, ggml_tensor * rows) const {
+    return kv->update_kq_cells(ctx, cells, cells_all, vals, rows);
+}
+
+ggml_tensor * llama_kv_cache_context::view_kq_cells(ggml_context * ctx, ggml_tensor * cells) const {
+    return kv->view_kq_cells(ctx, cells, n_kv, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::fill_kq_cells_upd(float * rows, float * vals, const llama_ubatch * ubatch) const {
+    kv->fill_kq_cells_upd(rows, vals, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_kq_cells_all(ggml_tensor * dst) const {
+    kv->set_input_kq_cells_all(dst);
+}
+
+void llama_kv_cache_context::set_kq_cells_synced() const {
+    kv->set_kq_cells_synced();
+}
+
+void llama_kv_cache_context::check_kq_cells(const float * cells_all, const float * rows, const float * vals, uint32_t n_upd, const float * toks, uint32_t n_tps,
+        const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->check_kq_cells(cells_all, rows, vals, n_upd, toks, n_tps, n_kv, sinfos[i_cur], ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const {

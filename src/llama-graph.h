@@ -337,6 +337,57 @@ public:
     const llama_cparams cparams;
 };
 
+// the mask built on the device (LLAMA_GPU_KQ_MASK) for the KV caches of an attention input. A step uploads one F32 input
+// (all integers in it below 2^24, so exact): the tokens' positions and sequences, then per cache the rows its update
+// writes (llama_kv_cache::fill_kq_cells_upd), then per cache their values. Each device stages it once and casts its
+// integers to I32; each cache's copy on the device (see llama_kv_cache::get_kq_cells_resident) takes its update from
+// there, and every layer's mask node reads the updated copy and the tokens
+struct llm_graph_kq_dev {
+    using cb_t = std::function<void(ggml_tensor * cur, const char * name, int il)>;
+
+    struct cache_t {
+        const llama_kv_cache_context * mctx = nullptr;
+
+        ggml_tensor * cells_all = nullptr; // F32 [2, kv_size*n_stream + 1], only while the copies are stale
+
+        int64_t n_upd    = 0; // rows of the update
+        int64_t off_rows = 0; // in the input, in floats
+        int64_t off_vals = 0;
+
+        std::map<const ggml_tensor *, ggml_tensor *> cur;  // copy -> [2, n_kv, n_stream] view of it, updated
+        std::set<const ggml_tensor *>                used; // the copies that layers' masks read
+    };
+
+    struct dev_t {
+        ggml_tensor * stage = nullptr; // the input on the device
+        ggml_tensor * ints  = nullptr; // its tokens and rows, as I32
+        ggml_tensor * toks  = nullptr; // I32 [2, n_tps, n_stream]
+    };
+
+    ggml_tensor * upd  = nullptr; // F32, see above
+    ggml_type     type = GGML_TYPE_F16; // of the masks
+
+    int64_t n_tokens = 0;
+    int64_t n_tps    = 0;
+    int64_t n_stream = 0;
+    int64_t n_int    = 0; // floats in the input that are tokens and rows
+
+    std::vector<cache_t> caches;
+
+    std::map<ggml_backend_buffer_type_t, dev_t> devs;
+
+    void build_inputs(ggml_context * ctx, const llama_ubatch & ubatch, const llama_cparams & cparams,
+            const std::vector<const llama_kv_cache_context *> & mctxs);
+
+    // the mask of layer il for cache c, built on the layer's device from its copy, which the first layer there updates;
+    // gf set: a layer's mask (its update is expanded into gf), else one for code that reads the mask directly
+    ggml_tensor * build_mask(ggml_context * ctx, ggml_cgraph * gf, const cb_t & cb, size_t c, int32_t il);
+
+    void set_input(const llama_ubatch * ubatch, bool causal_attn) const;
+
+    bool can_reuse(const llama_ubatch & ubatch, const llama_cparams & cparams) const;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -363,6 +414,11 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // with the mask built on the device (LLAMA_GPU_KQ_MASK, kq_dev.upd set), its input replaces self_kq_mask: build_attn
+    // makes a ggml_kq_mask node per layer, on that layer's device; self_kq_mask_cnv is then such a node too, for code
+    // that reads the mask directly
+    llm_graph_kq_dev kq_dev;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -534,13 +590,10 @@ public:
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    // with the mask built on the device (LLAMA_GPU_KQ_MASK), these replace self_kq_mask and self_kq_mask_swa as inputs:
-    // build_attn makes a ggml_kq_mask node per layer from them, on that layer's device; self_kq_mask_cnv and
-    // self_kq_mask_swa_cnv are then such nodes too, for code that reads the mask directly
-    ggml_tensor * self_kq_cells     = nullptr; // I32 [n_kv, 2, n_stream]
-    ggml_tensor * self_kq_cells_swa = nullptr; // I32 [n_kv, 2, n_stream]
-    ggml_tensor * self_kq_toks      = nullptr; // I32 [n_batch/n_stream, 2, n_stream]
-    ggml_type     kq_mask_type      = GGML_TYPE_F16;
+    // with the mask built on the device (LLAMA_GPU_KQ_MASK, kq_dev.upd set; caches base, swa), its input replaces
+    // self_kq_mask and self_kq_mask_swa: build_attn makes a ggml_kq_mask node per layer, on that layer's device;
+    // self_kq_mask_cnv and self_kq_mask_swa_cnv are then such nodes too, for code that reads the mask directly
+    llm_graph_kq_dev kq_dev;
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
