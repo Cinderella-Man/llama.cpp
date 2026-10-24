@@ -3659,7 +3659,16 @@ static bool ggml_cuda_match_moe_layer(const ggml_cgraph * cgraph, const int node
     memcpy(&layer.eps, norm->op_params, sizeof(float));
     layer.clamp_val = ggml_get_op_params_f32(clamp, 0);
     layer.scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+    layer.router_prec = ggml_get_op_params_i32(logits, 0);
     layer.n_nodes   = i - node_idx;
+    layer.stage[GGML_CUDA_MOE_STAGE_LOGITS]  = logits;
+    layer.stage[GGML_CUDA_MOE_STAGE_IDS]     = ids;
+    layer.stage[GGML_CUDA_MOE_STAGE_WEIGHTS] = weights;
+    layer.stage[GGML_CUDA_MOE_STAGE_ACT]     = glu;
+    layer.stage[GGML_CUDA_MOE_STAGE_DOWN]    = down;
+    layer.stage[GGML_CUDA_MOE_STAGE_SACT]    = sglu;
+    layer.stage[GGML_CUDA_MOE_STAGE_MOE]     = wr.dst;
+    layer.stage[GGML_CUDA_MOE_STAGE_OUT]     = out;
     return true;
 }
 
