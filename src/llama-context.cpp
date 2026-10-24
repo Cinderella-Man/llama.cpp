@@ -1992,7 +1992,16 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
             memory->seq_rm(seq_id, pos, -1);
             return -1;
         }
-        ggml_backend_tensor_copy_async(be_src, slot.tok_backend, t_src, t_dst);
+        if (src.ev_out != nullptr) {
+            // the device that embeds the tokens waits for the source evaluation alone: its event follows the copy of
+            // the sampled id into pinned host memory, from which this device's stream uploads it. A copy queued on the
+            // sampling device's stream would also wait for everything submitted there since (other conversations'
+            // tokens in streams mode), so every fed token would drain the pipeline
+            ggml_backend_event_wait(slot.tok_backend, src.ev_out);
+            ggml_backend_tensor_set_async(slot.tok_backend, t_dst, src.logits, 0, sizeof(llama_token));
+        } else {
+            ggml_backend_tensor_copy_async(be_src, slot.tok_backend, t_src, t_dst);
+        }
     }
 
     const auto status = ggml_backend_sched_graph_compute_async(slot.sched.get(), gf);
