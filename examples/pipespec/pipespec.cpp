@@ -55,6 +55,8 @@
 //                           (K = 1: one sample, timed to the stop text the same way);
 //                           plain mode decodes the samples round robin, pipe mode keeps one token of each in flight
 //                           (needs host sampling; the context gets K sequences and a unified KV cache)
+//   --pipe-floor F          (job key floor) pipe mode: when the guesser has nothing, fill the window up to F guesses
+//                           with the last token in it (almost always wrong, but idle cards drop to their base clock)
 //   --pipe-feed             (job key feed) pipe mode at depth 0 and streams mode without guesses, with a sampler on the
 //                           device: a sequence's next token is submitted before its current token is sampled, fed on
 //                           the devices from that token's sampled output (llama_pipe_submit_fed; run with
@@ -146,6 +148,7 @@ struct pipe_job {
     int         budget   = 0;      // streams: items in flight before guesses stop (0 = no limit)
     int         seq      = 0;      // the sequence (KV stream) a plain or pipe job generates in
     bool        feed     = false;  // submit each next token fed from the device (llama_pipe_submit_fed)
+    int         floor    = 0;      // pipe mode: guesses kept in flight when the guesser has none (a filler token)
 };
 
 static bool job_set(pipe_job & j, const std::string & k, const std::string & v) {
@@ -176,6 +179,7 @@ static bool job_set(pipe_job & j, const std::string & k, const std::string & v) 
     else if (k == "budget")    { j.budget    = atoi(v.c_str()); }
     else if (k == "seq")       { j.seq       = atoi(v.c_str()); }
     else if (k == "feed")      { j.feed      = v != "0"; }
+    else if (k == "floor")     { j.floor     = atoi(v.c_str()); }
     else {
         return false;
     }
@@ -191,7 +195,7 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
         {"--pipe-state-out", "state_out"}, {"--pipe-trace", "trace"}, {"--pipe-race", "race"},
         {"--pipe-race-stop", "race_stop"}, {"--pipe-jsonl", "jsonl"}, {"--pipe-cat", "cat"},
         {"--pipe-streams", "streams"}, {"--pipe-prompts", "prompts"}, {"--pipe-chunk", "chunk"}, {"--pipe-seed", "seed"},
-        {"--pipe-arrive", "arrive"}, {"--pipe-budget", "budget"},
+        {"--pipe-arrive", "arrive"}, {"--pipe-budget", "budget"}, {"--pipe-floor", "floor"},
     };
     int j = 1;
     for (int i = 1; i < argc; i++) {
@@ -986,7 +990,11 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         while (!failed && !done()) {
             // keep up to D guesses in flight behind the newest committed token
             while (!failed && (int) win.size() < D + 1 && win.back().pos + 1 < n_prompt + n_predict) {
-                const llama_token g = next_guess();
+                llama_token g = next_guess();
+                if (g < 0 && (int) win.size() - 1 < job.floor && win.back().tok >= 0) {
+                    // a filler: almost always wrong, but it keeps the cards busy, so their clocks stay up
+                    g = win.back().tok;
+                }
                 if (g < 0) {
                     break;
                 }
