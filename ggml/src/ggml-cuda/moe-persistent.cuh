@@ -20,6 +20,8 @@
 // GGML_CUDA_PERSISTENT_MOE_CHECK: 1 runs the per-op path as well and compares ffn_out bit for bit on the device; the
 //                                 counts are logged per graph evaluation (CUDA graphs are off in this mode)
 // GGML_CUDA_PERSISTENT_MOE_GRID:  N blocks per launch instead of the resident maximum (for testing)
+// GGML_CUDA_PERSISTENT_MOE_FAULT: a deliberate error, to show the tests catch one: 1 a wait that times out, 2 routing
+//                                 weights off by 1e-4, 3 the shared expert missing from ffn_out
 
 struct ggml_cuda_moe_layer {
     const ggml_tensor * x         = nullptr; // layer input (residual stream), F32 [n_embd]
