@@ -823,3 +823,169 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// RMS_NORM + MUL of one F32 row, optionally of a residual sum a + b (the preceding ADD, written to add_dst), that also
+// writes the row's Q8_1 blocks into q8 for the matrix-vector products that read it, so they skip their own
+// quantization (GGML_CUDA_NORM_Q8, single-token decode).
+//   - The norm runs rms_norm_f32<block_size, 1, true, true>'s layout: one float4 per thread, the same partial sums and
+//     block reduction, the same scale and products, so dst is bit-identical to it.
+//   - Q8_1 block ib (32 values) is held by threads 8 ib .. 8 ib + 7. quantize_q8_1 reduces its maximum and sum over 32
+//     lanes with the xor offsets 16, 8, 4, 2, 1; lane 4 t + c here is component c of thread t, so offsets 16, 8, 4 are
+//     shuffles between threads (xor 4, 2, 1) and offsets 2, 1 combine components (c ^ 2, then c ^ 1). The sums are thus
+//     added in quantize_q8_1's order and the blocks are bit-identical to it.
+//   - All inputs are read before the block reduction and all outputs written after it, by one block, so outputs may
+//     overlap the inputs (in-place residual adds).
+template <int block_size, bool do_add>
+static __global__ void add_rms_norm_mul_q8_1_f32(
+        const float * a, const float * b, float * add_dst, const float * mul, float * dst, block_q8_1 * q8,
+        const int ncols, const float eps) {
+    ggml_cuda_pdl_lc();
+    extern __shared__ float s_sum[];
+    const int tid    = threadIdx.x;
+    const int ncols4 = ncols / 4;
+
+    ggml_cuda_pdl_sync();
+    float4 xs = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 m  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float tmp = 0.0f;
+    if (tid < ncols4) {
+        xs = ((const float4 *) a)[tid];
+        if constexpr (do_add) {
+            const float4 xb = ((const float4 *) b)[tid];
+            xs = make_float4(xs.x + xb.x, xs.y + xb.y, xs.z + xb.z, xs.w + xb.w);
+        }
+        m = ((const float4 *) mul)[tid];
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    if (tid >= ncols4) { // whole warps: ncols is a multiple of 128
+        return;
+    }
+    if constexpr (do_add) {
+        ((float4 *) add_dst)[tid] = xs;
+    }
+    float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+    r.x *= m.x;
+    r.y *= m.y;
+    r.z *= m.z;
+    r.w *= m.w;
+    ((float4 *) dst)[tid] = r;
+
+    const float v[4] = { r.x, r.y, r.z, r.w };
+    float amax[4];
+    float sum[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        amax[c] = fabsf(v[c]);
+        sum[c]  = v[c];
+    }
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            amax[c] = fmaxf(amax[c], __shfl_xor_sync(0xffffffff, amax[c], offset, WARP_SIZE));
+            sum[c] += __shfl_xor_sync(0xffffffff, sum[c], offset, WARP_SIZE);
+        }
+    }
+    const float amax_b = fmaxf(fmaxf(amax[0], amax[2]), fmaxf(amax[1], amax[3]));
+    const float sum_b  = (sum[0] + sum[2]) + (sum[1] + sum[3]);
+
+    const float d = amax_b / 127.0f;
+    char4 q;
+    q.x = amax_b == 0.0f ? 0 : roundf(v[0] / d);
+    q.y = amax_b == 0.0f ? 0 : roundf(v[1] / d);
+    q.z = amax_b == 0.0f ? 0 : roundf(v[2] / d);
+    q.w = amax_b == 0.0f ? 0 : roundf(v[3] / d);
+
+    block_q8_1 * y = q8 + tid / 8;
+    *((char4 *) (y->qs + 4 * (tid % 8))) = q;
+    if (tid % 8 == 0) {
+        y->ds = make_half2(d, sum_b);
+    }
+}
+
+bool ggml_cuda_norm_q8_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_NORM_Q8");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_op_rms_norm_mul_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[1];
+    const int64_t ncols = x->ne[0];
+
+    // one contiguous F32 row whose Q8_1 copy needs no padding, of at most 1,024 float4 (vpt = 1)
+    if (mul->src[0] != rms_norm || x->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul) ||
+            !ggml_is_contiguous(w) || ggml_nelements(w) != ncols || ncols % MATRIX_ROW_PADDING != 0 ||
+            ncols > 4 * 1024 || ncols > GGML_CUDA_NORM_Q8_MAX_COLS) {
+        return false;
+    }
+    if (add) {
+        if (x != add || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+                add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1]) ||
+                !ggml_are_same_shape(add->src[0], add) || !ggml_are_same_shape(add->src[1], add)) {
+            return false;
+        }
+        // the residual sum and the normed row are written by the same threads: they must not overlap
+        const char * a0 = (const char *) add->data;
+        const char * m0 = (const char *) mul->data;
+        if (a0 < m0 + ggml_nbytes(mul) && m0 < a0 + ggml_nbytes(add)) {
+            return false;
+        }
+    }
+    if (!(((uintptr_t) x->data | (uintptr_t) mul->data | (uintptr_t) w->data) % 16 == 0) ||
+            (add && ((uintptr_t) add->src[1]->data | (uintptr_t) add->data) % 16 != 0)) {
+        return false;
+    }
+
+    ggml_cuda_set_device(ctx.device);
+    if (ctx.q8_1_row.buf == nullptr) {
+        CUDA_CHECK(cudaMalloc(&ctx.q8_1_row.buf, GGML_CUDA_NORM_Q8_MAX_COLS / QK8_1 * sizeof(block_q8_1)));
+    }
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const float * a = add ? (const float *) add->src[0]->data : (const float *) x->data;
+    const float * b = add ? (const float *) add->src[1]->data : nullptr;
+    float * add_dst = add ? (float *) add->data : nullptr;
+    block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_row.buf;
+    cudaStream_t stream = ctx.stream();
+
+    // the block size rms_norm_f32_dispatch picks for this row width, so the reduction is the same
+    const int n4 = (int) ncols / 4;
+#define NORM_Q8_LAUNCH(BS)                                                                                            \
+    do {                                                                                                              \
+        const ggml_cuda_kernel_launch_params launch_params{ dim3(1, 1, 1), dim3(BS, 1, 1), BS > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+        if (add) {                                                                                                    \
+            ggml_cuda_kernel_launch(add_rms_norm_mul_q8_1_f32<BS, true>, launch_params, a, b, add_dst,              \
+                (const float *) w->data, (float *) mul->data, q8, (int) ncols, eps);                                  \
+        } else {                                                                                                      \
+            ggml_cuda_kernel_launch(add_rms_norm_mul_q8_1_f32<BS, false>, launch_params, a, b, add_dst,             \
+                (const float *) w->data, (float *) mul->data, q8, (int) ncols, eps);                                  \
+        }                                                                                                             \
+    } while (0)
+    if (n4 <= 128) {
+        NORM_Q8_LAUNCH(128);
+    } else if (n4 <= 256) {
+        NORM_Q8_LAUNCH(256);
+    } else if (n4 <= 512) {
+        NORM_Q8_LAUNCH(512);
+    } else {
+        NORM_Q8_LAUNCH(1024);
+    }
+#undef NORM_Q8_LAUNCH
+
+    ctx.q8_1_row.src = mul;
+    ctx.q8_1_row.ne0 = ncols;
+    ctx.q8_1_row.n_written++;
+    ctx.q8_1_row.n_written_add += add != nullptr;
+    return true;
+}

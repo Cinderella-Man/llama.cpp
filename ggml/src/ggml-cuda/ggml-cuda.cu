@@ -766,6 +766,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (q8_1_row.buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(q8_1_row.buf));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -3989,6 +3993,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // residual ADD + RMS_NORM + MUL of one row, writing the sum, the normed row and its Q8_1 copy (GGML_CUDA_NORM_Q8);
+    // the sum is an output too, since the residual stream is read again later
+    if (node->op == GGML_OP_ADD && ggml_cuda_norm_q8_enabled() && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
+            cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] &&
+            ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        return 2;
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;
@@ -4541,7 +4554,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        // one row: also write its Q8_1 copy for the products that read it (GGML_CUDA_NORM_Q8)
+        if (!ggml_cuda_norm_q8_enabled() || !cuda_ctx->stream_context().concurrent_events.empty() ||
+                !ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, nullptr, node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 
@@ -4805,6 +4822,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_profile_record(*prof_graph, 0, cuda_ctx->stream());
             }
 
+            cuda_ctx->q8_1_row.src = nullptr;
+            cuda_ctx->q8_1_row.n_written = cuda_ctx->q8_1_row.n_written_add = 0;
+            cuda_ctx->q8_1_row.n_read = cuda_ctx->q8_1_row.n_quantized = 0;
+
+            // a node that writes over the row the Q8_1 copy was made from makes the copy stale
+            const auto q8_1_row_check = [&](const int first, const int last, const ggml_tensor * set_by_step) {
+                const ggml_tensor * src = cuda_ctx->q8_1_row.src;
+                if (src == nullptr || src != set_by_step) {
+                    return; // none, or just written by this step
+                }
+                const char * s0 = (const char *) src->data;
+                const char * s1 = s0 + ggml_nbytes(src);
+                for (int j = first; j <= last; ++j) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    const char * n0 = (const char *) n->data;
+                    if (n0 != nullptr && n0 < s1 && s0 < n0 + ggml_nbytes(n)) {
+                        cuda_ctx->q8_1_row.src = nullptr;
+                        return;
+                    }
+                }
+            };
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4847,9 +4886,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const ggml_tensor * q8_1_row_before = cuda_ctx->q8_1_row.src;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    q8_1_row_check(i, i + nodes_to_skip, q8_1_row_before);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4885,6 +4926,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                q8_1_row_check(i, i, q8_1_row_before);
 
                 if (prof_graph) {
                     prof_graph->labels.push_back(ggml_cuda_profile_label(cgraph, i, i));
@@ -4894,6 +4936,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+
+            static const bool norm_q8_debug = [] {
+                const char * env = getenv("GGML_CUDA_NORM_Q8_DEBUG");
+                return env != nullptr && atoi(env) != 0;
+            }();
+            if (norm_q8_debug) {
+                const auto & r = cuda_ctx->q8_1_row;
+                GGML_LOG_INFO("%s: %s: %d nodes: %d norms wrote a Q8_1 row (%d with the residual add), "
+                              "%d single-token products read one, %d quantized their activations\n", __func__,
+                              cuda_ctx->name.c_str(), cgraph->n_nodes, r.n_written, r.n_written_add, r.n_read, r.n_quantized);
             }
         }
 
