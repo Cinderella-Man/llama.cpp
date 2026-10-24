@@ -733,6 +733,17 @@ struct server_slot {
                 (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
     }
 
+    // the sampler's counters into stats, for requests with a grammar
+    void update_sampling_stats() {
+        if (smpl && !task->params.sampling.grammar.empty()) {
+            const auto & s = common_sampler_get_stats(smpl.get());
+            stats.smpl_grammar     = true;
+            stats.smpl_device      = s.n_device;
+            stats.smpl_constrained = s.n_constrained;
+            stats.smpl_rejected    = s.n_rejected;
+        }
+    }
+
     void print_timings() const {
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
@@ -758,6 +769,14 @@ struct server_slot {
         SLT_INF(*this,
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
+
+        if (smpl && !task->params.sampling.grammar.empty()) {
+            const auto & s = common_sampler_get_stats(smpl.get());
+            SLT_INF(*this,
+                    "        sampling = %10d tokens, %d drawn on the device, %d while the grammar applied, %d rejected "
+                    "(%d after a device draw), %d forced\n",
+                    s.n_sampled, s.n_device, s.n_constrained, s.n_rejected, s.n_rejected_device, s.n_forced);
+        }
 
         SLT_INF(*this,
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
@@ -2333,6 +2352,7 @@ private:
 
         // populate timings if this is final response or timings_per_token is enabled
         if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
+            slot.update_sampling_stats();
             res->stats = slot.stats;
         }
 
@@ -2372,6 +2392,7 @@ private:
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);
         }
+        slot.update_sampling_stats();
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
