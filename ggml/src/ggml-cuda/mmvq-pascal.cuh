@@ -24,3 +24,17 @@ bool ggml_cuda_mmvq_pascal(
 
 // Whether the kernels run on a device of compute capability cc under GGML_CUDA_MMVQ_PASCAL.
 bool ggml_cuda_mmvq_pascal_active(int cc);
+
+// One token: the three products of an attention block (Q, K, V) with the same Q8_1 activations vy, in one launch. Each
+// matrix is contiguous with ncols columns; K and V share a type. Every row comes out exactly as ggml_cuda_mmvq_pascal
+// computes it. Returns false (nothing launched) unless the kernels are active on this device, the types are a supported
+// combination and every product would run a staged shape there.
+struct ggml_cuda_mmvq_pascal_qkv_args {
+    const void * vx[3];    // weights: Q, K, V
+    ggml_type    type[3];
+    int64_t      nrows[3];
+    float      * dst[3];
+    int64_t      ncols;
+    const void * vy;       // Q8_1 activations, ncols padded to MATRIX_ROW_PADDING
+};
+bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & args, cudaStream_t stream);

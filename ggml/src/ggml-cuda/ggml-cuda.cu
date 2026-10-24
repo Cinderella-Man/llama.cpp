@@ -3701,6 +3701,7 @@ static bool ggml_cuda_moe_layer_persistent(ggml_backend_cuda_context * cuda_ctx,
 }
 
 
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3996,6 +3997,185 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// An attention block of one token with RoPE, from the Q/K/V products of the attention norm's output to the cache
+// writes, as build_qkv (separate weights), per-head RMS norms, RoPE and build_attn with a KV cache build it (Flint's
+// RoPE layers, K expanded last):
+//   MUL_MAT q, RESHAPE, RMS_NORM, MUL, ROPE        Q
+//   MUL_MAT v, RESHAPE                             V
+//   MUL_MAT k, RESHAPE, RMS_NORM, MUL, ROPE        K
+//   VIEW, SET_ROWS                                 K into the cache
+//   VIEW, SET_ROWS                                 V into the cache
+// GGML_CUDA_ATTN_BLOCK runs it as two launches instead of six: the three products into a scratch buffer
+// (ggml_cuda_mmvq_pascal_qkv), then the norms, RoPE and both cache writes from there (ggml_cuda_op_attn_epilogue), with
+// the same results. The products cannot go to their own tensors: the allocator may give V's and K's the memory of Q's
+// product and intermediates, which are dead by then in node order.
+struct ggml_cuda_attn_block {
+    ggml_tensor * mm[3];      // the Q, K and V products
+    ggml_tensor * q_norm, * q_mul, * q_rope;
+    ggml_tensor * k_norm, * k_mul, * k_rope, * k_set_rows;
+    ggml_tensor * v_set_rows;
+    int           n_nodes;
+};
+
+// the tensor t is a view of (directly or through reshapes and views of all of it)
+static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
+    while ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_src != nullptr && t->view_offs == 0 &&
+            ggml_nelements(t) == ggml_nelements(t->view_src)) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static bool ggml_cuda_match_attn_block(const ggml_cgraph * cgraph, const int node_idx, ggml_cuda_attn_block & blk) {
+    ggml_tensor ** nodes   = cgraph->nodes;
+    const int      n_nodes = cgraph->n_nodes;
+
+    if (nodes[node_idx]->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    int idxs[16];
+    ggml_op ops[16];
+    int n = 0;
+    int i = node_idx;
+    // the next node of the block, which must have this op; foreign view nodes before it are skipped
+    const auto take = [&](const ggml_op op) -> ggml_tensor * {
+        while (i < n_nodes && nodes[i]->op != op && ggml_cuda_is_view_or_noop(nodes[i])) {
+            i++;
+        }
+        if (i >= n_nodes || nodes[i]->op != op || n == 16) {
+            return nullptr;
+        }
+        idxs[n] = i;
+        ops[n]  = op;
+        n++;
+        return nodes[i++];
+    };
+    // a product of a weight matrix with the one-row activations x, and its reshape into heads
+    const ggml_tensor * x = nodes[node_idx]->src[1];
+    const auto take_product = [&]() -> ggml_tensor * {
+        ggml_tensor * mm = take(GGML_OP_MUL_MAT);
+        ggml_tensor * rs = take(GGML_OP_RESHAPE);
+        if (!mm || !rs || mm->src[1] != x || mm->src[0]->op != GGML_OP_NONE || !ggml_is_contiguous(mm->src[0]) ||
+                ggml_cuda_view_root(rs) != mm) {
+            return nullptr;
+        }
+        return mm;
+    };
+    // RMS_NORM + MUL + ROPE of a product's heads, as ggml_cuda_op_rms_norm_mul_rope_fused runs them
+    const auto take_norm_rope = [&](const ggml_tensor * mm, ggml_tensor ** norm, ggml_tensor ** mul, ggml_tensor ** rope) {
+        *norm = take(GGML_OP_RMS_NORM);
+        *mul  = take(GGML_OP_MUL);
+        *rope = take(GGML_OP_ROPE);
+        return *norm && *mul && *rope && ggml_cuda_view_root((*norm)->src[0]) == mm && (*mul)->src[0] == *norm &&
+            (*mul)->src[1]->op == GGML_OP_NONE && ggml_cuda_should_fuse_rms_norm_mul_rope(*norm, *mul, *rope);
+    };
+
+    if (x->type != GGML_TYPE_F32 || ggml_nrows(x) != 1 || !ggml_is_contiguous(x)) {
+        return false;
+    }
+    blk.mm[0] = take_product();
+    if (!blk.mm[0] || !take_norm_rope(blk.mm[0], &blk.q_norm, &blk.q_mul, &blk.q_rope)) {
+        return false;
+    }
+    blk.mm[2] = take_product();
+    blk.mm[1] = take_product();
+    if (!blk.mm[2] || !blk.mm[1] || !take_norm_rope(blk.mm[1], &blk.k_norm, &blk.k_mul, &blk.k_rope)) {
+        return false;
+    }
+    ggml_tensor * k_view = take(GGML_OP_VIEW);
+    blk.k_set_rows = take(GGML_OP_SET_ROWS);
+    if (!k_view || !blk.k_set_rows || k_view->src[0] != blk.k_rope || blk.k_set_rows->src[0] != k_view ||
+            !ggml_cuda_should_fuse_rope_set_rows(blk.k_rope, k_view, blk.k_set_rows)) {
+        return false;
+    }
+    ggml_tensor * v_view = take(GGML_OP_VIEW);
+    blk.v_set_rows = take(GGML_OP_SET_ROWS);
+    if (!v_view || !blk.v_set_rows || blk.v_set_rows->src[0] != v_view || ggml_cuda_view_root(v_view) != blk.mm[2]) {
+        return false;
+    }
+
+    // nothing but Q (for the attention) and the cache writes leaves the block, and the per-op path would fuse Q's
+    // and K's norms and RoPE (and K's cache write) as the epilogue does
+    const int outputs[] = { idxs[4], idxs[13], idxs[15] };
+    if (n != 16 || !ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outputs, 3) ||
+            !ggml_cuda_can_fuse(cgraph, idxs[2], { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {}) ||
+            ggml_cuda_can_fuse(cgraph, idxs[2], { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {}) ||
+            !ggml_cuda_can_fuse(cgraph, idxs[9], { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+        return false;
+    }
+    blk.n_nodes = i - node_idx;
+    return true;
+}
+
+// GGML_CUDA_ATTN_BLOCK: 1 (default) compute capability 6.1 only, 0 off, 2 any NVIDIA GPU (testing)
+static bool ggml_cuda_attn_block_enabled(const int cc) {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_ATTN_BLOCK");
+        return env ? atoi(env) : 1;
+    }();
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
+}
+
+// Runs the attention block starting at node i as two launches; false (nothing launched) if it is not one or the
+// kernels do not cover it.
+static bool ggml_cuda_attn_block_run(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
+                                     int & n_nodes) {
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || !cuda_ctx->stream_context().concurrent_events.empty() ||
+            !ggml_cuda_attn_block_enabled(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        return false;
+    }
+    ggml_cuda_attn_block blk;
+    if (!ggml_cuda_match_attn_block(cgraph, i, blk) ||
+            !ggml_cuda_attn_epilogue_supported(blk.q_norm, blk.q_mul, blk.q_rope, blk.k_norm, blk.k_mul, blk.k_rope,
+                                               blk.k_set_rows, blk.v_set_rows)) {
+        return false;
+    }
+
+    const ggml_tensor * x = blk.mm[0]->src[1];
+    int64_t off[4] = { 0 };
+    for (int j = 0; j < 3; ++j) {
+        const ggml_tensor * w = blk.mm[j]->src[0];
+        if (blk.mm[j]->type != GGML_TYPE_F32 || !ggml_is_contiguous(blk.mm[j]) || w->ne[0] != x->ne[0] ||
+                ggml_nrows(w) != w->ne[1]) {
+            return false;
+        }
+        off[j + 1] = off[j] + w->ne[1];
+    }
+
+    // the activations as Q8_1: the norm's copy, or quantized here once for all three products
+    const int64_t ne10_padded = GGML_PAD(x->ne[0], MATRIX_ROW_PADDING);
+    const void * x_q8_1 = ggml_cuda_q8_1_row_lookup(*cuda_ctx, x, ne10_padded);
+    ggml_cuda_pool_alloc<char> x_q8_1_buf(cuda_ctx->pool());
+    ggml_cuda_pool_alloc<float> products(cuda_ctx->pool(), off[3]);
+
+    ggml_cuda_mmvq_pascal_qkv_args a;
+    for (int j = 0; j < 3; ++j) {
+        const ggml_tensor * w = blk.mm[j]->src[0];
+        a.vx[j]    = w->data;
+        a.type[j]  = w->type;
+        a.nrows[j] = w->ne[1];
+        a.dst[j]   = products.get() + off[j];
+    }
+    a.ncols = x->ne[0];
+    if (x_q8_1 == nullptr) {
+        x_q8_1_buf.alloc(ne10_padded * sizeof(block_q8_1) / QK8_1);
+        quantize_row_q8_1_cuda((const float *) x->data, nullptr, x_q8_1_buf.get(), a.type[0], x->ne[0], x->ne[0],
+                               x->ne[0], x->ne[0], ne10_padded, 1, 1, 1, cuda_ctx->stream());
+    }
+    a.vy = x_q8_1 != nullptr ? x_q8_1 : (const void *) x_q8_1_buf.get();
+
+    if (!ggml_cuda_mmvq_pascal_qkv(a, cuda_ctx->stream())) {
+        return false;
+    }
+    (x_q8_1 != nullptr ? cuda_ctx->q8_1_row.n_read : cuda_ctx->q8_1_row.n_quantized) += 3;
+
+    ggml_cuda_op_attn_epilogue(*cuda_ctx, blk.q_norm, blk.q_mul, blk.q_rope, blk.k_norm, blk.k_mul, blk.k_rope,
+                               blk.k_set_rows, blk.v_set_rows, a.dst[0], a.dst[1], a.dst[2]);
+    n_nodes = blk.n_nodes;
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4004,6 +4184,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // an attention block's products, norms, RoPE and cache writes as two launches (GGML_CUDA_ATTN_BLOCK)
+    {
+        int n_block = 0;
+        if (ggml_cuda_attn_block_run(cuda_ctx, cgraph, i, n_block)) {
+            return n_block - 1;
+        }
+    }
 
     // a whole MoE layer as one persistent kernel (GGML_CUDA_PERSISTENT_MOE); in check mode the kernel writes a scratch
     // output and the layer's nodes run as usual below, to be compared with it once ffn_out is written

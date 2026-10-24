@@ -93,9 +93,11 @@ constexpr bool mmvqp_fits_mc() {
     return MMVQ_PASCAL_NWARPS * WARP_SIZE * (wb + yb) <= 48 * 1024;
 }
 
+// One token: the rows of row block bx (blockIdx.x of mul_mat_vec_q_pascal). Shared by mul_mat_vec_q_pascal and the
+// Q/K/V launch (mul_mat_vec_q_pascal_qkv), where each type's instantiation has its own staging memory.
 template <ggml_type type, int R, int C, bool staged, int fk>
-__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
-static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_mm_fusion_args_device fusion) {
+static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const ggml_cuda_mm_fusion_args_device & fusion,
+                                                     const uint32_t bx) {
     constexpr int NW = MMVQ_PASCAL_NWARPS;
     constexpr int BS = mmvqp_traits<type>::bs;
     constexpr int WB = C * BS;                     // weight bytes per lane and iteration
@@ -110,7 +112,7 @@ static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_
     const int lpr      = 1 << lpr_log2;
     const int sl       = lane & (lpr - 1);
     const int grp      = lane >> lpr_log2;
-    const int row0     = (((blockIdx.x * NW + threadIdx.y) << (5 - lpr_log2)) + grp) * R;
+    const int row0     = (((bx * NW + threadIdx.y) << (5 - lpr_log2)) + grp) * R;
 
     const bool     shared_expert = fk == MMVQP_GATE && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     const uint32_t channel_dst   = shared_expert ? 0 : blockIdx.y;
@@ -243,6 +245,30 @@ static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_
             }
         }
         dst[row] = result;
+    }
+}
+
+template <ggml_type type, int R, int C, bool staged, int fk>
+__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_mm_fusion_args_device fusion) {
+    mmvqp_rows_1t<type, R, C, staged, fk>(p, fusion, blockIdx.x);
+}
+
+// One token, three products of the same activations in one launch (an attention block's Q, K and V): row blocks
+// [0, nbq) compute Q, [nbq, nbq + nbk) K, the rest V, each exactly as its own mul_mat_vec_q_pascal launch would (staged
+// shapes only). K and V share a type.
+template <ggml_type tq, int Rq, int Cq, ggml_type tkv, int Rkv, int Ckv>
+__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q_pascal_qkv(const mmvqp_args pq, const mmvqp_args pk, const mmvqp_args pv,
+                                                const int nbq, const int nbk) {
+    const ggml_cuda_mm_fusion_args_device fusion = {};
+    const uint32_t bx = blockIdx.x;
+    if (bx < (uint32_t) nbq) {
+        mmvqp_rows_1t<tq, Rq, Cq, true, MMVQP_PLAIN>(pq, fusion, bx);
+    } else if (bx < (uint32_t) (nbq + nbk)) {
+        mmvqp_rows_1t<tkv, Rkv, Ckv, true, MMVQP_PLAIN>(pk, fusion, bx - nbq);
+    } else {
+        mmvqp_rows_1t<tkv, Rkv, Ckv, true, MMVQP_PLAIN>(pv, fusion, bx - nbq - nbk);
     }
 }
 
@@ -754,6 +780,88 @@ bool ggml_cuda_mmvq_pascal(
     return true;
 }
 
+// One token, a plain product of a contiguous matrix: the arguments mul_mat_vec_q_pascal runs with in
+// ggml_cuda_mmvq_pascal, if that is a staged shape (as in that function, with no channels, samples or fusion)
+static bool mmvqp_prepare_plain_staged(const void * vx, const ggml_type type, const void * vy, float * dst,
+                                       const int64_t ncols_x, const int64_t nrows_x, mmvqp_args & p, int & nblocks) {
+    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
+            type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS) {
+        return false;
+    }
+    const mmvqp_shape s = mmvqp_choose(type, false);
+
+    const int64_t bs     = ggml_type_size(type);
+    const int64_t blocks = ncols_x / ggml_blck_size(type);
+    if (!s.staged || ncols_x % ggml_blck_size(type) != 0 || blocks % s.C != 0) {
+        return false;
+    }
+    const int64_t chunks = blocks / s.C;
+    int lpr_log2 = 0;
+    while (lpr_log2 < 5 && chunks % (2 << lpr_log2) == 0) {
+        lpr_log2++;
+    }
+    const int64_t row_bytes = blocks * bs;
+    if (((s.C * bs) << lpr_log2) % 16 != 0 || !mmvqp_aligned(vx, 16) || row_bytes % 16 != 0 || row_bytes > INT_MAX) {
+        return false;
+    }
+    const int64_t aly = mmvqp_gcd((int) (s.C * (ggml_blck_size(type) / QK8_1) * sizeof(block_q8_1)), 16);
+    if (!mmvqp_aligned(vy, aly)) {
+        return false;
+    }
+
+    p                    = {};
+    p.vx                 = (const char *) vx;
+    p.vy                 = (const char *) vy;
+    p.ids                = nullptr;
+    p.dst                = dst;
+    p.nrows              = (int) nrows_x;
+    p.row_bytes          = (int) row_bytes;
+    p.lpr_log2           = lpr_log2;
+    p.niter              = (int) (chunks >> lpr_log2);
+    p.nchannels_y        = make_uint3(0, 0, 0);
+    p.channel_ratio      = init_fastdiv_values(1);
+    p.sample_ratio       = init_fastdiv_values(1);
+    p.channel_bytes_x    = row_bytes * nrows_x;
+    p.sample_bytes_x     = row_bytes * nrows_x;
+
+    const int64_t rows_per_block = MMVQ_PASCAL_NWARPS * (WARP_SIZE >> lpr_log2) * s.R;
+    nblocks = (int) ((nrows_x + rows_per_block - 1) / rows_per_block);
+    return true;
+}
+
+bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & a, cudaStream_t stream) {
+    if (!ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) || a.type[1] != a.type[2]) {
+        return false;
+    }
+    mmvqp_args p[3];
+    int        nb[3];
+    for (int j = 0; j < 3; ++j) {
+        if (!mmvqp_prepare_plain_staged(a.vx[j], a.type[j], a.vy, a.dst[j], a.ncols, a.nrows[j], p[j], nb[j])) {
+            return false;
+        }
+    }
+    const dim3 grid(nb[0] + nb[1] + nb[2], 1, 1);
+    const dim3 block(WARP_SIZE, MMVQ_PASCAL_NWARPS, 1);
+
+#define MMVQP_QKV_CASE(TQ, TKV)                                                                                        \
+    if (a.type[0] == TQ && a.type[1] == TKV) {                                                                        \
+        [[maybe_unused]] constexpr mmvqp_shape sq  = mmvqp_choose(TQ,  false);                                        \
+        [[maybe_unused]] constexpr mmvqp_shape skv = mmvqp_choose(TKV, false);                                        \
+        static_assert(mmvqp_fits<TQ, sq.R, sq.C, true, false>() && mmvqp_fits<TKV, skv.R, skv.C, true, false>(), "");  \
+        mul_mat_vec_q_pascal_qkv<TQ, sq.R, sq.C, TKV, skv.R, skv.C><<<grid, block, 0, stream>>>(p[0], p[1], p[2],      \
+                                                                                               nb[0], nb[1]);         \
+        return true;                                                                                                  \
+    }
+    // the attention types of the Flint files this fork targets (K2h-r16, G3: Q5_0/Q8_0 mixes; UD-Q4_K_XL: Q8_0, Q5_K)
+    MMVQP_QKV_CASE(GGML_TYPE_Q5_0, GGML_TYPE_Q8_0)
+    MMVQP_QKV_CASE(GGML_TYPE_Q8_0, GGML_TYPE_Q5_0)
+    MMVQP_QKV_CASE(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    MMVQP_QKV_CASE(GGML_TYPE_Q5_0, GGML_TYPE_Q5_0)
+    MMVQP_QKV_CASE(GGML_TYPE_Q5_K, GGML_TYPE_Q5_K)
+#undef MMVQP_QKV_CASE
+    return false;
+}
+
 #else
 
 bool ggml_cuda_mmvq_pascal_active(const int cc) {
@@ -770,6 +878,11 @@ bool ggml_cuda_mmvq_pascal(
     GGML_UNUSED_VARS(vx, type, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                      nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                      nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+    return false;
+}
+
+bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & args, cudaStream_t stream) {
+    GGML_UNUSED_VARS(args, stream);
     return false;
 }
 
