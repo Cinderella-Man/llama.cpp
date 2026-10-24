@@ -604,6 +604,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_KQ_MASK,
+
         GGML_OP_COUNT,
     };
 
@@ -1824,6 +1826,21 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale,
             float                 max_bias);
+
+    // causal attention mask built from KV cell and token positions, so it can be computed on the device that uses it:
+    //   cells: I32 [n_kv, 2, n_stream]: row 0 the cell's position, row 1 a bit mask of the micro-batch's sequences
+    //          (bit b = the sequence of index b) the cell belongs to, 0 for an empty cell
+    //   toks:  I32 [n_tps, 2, n_stream]: row 0 the token's position, row 1 the index (0..31) of its sequence
+    //   result [n_kv, n_tps, 1, n_stream] of type (F16 or F32): 0 where token i may attend cell j (same sequence,
+    //   cell position <= token position, inside the sliding window), -INFINITY elsewhere
+    //   swa_type: 0 none, 1 standard (masked when p_tok - p_cell >= n_swa), 2 chunked, 3 symmetric (as llama_swa_type)
+    GGML_API struct ggml_tensor * ggml_kq_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * toks,
+            enum ggml_type        type,
+            int                   swa_type,
+            int                   n_swa);
 
     GGML_API struct ggml_tensor * ggml_soft_max_ext_inplace(
             struct ggml_context * ctx,

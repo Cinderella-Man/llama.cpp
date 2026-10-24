@@ -7,6 +7,7 @@
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
+#include "ggml-cuda/kq-mask.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
@@ -2398,6 +2399,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ARANGE:
             ggml_cuda_op_arange(ctx, dst);
+            break;
+        case GGML_OP_KQ_MASK:
+            ggml_cuda_op_kq_mask(ctx, dst);
             break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             ggml_cuda_op_timestep_embedding(ctx, dst);
@@ -6202,6 +6206,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_PAD:
             return true;
+        case GGML_OP_KQ_MASK:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_UPSCALE:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ARANGE:

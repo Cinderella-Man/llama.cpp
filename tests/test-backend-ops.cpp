@@ -8638,6 +8638,75 @@ struct test_arange : public test_case {
     }
 };
 
+// GGML_OP_KQ_MASK: the attention mask from cell and token positions and sequences. The KV ring of each stream holds
+// cells at positions 0..n_kv-1 (a few empty), each in a random subset of n_seq sequences; the tokens are the last n_tps
+// positions, each of a random sequence. Values are 0 or -inf, compared exactly.
+struct test_kq_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int swa_type;
+    const int n_swa;
+    const int n_seq;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_kv, n_tps, n_stream, swa_type, n_swa, n_seq);
+    }
+
+    test_kq_mask(ggml_type type, int64_t n_kv, int64_t n_tps, int64_t n_stream, int swa_type, int n_swa, int n_seq)
+        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), swa_type(swa_type), n_swa(n_swa), n_seq(n_seq) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 2, n_stream);
+        ggml_set_name(cells, "cells");
+        ggml_tensor * toks = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_tps, 2, n_stream);
+        ggml_set_name(toks, "toks");
+        ggml_tensor * out = ggml_kq_mask(ctx, cells, toks, type, swa_type, n_swa);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234 + (int) n_kv + 7 * (int) n_tps + 31 * swa_type + n_seq);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                continue;
+            }
+            const bool is_cells = strcmp(t->name, "cells") == 0;
+            const int64_t n = t->ne[0];
+            std::vector<int32_t> data(2*n*n_stream);
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t i = 0; i < n; ++i) {
+                    int32_t & pos = data[2*n*s + i];
+                    int32_t & seq = data[2*n*s + n + i];
+                    if (is_cells) {
+                        pos = (int32_t) i;
+                        const uint32_t all = n_seq >= 32 ? 0xffffffffu : (1u << n_seq) - 1;
+                        seq = rng() % 16 == 0 ? 0 : (int32_t) ((rng() & all) | (1u << (rng() % n_seq)));
+                    } else {
+                        pos = (int32_t) (n_kv - n_tps + i);
+                        seq = (int32_t) (rng() % n_seq);
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+};
+
 // GGML_OP_TIMESTEP_EMBEDDING
 struct test_timestep_embedding : public test_case {
     const ggml_type type;
@@ -12079,6 +12148,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        // no window, Flint's 513-token window, chunked and symmetric windows; one or several sequences and streams
+        test_cases.emplace_back(new test_kq_mask(type, 1024, 128, 1, 0,   0, 1));
+        test_cases.emplace_back(new test_kq_mask(type,  768, 128, 1, 1, 513, 1));
+        test_cases.emplace_back(new test_kq_mask(type, 2048,  64, 1, 1, 513, 3));
+        test_cases.emplace_back(new test_kq_mask(type, 1280, 512, 1, 1, 513, 1));
+        test_cases.emplace_back(new test_kq_mask(type,  777,  33, 1, 2, 128, 2));
+        test_cases.emplace_back(new test_kq_mask(type,  512,  32, 1, 3,  64, 1));
+        test_cases.emplace_back(new test_kq_mask(type,  512,  16, 4, 0,   0, 1));
+        test_cases.emplace_back(new test_kq_mask(type,  768,  32, 3, 1, 513, 1));
+        test_cases.emplace_back(new test_kq_mask(type,  256,   1, 2, 1, 513, 1));
+        test_cases.emplace_back(new test_kq_mask(type, 4096,   8, 1, 0,   0, 32));
+    }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());
