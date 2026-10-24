@@ -932,6 +932,11 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// A sliding-window cache keeps every cell of the sequence, also those already outside the window (by default they are
+// left out): the state then holds all positions from the cache's lowest one, and a restore that removes the positions
+// after a point before the state's end still has a complete window before that point.
+#define LLAMA_STATE_SEQ_FLAGS_SWA_RING 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
