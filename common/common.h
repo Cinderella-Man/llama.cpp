@@ -134,7 +134,11 @@ enum common_sampler_type {
 // screened output head (models with an output_screen tensor; see llama_set_screen_head): whether sampling with these
 // parameters picks the same tokens from screened logits (exact for the top m candidates, -INFINITY elsewhere) as from
 // the full head whenever the true top-k is among the candidates; why = the reason when it does not
-bool common_sampling_screen_head_ok(const struct common_params_sampling & p, uint32_t m, std::string * why = nullptr);
+// grammar_active: whether the grammar can reject the next token (common_sampler_grammar_active); a grammar that cannot
+// (a lazy grammar before its trigger, or inside the reasoning) leaves the chain's token as it is, so the screen stays
+// exact, while a rejection resamples over the allowed tokens, which may lie outside the candidates
+bool common_sampling_screen_head_ok(const struct common_params_sampling & p, uint32_t m, std::string * why = nullptr,
+                                    bool grammar_active = true);
 
 // LLAMA_SCREEN_HEAD=1 asks for the screened output head (llama_context turns it on at creation)
 bool common_screen_head_requested();

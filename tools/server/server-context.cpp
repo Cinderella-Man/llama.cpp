@@ -4589,7 +4589,9 @@ private:
             bool screen = true;
             for (const auto & slot : slots) {
                 if (slot.task && slot.i_batch >= off && slot.i_batch < off + (int) batch.view.size()) {
-                    screen = screen && common_sampling_screen_head_ok(slot.task->params.sampling, screen_head_m);
+                    // a grammar keeps the screen until it can reject a token (after a lazy grammar's trigger)
+                    screen = screen && common_sampling_screen_head_ok(slot.task->params.sampling, screen_head_m, nullptr,
+                            common_sampler_grammar_active(slot.smpl.get()));
                 }
             }
             llama_set_screen_head(ctx_tgt, screen);
