@@ -1588,8 +1588,9 @@ private:
                 SRV_WRN("%s", "failed to set up the pipe slots: pipelined speculation off\n");
                 params_base.pipe_depth = 0;
             } else {
-                SRV_INF("pipelined speculation: up to %d guesses (%s, copy >= %d), %d pipe slots\n",
-                        params_base.pipe_depth, params_base.pipe_guess.c_str(), params_base.pipe_copy_min, n_pipe);
+                SRV_INF("pipelined speculation: up to %d guesses (%s, copy >= %d, floor %d), %d pipe slots\n",
+                        params_base.pipe_depth, params_base.pipe_guess.c_str(), params_base.pipe_copy_min,
+                        params_base.pipe_floor, n_pipe);
                 for (auto & slot : slots) {
                     slot.pipe_draws = true;
                     slot.pipe_guesser.kind = params_base.pipe_guess == "none" ? common_pipe_guesser::NONE :
@@ -3593,7 +3594,11 @@ private:
             for (size_t i = 1; i < slot.pipe_win.size(); i++) {
                 inflight.push_back(slot.pipe_win[i].tok);
             }
-            const llama_token g = slot.pipe_guesser.guess(inflight.data(), inflight.size());
+            llama_token g = slot.pipe_guesser.guess(inflight.data(), inflight.size());
+            if (g < 0 && (int32_t) inflight.size() < params_base.pipe_floor) {
+                // a filler: almost always wrong, but it keeps the GPUs busy, so their clocks stay up
+                g = slot.pipe_win.back().tok;
+            }
             if (g < 0 || !pipe_submit(slot, g, pos)) {
                 break;
             }

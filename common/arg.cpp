@@ -1735,6 +1735,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PIPE_COPY_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--pipe-floor"}, "N",
+        string_format("keep at least N guesses in flight for --pipe-depth, with a filler token when the guesser has "
+            "none: almost always wrong, but idle GPUs drop to their base clock (default: %d)", params.pipe_floor),
+        [](common_params & params, int value) {
+            params.pipe_floor = value;
+        }
+    ).set_env("LLAMA_ARG_PIPE_FLOOR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {

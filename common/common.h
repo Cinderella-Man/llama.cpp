@@ -650,6 +650,7 @@ struct common_params {
     int32_t     pipe_depth     = 0;
     std::string pipe_guess     = "cont"; // none, copy or cont (common_pipe_guesser)
     int32_t     pipe_copy_min  = 4;      // shortest copy match that makes a guess
+    int32_t     pipe_floor     = 0;      // guesses kept in flight with a filler token when the guesser has none
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
