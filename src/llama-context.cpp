@@ -2880,8 +2880,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
-        if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+        // - a layer's attention mask built on the device (LLAMA_GPU_KQ_MASK) belongs on that layer's device, or the scheduler
+        //   computes it once and copies it between devices, which is the transfer it exists to avoid
+        if ((ubatch.n_tokens < 32 || full_offload || strcmp(name, "kq_mask") == 0) && il != -1) {
+            if (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || strcmp(name, "kq_mask") == 0) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

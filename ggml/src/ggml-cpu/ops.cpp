@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 
 // ggml_compute_forward_dup
 
@@ -8739,6 +8740,82 @@ void ggml_compute_forward_arange(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_arange_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_kq_mask
+
+// llama_hparams::is_masked_swa, with swa_type numbered as llama_swa_type
+static inline bool ggml_kq_mask_swa_masked(const int swa_type, const int32_t n_swa, const int32_t p0, const int32_t p1) {
+    switch (swa_type) {
+        case 1: // standard
+            return p1 - p0 >= n_swa;
+        case 2: // chunked
+            return p0 < (p1 / n_swa) * n_swa;
+        case 3: // symmetric
+            return p1 - p0 < -(n_swa / 2) || p1 - p0 > n_swa / 2;
+        default:
+            return false;
+    }
+}
+
+template <typename T>
+static void ggml_compute_forward_kq_mask_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cells = dst->src[0];
+    const ggml_tensor * toks  = dst->src[1];
+
+    const int     swa_type = ggml_get_op_params_i32(dst, 0);
+    const int32_t n_swa    = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tps    = dst->ne[1];
+    const int64_t n_stream = dst->ne[3];
+
+    T keep;
+    T drop;
+    if constexpr (std::is_same_v<T, ggml_fp16_t>) {
+        keep = GGML_CPU_FP32_TO_FP16(0.0f);
+        drop = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    } else {
+        keep = 0.0f;
+        drop = -INFINITY;
+    }
+
+    for (int64_t r = params->ith; r < n_tps*n_stream; r += params->nth) {
+        const int64_t s = r / n_tps;
+        const int64_t i = r % n_tps;
+
+        const int32_t * cpos  = (const int32_t *) cells->data + 2*n_kv*s;
+        const int32_t * cbits = cpos + n_kv;
+        const int32_t * tpos  = (const int32_t *) toks->data + 2*n_tps*s;
+        const int32_t   p1    = tpos[i];
+        const int32_t   b     = tpos[n_tps + i];
+
+        T * row = (T *) ((char *) dst->data + i*dst->nb[1] + s*dst->nb[3]);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int32_t p0 = cpos[j];
+            const bool same_seq = ((uint32_t) cbits[j] >> b) & 1;
+            row[j] = same_seq && p0 <= p1 && !ggml_kq_mask_swa_masked(swa_type, n_swa, p0, p1) ? keep : drop;
+        }
+    }
+}
+
+void ggml_compute_forward_kq_mask(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_kq_mask_impl<ggml_fp16_t>(params, dst);
+            } break;
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_kq_mask_impl<float>(params, dst);
             } break;
         default:
             {

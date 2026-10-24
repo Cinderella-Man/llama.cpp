@@ -534,6 +534,14 @@ public:
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // with the mask built on the device (LLAMA_GPU_KQ_MASK), these replace self_kq_mask and self_kq_mask_swa as inputs:
+    // build_attn makes a ggml_kq_mask node per layer from them, on that layer's device; self_kq_mask_cnv and
+    // self_kq_mask_swa_cnv are then such nodes too, for code that reads the mask directly
+    ggml_tensor * self_kq_cells     = nullptr; // I32 [n_kv, 2, n_stream]
+    ggml_tensor * self_kq_cells_swa = nullptr; // I32 [n_kv, 2, n_stream]
+    ggml_tensor * self_kq_toks      = nullptr; // I32 [n_batch/n_stream, 2, n_stream]
+    ggml_type     kq_mask_type      = GGML_TYPE_F16;
+
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 

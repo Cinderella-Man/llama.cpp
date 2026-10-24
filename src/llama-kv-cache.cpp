@@ -1805,6 +1805,71 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+void llama_kv_cache::fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const {
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(n_tokens%n_stream == 0);
+
+    const int64_t n_tps = n_tokens/n_stream;
+
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
+    const args_set_input_kq_mask args = {
+        /*.hparams          =*/ hparams,
+        /*.ubatch           =*/ ubatch,
+        /*.v_cells          =*/ v_cells,
+        /*.seq_to_stream    =*/ seq_to_stream,
+        /*.n_swa            =*/ n_swa,
+        /*.swa_type         =*/ swa_type,
+        /*.n_kv             =*/ n_kv,
+        /*.n_stream         =*/ n_stream,
+        /*.n_tps            =*/ n_tps,
+    };
+
+    set_input_kq_mask_impl<float>(args, data, causal_attn);
+}
+
+void llama_kv_cache::set_input_kq_cells(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[1] == 2);
+    GGML_ASSERT(ubatch->n_seqs_unq <= 32);
+
+    const int64_t  n_kv     = dst->ne[0];
+    const int64_t  n_stream = dst->ne[2];
+    const uint32_t n_tps    = ubatch->n_tokens/n_stream;
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        // every token of a stream's rows reads the cells of that stream
+        const uint32_t stream = seq_to_stream[ubatch->seq_id[s*n_tps][0]];
+        for (uint32_t ii = 1; ii < n_tps; ++ii) {
+            GGML_ASSERT(seq_to_stream[ubatch->seq_id[s*n_tps + ii][0]] == stream);
+        }
+        const auto & cells = v_cells.at(stream);
+
+        int32_t * pos  = data + 2*n_kv*s;
+        int32_t * seqs = pos + n_kv;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            int32_t  p = 0;
+            uint32_t m = 0;
+            if (!cells.is_empty(j)) {
+                p = cells.pos_get(j);
+                for (uint32_t b = 0; b < ubatch->n_seqs_unq; ++b) {
+                    const llama_seq_id seq_id = ubatch->seq_id_unq[b];
+                    if (cells.seq_has(j, seq_id)) {
+                        m |= 1u << ubatch->seq_idx[seq_id];
+                    }
+                }
+            }
+            pos[j]  = p;
+            seqs[j] = (int32_t) m;
+        }
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2946,6 +3011,22 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_cells(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_cells(dst, ubatch);
+}
+
+void llama_kv_cache_context::fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->fill_kq_mask_f32(data, n_kv, n_stream, ubatch, causal_attn);
+}
+
+uint32_t llama_kv_cache_context::get_n_swa() const {
+    return kv->get_n_swa();
+}
+
+llama_swa_type llama_kv_cache_context::get_swa_type() const {
+    return kv->get_swa_type();
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
