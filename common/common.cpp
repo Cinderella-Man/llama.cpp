@@ -1465,7 +1465,7 @@ bool common_screen_head_requested() {
     return e && atoi(e) != 0;
 }
 
-bool common_sampling_screen_head_ok(const common_params_sampling & p, uint32_t m, std::string * why) {
+bool common_sampling_screen_head_ok(const common_params_sampling & p, uint32_t m, std::string * why, bool grammar_active) {
     const auto no = [&](const char * reason) {
         if (why) {
             *why = reason;
@@ -1478,7 +1478,7 @@ bool common_sampling_screen_head_ok(const common_params_sampling & p, uint32_t m
     if (p.n_probs > 0) {
         return no("token probabilities are requested");
     }
-    if (!p.grammar.empty()) {
+    if (!p.grammar.empty() && grammar_active) {
         return no("a grammar is set");
     }
     for (const auto & lb : p.logit_bias) {
