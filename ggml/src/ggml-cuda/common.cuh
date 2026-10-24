@@ -1550,6 +1550,12 @@ struct ggml_backend_cuda_context {
         int n_checked = 0;                       // check mode: layers compared
     } moe_persistent;
 
+    // The Pascal decode attention kernel's merge counters (fattn-pascal.cu), one per KV-head group, allocated and zeroed
+    // on first use; each launch leaves them at zero.
+    struct fattn_pascal_state {
+        unsigned * counters = nullptr;
+    } fattn_pascal;
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
