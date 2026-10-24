@@ -940,13 +940,17 @@ static void moep_alloc(ggml_backend_cuda_context & ctx) {
     CUDA_CHECK(cudaHostAlloc((void **) &st.err_host, MOEP_ERR_WORDS * sizeof(unsigned), cudaHostAllocMapped));
     memset(st.err_host, 0, MOEP_ERR_WORDS * sizeof(unsigned));
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &st.err_dev, st.err_host, 0));
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_LOG_INFO("%s: %s (compute capability %d.%d): MoE layers at one token run as one persistent kernel "
+                  "(GGML_CUDA_PERSISTENT_MOE=%d)\n", __func__, ctx.name.c_str(), cc / 100, (cc % 100) / 10, moep_mode());
 }
 
 } // namespace
 
+// 1: compute capability 6.1 only; 2: any NVIDIA GPU (testing)
 bool ggml_cuda_moe_persistent_enabled(const int cc) {
     const int mode = moep_mode();
-    return mode != 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && (mode != 1 || cc == GGML_CUDA_CC_DP4A);
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
 }
 
 bool ggml_cuda_moe_persistent_check_mode() {
