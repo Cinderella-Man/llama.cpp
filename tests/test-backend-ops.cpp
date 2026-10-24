@@ -11540,6 +11540,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 6, true,  512, 512, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 6, false, 2048, 512, 512));
+    // steps of 5-8 tokens with the same routing: MMQ with the per-expert tiles for the types whose vector kernel stops
+    // below 8 tokens (get_mmvq_mmid_max_batch), the vector kernels for the others
+    for (ggml_type type : { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ3_S, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+                            GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS }) {
+        for (int n : { 5, 6, 7, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 6, true,  256, n, 512));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 6, false, 512, n, 256));
+        }
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
