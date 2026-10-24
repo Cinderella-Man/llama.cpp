@@ -1355,6 +1355,12 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
 
         auto & sampler = samplers[seq_id];
 
+        // this graph's input tensors, not those of the graph built last with the same sampler
+        const auto it = sampler_inputs.find(seq_id);
+        if (it != sampler_inputs.end()) {
+            llama_sampler_backend_set_inputs(sampler, it->second);
+        }
+
         if (sampler->iface->backend_set_input) {
             sampler->iface->backend_set_input(sampler);
         }
@@ -4225,6 +4231,7 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto * inp_sampling_ptr = inp_sampling.get();
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
@@ -4310,6 +4317,10 @@ void llm_graph_context::build_sampling() const {
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
         }
+    }
+
+    for (const auto & [seq_id, sampler] : samplers) {
+        inp_sampling_ptr->sampler_inputs[seq_id] = llama_sampler_backend_get_inputs(sampler);
     }
 
     // TODO: Call backend_accept after all samplers have been applied.
