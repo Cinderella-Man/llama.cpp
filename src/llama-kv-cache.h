@@ -236,9 +236,55 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
-    // inputs of the mask built on the device (ggml_kq_mask): per KV cell its position and, as bit b, whether it holds
-    // the ubatch's sequence of index b (ubatch->seq_idx); I32 [n_kv, 2, n_stream], an empty cell holds no sequence
-    void set_input_kq_cells(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // the mask built on the device (ggml_kq_mask) reads the cells' positions and sequences from a copy that each device
+    // holding layers of this cache keeps: F32 [2, kv_size*n_stream + 1], per cell its position and, as bit s, whether
+    // it holds sequence s (an empty cell holds none), plus a scratch row. A step that builds its mask on the device
+    // scatters into every copy first the cells changed since the last step (seq_rm, a seq_cp within a stream: up to
+    // kq_cells_n_changed_max of them, the rest of the list pointing at the scratch row), then the cells it writes. The
+    // copies are stale after more changes than that, any other change to the cells, or a step whose cells did not reach
+    // every copy (a host-mask step, say); the next device-mask step then uploads all cells.
+    // Kept for offloaded caches with their own cells and at most 24 sequences (the bits and positions below 2^24 are
+    // exact), except with tensor split.
+    bool   get_kq_cells_resident() const;
+    bool   get_kq_cells_stale()    const { return kq_cells_stale || kq_cells_n_applied > 1; }
+    size_t get_kq_cells_n_copies() const { return kq_cells_devs.size(); }
+
+    // the copy on layer il's device; il < 0: the first copy
+    ggml_tensor * get_kq_cells(int32_t il) const;
+
+    // a model layer whose cells are on the first copy's device
+    int32_t get_kq_cells_il0() const { return kq_cells_il.at(0); }
+
+    // the rows a step's update writes: its own cells, then the kq_cells_n_changed_max entries of the changed-cell list
+    uint32_t get_kq_cells_n_upd(const llama_ubatch & ubatch) const { return ubatch.n_tokens + kq_cells_n_changed_max; }
+
+    ggml_tensor * build_input_kq_cells_all(ggml_context * ctx) const; // F32 [2, kv_size*n_stream + 1]
+
+    // a copy updated for this step: cells_all, if set, replaces it, then the values vals (F32 [2, n_upd]) go to the rows
+    // that rows (I32 [n_upd]) names; a row named twice gets the same value twice
+    ggml_tensor * update_kq_cells(ggml_context * ctx, ggml_tensor * cells, ggml_tensor * cells_all, ggml_tensor * vals, ggml_tensor * rows) const;
+
+    // the cells a ubatch attends to, from an updated copy: F32 [2, n_kv, ns]
+    ggml_tensor * view_kq_cells(ggml_context * ctx, ggml_tensor * cells, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // a step's update, as floats (all integers below 2^24): rows [n_upd] holds the step's cells in the order of
+    // set_input_k_idxs, then the changed cells, then the scratch row; vals [2*n_upd] their current values
+    void fill_kq_cells_upd(float * rows, float * vals, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_kq_cells_all(ggml_tensor * dst) const;
+
+    // a step applied its cells (llama_kv_cache_context::apply); they reach the copies only through that step's graph
+    void set_kq_cells_applied() { kq_cells_n_applied++; }
+
+    // the step whose inputs were just set updates every copy: they hold the cells once it has run
+    void set_kq_cells_synced() const { kq_cells_stale = false; kq_cells_n_applied = 0; kq_cells_changed.clear(); }
+
+    // LLAMA_GPU_KQ_MASK_CHECK=1: read every device's copy (the caller synchronizes first), apply this step's update to it
+    // (cells_all: the full upload or null; rows, vals: as fill_kq_cells_upd wrote them), expand the mask for the tokens'
+    // pairs toks (F32 [2, n_tps, n_stream]) by ggml_kq_mask's rule and compare it with the host mask; abort on a difference
+    void check_kq_cells(const float * cells_all, const float * rows, const float * vals, uint32_t n_upd, const float * toks, uint32_t n_tps,
+            uint32_t n_kv, const slot_info & sinfo, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    static constexpr uint32_t kq_cells_n_changed_max = 32;
 
     // the mask set_input_kq_mask writes, as F32 into data [n_kv, n_tokens/n_stream, 1, n_stream]
     void fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const;
@@ -274,6 +320,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // the cell copy of the layer's device (see get_kq_cells_resident), shared by the layers there
+        ggml_tensor * kq_cells = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -324,6 +373,18 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    // one cell copy per device (see get_kq_cells_resident); stale until a step uploads all cells
+    std::vector<ggml_tensor *> kq_cells_devs;
+    std::vector<int32_t>       kq_cells_il; // per copy, the first model layer stored on its device
+    mutable bool     kq_cells_stale     = true;
+    mutable uint32_t kq_cells_n_applied = 0; // steps applied since the copies were last updated
+
+    // cells changed outside the steps' own writes since then (stream*kv_size + cell); kq_cells_track off: not recorded
+    mutable std::vector<uint32_t> kq_cells_changed;
+    bool kq_cells_track = true;
+
+    void kq_cells_mark(uint32_t strm, uint32_t idx);
 
     std::vector<kv_layer> layers;
 
@@ -441,8 +502,23 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_kq_cells  (ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void fill_kq_mask_f32    (float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // see llama_kv_cache::get_kq_cells_resident()
+    bool          get_kq_cells_resident() const;
+    bool          get_kq_cells_stale()    const;
+    size_t        get_kq_cells_n_copies() const;
+    ggml_tensor * get_kq_cells(int32_t il) const;
+    int32_t       get_kq_cells_il0() const;
+    uint32_t      get_kq_cells_n_upd(const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_kq_cells_all(ggml_context * ctx) const;
+    ggml_tensor * update_kq_cells(ggml_context * ctx, ggml_tensor * cells, ggml_tensor * cells_all, ggml_tensor * vals, ggml_tensor * rows) const;
+    ggml_tensor * view_kq_cells(ggml_context * ctx, ggml_tensor * cells) const;
+    void          fill_kq_cells_upd(float * rows, float * vals, const llama_ubatch * ubatch) const;
+    void          set_input_kq_cells_all(ggml_tensor * dst) const;
+    void          set_kq_cells_synced() const;
+    void          check_kq_cells(const float * cells_all, const float * rows, const float * vals, uint32_t n_upd, const float * toks, uint32_t n_tps,
+                          const llama_ubatch * ubatch, bool causal_attn) const;
 
     uint32_t       get_n_swa()    const;
     llama_swa_type get_swa_type() const;

@@ -47,129 +47,157 @@ static ggml_tensor * build_attn_inp_kq_mask(
     return res;
 }
 
-// LLAMA_GPU_KQ_MASK=<n>: micro-batches of at least n tokens build their attention masks on each device (ggml_kq_mask)
-// from the cells' positions and sequences, 8 bytes per cell to copy, instead of copying the n_kv x n_tokens mask,
-// 2 bytes per cell and token, to every device; 0 turns it off. The default, 32, leaves decode and short batches with the
-// host mask, which is smaller for them.
+// LLAMA_GPU_KQ_MASK=<n>: micro-batches of at least n tokens (default 1: all) build their attention masks on each device
+// (ggml_kq_mask) from the copy of the cells' positions and sequences that each device keeps, which a step updates with
+// the 8 bytes of each cell it writes, instead of copying the n_kv x n_tokens mask, 2 bytes per cell and token, to every
+// device; 0 turns it off
 static uint32_t llama_kq_mask_dev_min_tokens() {
     static const uint32_t n_min = [] {
         const char * env = getenv("LLAMA_GPU_KQ_MASK");
-        return env ? (uint32_t) std::max(0, atoi(env)) : 32u;
+        return env ? (uint32_t) std::max(0, atoi(env)) : 1u;
     }();
     return n_min;
 }
 
-// whether this ubatch's masks are built on the device; the host mask covers everything else
-static bool llama_kq_mask_on_device(const llama_hparams & hparams, const llama_cparams & cparams, const llama_ubatch & ubatch) {
-    const uint32_t n_min = llama_kq_mask_dev_min_tokens();
-    return n_min > 0 && ubatch.n_tokens >= n_min && cparams.causal_attn && !hparams.use_alibi && !ubatch.is_pos_2d() &&
-        ubatch.n_seqs_unq <= 32;
-}
-
-static ggml_tensor * build_attn_inp_kq_cells(
-        ggml_context * ctx,
-        const llama_kv_cache_context * mctx,
-        const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
-
-    ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_kv, 2, n_stream);
-    ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_kq_cells");
-
-    return res;
-}
-
-static ggml_tensor * build_attn_inp_kq_toks(
-        ggml_context * ctx,
-        const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
-
-    ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_tokens/n_stream, 2, n_stream);
-    ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_kq_toks");
-
-    return res;
-}
-
-// per token of each stream: its position and the index of its sequence (ubatch->seq_idx)
-static void set_input_kq_toks(ggml_tensor * dst, const llama_ubatch * ubatch) {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    const int64_t n_tps    = dst->ne[0];
-    const int64_t n_stream = dst->ne[2];
-
-    int32_t * data = (int32_t *) dst->data;
-    for (int64_t s = 0; s < n_stream; ++s) {
-        for (int64_t ii = 0; ii < n_tps; ++ii) {
-            const int64_t i = s*n_tps + ii;
-            data[2*n_tps*s + ii]         = ubatch->pos[i];
-            data[2*n_tps*s + n_tps + ii] = ubatch->seq_idx[ubatch->seq_id[i][0]];
-        }
-    }
-}
-
-// LLAMA_GPU_KQ_MASK_CHECK=1: for every ubatch, expand the device mask's inputs on the host by ggml_kq_mask's rule and
-// compare the result with the host mask; abort on any difference
-static void check_kq_mask_inputs(
-        const llama_kv_cache_context * mctx,
-        const ggml_tensor * cells,
-        const ggml_tensor * toks,
-        const llama_ubatch * ubatch,
-        bool causal_attn) {
+// LLAMA_GPU_KQ_MASK_CHECK=1: every device-mask step compares, per cache and device copy, the mask its inputs and the
+// copy expand to with the host mask (llama_kv_cache::check_kq_cells); llama_context synchronizes before the inputs
+static bool llama_kq_mask_check_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("LLAMA_GPU_KQ_MASK_CHECK");
         return env != nullptr && atoi(env) != 0;
     }();
-    if (!enabled) {
-        return;
+    return enabled;
+}
+
+// whether this ubatch's masks can be built on the device, given caches that keep cell copies; the host mask covers
+// everything else
+static bool llama_kq_mask_on_device(const llama_hparams & hparams, const llama_cparams & cparams, const llama_ubatch & ubatch) {
+    const uint32_t n_min = llama_kq_mask_dev_min_tokens();
+    return n_min > 0 && ubatch.n_tokens >= n_min && cparams.causal_attn && !hparams.use_alibi && !ubatch.is_pos_2d();
+}
+
+void llm_graph_kq_dev::build_inputs(ggml_context * ctx, const llama_ubatch & ubatch, const llama_cparams & cparams,
+        const std::vector<const llama_kv_cache_context *> & mctxs) {
+    n_tokens = ubatch.n_tokens;
+    n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    n_tps    = n_tokens/n_stream;
+    type     = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    // [tokens' pairs | rows per cache | values per cache]
+    caches.assign(mctxs.size(), cache_t());
+
+    int64_t off = 2*n_tokens;
+    for (size_t c = 0; c < mctxs.size(); ++c) {
+        cache_t & ca = caches[c];
+
+        ca.mctx      = mctxs[c];
+        ca.n_upd     = mctxs[c]->get_kq_cells_n_upd(ubatch);
+        ca.off_rows  = off;
+        ca.cells_all = mctxs[c]->get_kq_cells_stale() ? mctxs[c]->build_input_kq_cells_all(ctx) : nullptr;
+
+        off += ca.n_upd;
     }
 
-    const int64_t n_kv     = cells->ne[0];
-    const int64_t n_stream = cells->ne[2];
-    const int64_t n_tps    = toks->ne[0];
-    const int     swa_type = mctx->get_swa_type();
-    const int32_t n_swa    = mctx->get_n_swa();
+    n_int = off;
 
-    std::vector<float> host((size_t) (n_kv*n_tps*n_stream));
-    mctx->fill_kq_mask_f32(host.data(), n_kv, n_stream, ubatch, causal_attn);
+    for (cache_t & ca : caches) {
+        ca.off_vals = off;
+        off += 2*ca.n_upd;
+    }
 
-    int64_t n_diff = 0;
-    for (int64_t s = 0; s < n_stream; ++s) {
-        const int32_t * cpos  = (const int32_t *) cells->data + 2*n_kv*s;
-        const int32_t * cseqs = cpos + n_kv;
-        const int32_t * tpos  = (const int32_t *) toks->data + 2*n_tps*s;
-        for (int64_t i = 0; i < n_tps; ++i) {
-            const int32_t p1 = tpos[i];
-            const int32_t b  = tpos[n_tps + i];
-            for (int64_t j = 0; j < n_kv; ++j) {
-                const int32_t p0 = cpos[j];
-                bool swa_masked = false;
-                switch (swa_type) {
-                    case 1: swa_masked = p1 - p0 >= n_swa; break;
-                    case 2: swa_masked = p0 < (p1 / n_swa) * n_swa; break;
-                    case 3: swa_masked = p1 - p0 < -(n_swa / 2) || p1 - p0 > n_swa / 2; break;
-                    default: break;
-                }
-                const bool keep = (((uint32_t) cseqs[j] >> b) & 1) && p0 <= p1 && !swa_masked;
-                const float want = host[(size_t) ((s*n_tps + i)*n_kv + j)];
-                if ((keep ? 0.0f : -INFINITY) != want) {
-                    if (n_diff++ < 8) {
-                        LLAMA_LOG_ERROR("%s: stream %" PRId64 " token %" PRId64 " (pos %d, seq index %d) cell %" PRId64 " (pos %d, seqs 0x%x): device %s, host %f\n",
-                                __func__, s, i, p1, b, j, p0, (unsigned) cseqs[j], keep ? "keep" : "drop", want);
-                    }
-                }
-            }
+    upd = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, off);
+    ggml_set_input(upd);
+    ggml_set_name(upd, "attn_inp_kq_upd");
+}
+
+ggml_tensor * llm_graph_kq_dev::build_mask(ggml_context * ctx, ggml_cgraph * gf, const cb_t & cb, size_t c, int32_t il) {
+    cache_t & ca = caches[c];
+
+    ggml_tensor * cells = ca.mctx->get_kq_cells(il);
+
+    // the input on the layer's device: one node reads all of it, so the scheduler uploads it once per device; the
+    // callback places these nodes on the layer's device
+    dev_t & d = devs[ggml_backend_buffer_get_type(cells->buffer)];
+    if (!d.stage) {
+        d.stage = ggml_cont(ctx, upd);
+        d.ints  = ggml_cast(ctx, ggml_view_1d(ctx, d.stage, n_int, 0), GGML_TYPE_I32);
+        if (cb) {
+            cb(d.stage, "kq_stage", il);
+            cb(d.ints,  "kq_stage", il);
+        }
+
+        d.toks = ggml_view_3d(ctx, d.ints, 2, n_tps, n_stream, 2*sizeof(int32_t), 2*sizeof(int32_t)*n_tps, 0);
+    }
+
+    auto it = ca.cur.find(cells);
+    if (it == ca.cur.end()) {
+        // the copy lives in the device's KV buffer, so the scheduler runs its update there, before every mask that reads it
+        ggml_tensor * rows = ggml_view_1d(ctx, d.ints, ca.n_upd, ca.off_rows*sizeof(int32_t));
+        ggml_tensor * vals = ggml_view_2d(ctx, d.stage, 2, ca.n_upd, 2*sizeof(float), ca.off_vals*sizeof(float));
+
+        it = ca.cur.emplace(cells, ca.mctx->view_kq_cells(ctx, ca.mctx->update_kq_cells(ctx, cells, ca.cells_all, vals, rows))).first;
+    }
+
+    if (gf) {
+        ggml_build_forward_expand(gf, it->second);
+        ca.used.insert(cells);
+    }
+
+    ggml_tensor * mask = ggml_kq_mask(ctx, it->second, d.toks, type, ca.mctx->get_swa_type(), ca.mctx->get_n_swa());
+    if (gf && cb) {
+        cb(mask, "kq_mask", il);
+    }
+
+    return mask;
+}
+
+void llm_graph_kq_dev::set_input(const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(upd->buffer));
+    GGML_ASSERT(ubatch->n_tokens == n_tokens);
+
+    float * data = (float *) upd->data;
+
+    // per token, in stream order: its position and its (first) sequence, as the host mask reads them
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        GGML_ASSERT(ubatch->pos[i] >= 0 && ubatch->pos[i] < (1 << 24));
+        data[2*i + 0] = (float) ubatch->pos[i];
+        data[2*i + 1] = (float) ubatch->seq_id[i][0];
+    }
+
+    for (const cache_t & ca : caches) {
+        ca.mctx->fill_kq_cells_upd(data + ca.off_rows, data + ca.off_vals, ubatch);
+
+        const bool all = ca.cells_all && ca.cells_all->buffer;
+        if (all) {
+            ca.mctx->set_input_kq_cells_all(ca.cells_all);
+        }
+
+        if (llama_kq_mask_check_enabled()) {
+            ca.mctx->check_kq_cells(all ? (const float *) ca.cells_all->data : nullptr, data + ca.off_rows, data + ca.off_vals, ca.n_upd,
+                    data, n_tps, ubatch, causal_attn);
+        }
+
+        // a graph that updates only some copies (one that leaves out a device's layers) leaves the cells to a full upload
+        if (ca.used.size() == ca.mctx->get_kq_cells_n_copies()) {
+            ca.mctx->set_kq_cells_synced();
         }
     }
-    if (n_diff != 0) {
-        GGML_ABORT("%s: %" PRId64 " of %" PRId64 " mask values differ from the host mask", __func__, n_diff, n_kv*n_tps*n_stream);
+}
+
+bool llm_graph_kq_dev::can_reuse(const llama_ubatch & ubatch, const llama_cparams & cparams) const {
+    bool res = true;
+
+    res &= n_tokens == ubatch.n_tokens;
+    res &= n_stream == (cparams.kv_unified ? 1 : ubatch.n_seqs_unq);
+
+    for (const cache_t & ca : caches) {
+        res &= (ca.cells_all != nullptr) == ca.mctx->get_kq_cells_stale();
+        for (const auto & [_, view] : ca.cur) {
+            res &= view->ne[1] == ca.mctx->get_n_kv();
+        }
     }
-    LLAMA_LOG_INFO("%s: %" PRId64 " tokens x %" PRId64 " cells x %" PRId64 " streams (swa type %d): identical to the host mask\n",
-            __func__, n_tps, n_kv, n_stream, swa_type);
+
+    return res;
 }
 
 static bool can_reuse_kq_mask(
@@ -677,6 +705,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    // the mask built on the device: its input
+    if (kq_dev.upd && kq_dev.upd->buffer) {
+        kq_dev.set_input(ubatch, cparams.causal_attn);
+    }
+
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -696,7 +729,15 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    // the mask built on the device or on the host, as the new ubatch needs, and the same shapes
+    const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch) && mctx->get_kq_cells_resident();
+    res &= kq_mask_dev == (kq_dev.upd != nullptr);
+    if (kq_dev.upd) {
+        kq_dev.caches[0].mctx = mctx;
+        res &= kq_dev.can_reuse(params.ubatch, params.cparams);
+    } else {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -835,17 +876,9 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    // the mask built on the device: its inputs
-    if (self_kq_toks && self_kq_toks->buffer) {
-        set_input_kq_toks(self_kq_toks, ubatch);
-        if (self_kq_cells && self_kq_cells->buffer) {
-            mctx->get_base()->set_input_kq_cells(self_kq_cells, ubatch);
-            check_kq_mask_inputs(mctx->get_base(), self_kq_cells, self_kq_toks, ubatch, cparams.causal_attn);
-        }
-        if (self_kq_cells_swa && self_kq_cells_swa->buffer) {
-            mctx->get_swa()->set_input_kq_cells(self_kq_cells_swa, ubatch);
-            check_kq_mask_inputs(mctx->get_swa(), self_kq_cells_swa, self_kq_toks, ubatch, cparams.causal_attn);
-        }
+    // the mask built on the device: its input
+    if (kq_dev.upd && kq_dev.upd->buffer) {
+        kq_dev.set_input(ubatch, cparams.causal_attn);
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -893,17 +926,13 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     // the mask built on the device or on the host, as the new ubatch needs, and the same shapes
-    const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch);
-    res &= kq_mask_dev == (self_kq_toks != nullptr);
-    if (kq_mask_dev && self_kq_toks) {
-        const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
-        res &= self_kq_toks->ne[0] == params.ubatch.n_tokens/n_stream && self_kq_toks->ne[2] == n_stream;
-        if (self_kq_cells) {
-            res &= self_kq_cells->ne[0] == mctx->get_base()->get_n_kv() && self_kq_cells->ne[2] == n_stream;
-        }
-        if (self_kq_cells_swa) {
-            res &= self_kq_cells_swa->ne[0] == mctx->get_swa()->get_n_kv() && self_kq_cells_swa->ne[2] == n_stream;
-        }
+    const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch) &&
+        mctx->get_base()->get_kq_cells_resident() && mctx->get_swa()->get_kq_cells_resident();
+    res &= kq_mask_dev == (kq_dev.upd != nullptr);
+    if (kq_dev.upd) {
+        kq_dev.caches[0].mctx = mctx->get_base();
+        kq_dev.caches[1].mctx = mctx->get_swa();
+        res &= kq_dev.can_reuse(params.ubatch, params.cparams);
     }
 
     return res;
@@ -3344,12 +3373,15 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+// kq_mask_dev: the mask may be built on the device (callers whose own inputs read self_kq_mask keep the host mask)
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+                   bool   kq_mask_dev = false,
+    const llm_graph_kq_dev::cb_t & cb = nullptr) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3359,8 +3391,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        if (kq_mask_dev && !cparams.training && llama_kq_mask_on_device(hparams, cparams, ubatch) && mctx_cur->get_kq_cells_resident()) {
+            inp->kq_dev.build_inputs(ctx0, ubatch, cparams, { mctx_cur });
+            inp->self_kq_mask_cnv = inp->kq_dev.build_mask(ctx0, nullptr, cb, 0, mctx_cur->get_kq_cells_il0());
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3372,7 +3409,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, /*kq_mask_dev =*/ true,
+            [this](ggml_tensor * t, const char * name, int i) { cb(t, name, i); });
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3433,6 +3471,11 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
+    if (inp->kq_dev.upd) {
+        // the mask built on the device: one node per layer, from the cell copy of the layer's device, which the
+        // scheduler callback places on that device
+        kq_mask = inp->kq_dev.build_mask(ctx0, gf, [this](ggml_tensor * t, const char * name, int i) { cb(t, name, i); }, 0, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3718,11 +3761,10 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
-    if (inp->self_kq_toks) {
-        // the mask built on the device: one node per layer, which the scheduler callback places on the layer's device
-        kq_mask = ggml_kq_mask(ctx0, is_swa ? inp->self_kq_cells_swa : inp->self_kq_cells, inp->self_kq_toks, inp->kq_mask_type,
-                               mctx_cur->get_swa_type(), mctx_cur->get_n_swa());
-        cb(kq_mask, "kq_mask", il);
+    if (inp->kq_dev.upd) {
+        // the mask built on the device: one node per layer, from the cell copy of the layer's device, which the
+        // scheduler callback places on that device
+        kq_mask = inp->kq_dev.build_mask(ctx0, gf, [this](ggml_tensor * t, const char * name, int i) { cb(t, name, i); }, is_swa ? 1 : 0, il);
     }
 
     ggml_tensor * q = q_cur;
@@ -3971,10 +4013,11 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur);
 
-    const bool kq_mask_dev = llama_kq_mask_on_device(hparams, cparams, ubatch);
+    const bool kq_mask_dev = !cparams.training && llama_kq_mask_on_device(hparams, cparams, ubatch) &&
+        mctx_cur->get_base()->get_kq_cells_resident() && mctx_cur->get_swa()->get_kq_cells_resident();
+    const llm_graph_kq_dev::cb_t kq_cb = [this](ggml_tensor * t, const char * name, int i) { cb(t, name, i); };
     if (kq_mask_dev) {
-        inp->self_kq_toks = build_attn_inp_kq_toks(ctx0, ubatch, cparams);
-        inp->kq_mask_type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        inp->kq_dev.build_inputs(ctx0, ubatch, cparams, { mctx_cur->get_base(), mctx_cur->get_swa() });
     }
 
     {
@@ -3982,9 +4025,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
 
         if (kq_mask_dev) {
-            inp->self_kq_cells = build_attn_inp_kq_cells(ctx0, mctx_cur->get_base(), ubatch, cparams);
-            inp->self_kq_mask_cnv = ggml_kq_mask(ctx0, inp->self_kq_cells, inp->self_kq_toks, inp->kq_mask_type,
-                                                 mctx_cur->get_base()->get_swa_type(), mctx_cur->get_base()->get_n_swa());
+            inp->self_kq_mask_cnv = inp->kq_dev.build_mask(ctx0, nullptr, kq_cb, 0, mctx_cur->get_base()->get_kq_cells_il0());
         } else {
             inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
             inp->self_kq_mask_cnv = inp->self_kq_mask;
@@ -3998,9 +4039,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_v_idxs_swa = mctx_cur->get_swa()->build_input_v_idxs(ctx0, ubatch);
 
         if (kq_mask_dev) {
-            inp->self_kq_cells_swa = build_attn_inp_kq_cells(ctx0, mctx_cur->get_swa(), ubatch, cparams);
-            inp->self_kq_mask_swa_cnv = ggml_kq_mask(ctx0, inp->self_kq_cells_swa, inp->self_kq_toks, inp->kq_mask_type,
-                                                     mctx_cur->get_swa()->get_swa_type(), mctx_cur->get_swa()->get_n_swa());
+            inp->self_kq_mask_swa_cnv = inp->kq_dev.build_mask(ctx0, nullptr, kq_cb, 1, mctx_cur->get_swa()->get_kq_cells_il0());
         } else {
             inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
             inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;

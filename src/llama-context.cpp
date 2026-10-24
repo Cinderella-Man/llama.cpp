@@ -1577,6 +1577,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        // LLAMA_GPU_KQ_MASK_CHECK=1 reads the devices' cell copies while it sets the inputs: let the last step finish
+        static const bool kq_mask_check = [] {
+            const char * env = getenv("LLAMA_GPU_KQ_MASK_CHECK");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (kq_mask_check) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
@@ -2872,9 +2881,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         // - a layer's attention mask built on the device (LLAMA_GPU_KQ_MASK) belongs on that layer's device, or the scheduler
-        //   computes it once and copies it between devices, which is the transfer it exists to avoid
-        if ((ubatch.n_tokens < 32 || full_offload || strcmp(name, "kq_mask") == 0) && il != -1) {
-            if (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || strcmp(name, "kq_mask") == 0) {
+        //   computes it once and copies it between devices, which is the transfer it exists to avoid; so does the staged
+        //   input it is built from ("kq_stage"), or the scheduler uploads each part of the input separately
+        const bool kq_dev = strcmp(name, "kq_mask") == 0 || strcmp(name, "kq_stage") == 0;
+        if ((ubatch.n_tokens < 32 || full_offload || kq_dev) && il != -1) {
+            if (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || kq_dev) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
