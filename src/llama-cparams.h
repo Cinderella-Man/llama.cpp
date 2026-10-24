@@ -56,6 +56,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool moe_down_rescale_tg; // LLAMA_NO_MOE_DOWN_RESCALE unset: as "tg" (every device of compute capability 6.1)
 
     bool     screen_head;    // screened output head: exact logits only for the candidates of the model's output_screen
     uint32_t screen_head_m;  // number of candidates; 0 = the model's output_screen.top_m
