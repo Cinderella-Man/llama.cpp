@@ -544,6 +544,15 @@ public:
     llm_attn_mask self_attn_mask;
     llm_attn_mask self_attn_mask_swa;
 
+    // with the mask built on the device (LLAMA_GPU_KQ_MASK), these replace the host-filled self_attn_mask.raw and
+    // self_attn_mask_swa.raw as inputs: build_attn makes a ggml_kq_mask node per layer from them, on that layer's
+    // device; self_attn_mask{,_swa}.raw are then such nodes too, and .rows stays unset (no flash_attn_ext_rows)
+    // REBASE PROBE: ported from self_kq_mask/_cnv onto upstream's llm_attn_mask (#29510), not compiled
+    ggml_tensor * self_kq_cells     = nullptr; // I32 [n_kv, 2, n_stream]
+    ggml_tensor * self_kq_cells_swa = nullptr; // I32 [n_kv, 2, n_stream]
+    ggml_tensor * self_kq_toks      = nullptr; // I32 [n_batch/n_stream, 2, n_stream]
+    ggml_type     kq_mask_type      = GGML_TYPE_F16;
+
     std::vector<ggml_tensor *> self_k_rot;
     std::vector<ggml_tensor *> self_v_rot;
 

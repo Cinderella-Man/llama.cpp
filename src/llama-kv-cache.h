@@ -245,6 +245,18 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // inputs of the mask built on the device (ggml_kq_mask): per KV cell its position and, as bit b, whether it holds
+    // the ubatch's sequence of index b (ubatch->seq_idx); I32 [n_kv, 2, n_stream], an empty cell holds no sequence
+    void set_input_kq_cells(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // the mask set_input_attn_mask writes (rows == nullptr shape), as F32 into data [n_kv, n_tokens/n_stream, 1, n_stream]
+    // REBASE PROBE: upstream renamed set_input_kq_mask -> set_input_attn_mask (#29510); body not re-checked
+    void fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    uint32_t       get_n_swa()    const { return n_swa; }
+    llama_swa_type get_swa_type() const { return swa_type; }
+
+
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
@@ -443,6 +455,11 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kq_cells  (ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void fill_kq_mask_f32    (float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    uint32_t       get_n_swa()    const;
+    llama_swa_type get_swa_type() const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
