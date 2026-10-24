@@ -11513,7 +11513,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // shared expert), and an odd row count; these reach the full-width paths of the Pascal matrix-vector kernels
     // (mmvq-pascal.cu) that the small cases above don't
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0,
-                            GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K }) {
+                            GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K }) {
         for (int64_t n : { 1, 2, 3, 4 }) {
             for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                     { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 2048, 1024 }, { 6144, 2048 }, { 2048, 6144 }, { 4097, 2048 } }) {
@@ -11536,6 +11536,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
             test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
             test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 256));
+        }
+    }
+
+    // the K-quants of Q4_K_M files at the shapes of Qwen3.6-35B-A3B (8 of 256 experts of width 512, a 512-wide shared
+    // expert, an 8192-row gated query projection) and of Qwen3-30B-A3B's 768-wide experts, whose 3 super-blocks per row
+    // give one lane per row
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 2048, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2048, n, 512, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, true,  512, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 2048, n, 512));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, true,  768, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 2048, n, 768));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 512, 2048, true, 32, 8, true));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, n, 512, 32, 8));
         }
     }
 
@@ -12583,7 +12599,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // distinct experts in 2 and 4 tokens, close to Flint's own routing of 6 of 256 (11.1 and 20.1), with a fifth of the
     // weights to initialize; the output head runs for Q8_0 only, the type of Flint's head.
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS,
-                            GGML_TYPE_Q6_K }) {
+                            GGML_TYPE_Q6_K, GGML_TYPE_Q4_K }) {
         for (int64_t n : { 1, 2, 3, 4 }) {
             for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                     { 4096, 2048 }, { 512, 2048 }, { 2048, 4096 }, { 1024, 2048 }, { 2048, 1024 } }) {

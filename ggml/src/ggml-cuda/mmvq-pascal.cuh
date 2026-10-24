@@ -2,8 +2,8 @@
 
 #include "common.cuh"
 
-// Quantized matrix-vector products of 1 to 4 tokens (Q4_0, Q4_1, Q5_0, Q8_0, Q5_K, IQ4_XS, Q6_K) tuned for compute
-// capability 6.1 (Pascal with dp4a). On small Pascal cards such as the 5-SM P106-090, mul_mat_vec_q runs out of
+// Quantized matrix-vector products of 1 to 4 tokens (Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, IQ4_XS, Q6_K) tuned for
+// compute capability 6.1 (Pascal with dp4a). On small Pascal cards such as the 5-SM P106-090, mul_mat_vec_q runs out of
 // instruction issue and load throughput long before memory bandwidth; these kernels give each row a lane group sized to
 // the row width, let several rows share one load of the activations, load several weight blocks per lane with coalesced
 // wide loads and keep the addressing out of the loop. They compute the activation block sums in FP32 from the int8
