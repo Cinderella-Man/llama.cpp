@@ -209,26 +209,26 @@ static __global__ void flash_attn_tile_pascal(
 
     // chunk g of the tile at key k0: g < NKC is K dimensions g*DC..g*DC+DC-1 of all T keys,
     // g >= NKC is V rows (g - NKC)*TV..+TV-1. Each thread loads and stores 8 dimensions of one key.
+    // split: chunk columns 0-7 are dimensions 8g..8g+7, columns 8-15 are D/2 + 8g..D/2 + 8g + 7
     piece_K pk;
     piece_V pv;
-    // split: chunk columns 0-7 are dimensions 8g..8g+7, columns 8-15 are D/2 + 8g..D/2 + 8g + 7
-    auto load_K = [&](const int k0, const int g) {
-        const int key  = tid / (S::DC/8);
-        const int p    = tid % (S::DC/8);
-        const int dim0 = split ? p*(D/2) + g*(S::DC/2) : g*S::DC + p*8;
-        piece_K::load(pk, K_h + int64_t(k0 + key)*nb11, dim0);
+    const char * K_thr  = K_h + int64_t(tid / (S::DC/8))*nb11;  // the thread's K row at key 0 of a tile
+    const char * V_thr  = V_h + int64_t(tid / (D/8))*nb21;      // and V row
+    const int    K_dim0 = split ? (tid % (S::DC/8))*(D/2) : (tid % (S::DC/8))*8;
+    const int    V_dim0 = (tid % (D/8))*8;
+    float * const K_st  = KV_s + (tid / (S::DC/8))*S::KS + (tid % (S::DC/8))*8;
+    float * const V_st  = KV_s + (tid / (D/8))*S::VS + V_dim0;
+    auto load_K = [&](const char * K_tile, const int g) { // K_tile: K_thr advanced to the tile
+        piece_K::load(pk, K_tile, K_dim0 + g*(split ? S::DC/2 : S::DC));
     };
     auto store_K = [&]() {
-        const int key = tid / (S::DC/8);
-        piece_K::store(pk, KV_s + key*S::KS + (tid % (S::DC/8))*8);
+        piece_K::store(pk, K_st);
     };
-    auto load_V = [&](const int k0, const int v) {
-        const int key  = v*S::TV + tid / (D/8);
-        const int dim0 = (tid % (D/8))*8;
-        piece_V::load(pv, V_h + int64_t(k0 + key)*nb21, dim0);
+    auto load_V = [&](const char * V_tile, const int v) { // V_tile: V_thr advanced to the tile
+        piece_V::load(pv, V_tile + v*(S::TV*nb21), V_dim0);
     };
     auto store_V = [&]() {
-        piece_V::store(pv, KV_s + (tid / (D/8))*S::VS + (tid % (D/8))*8);
+        piece_V::store(pv, V_st);
     };
 
     half mask_pf[KA];
@@ -257,7 +257,7 @@ static __global__ void flash_attn_tile_pascal(
 
     int k0 = blockIdx.y*T;
     if (k0 < k_VKQ_max) {
-        load_K(k0, 0);
+        load_K(K_thr + int64_t(k0)*nb11, 0);
         load_mask(k0);
     }
 
@@ -278,11 +278,13 @@ static __global__ void flash_attn_tile_pascal(
         if (!__syncthreads_or(any_key) || drop) {
             k0 += k_step;
             if (k0 < k_VKQ_max) {
-                load_K(k0, 0);
+                load_K(K_thr + int64_t(k0)*nb11, 0);
                 load_mask(k0);
             }
             continue;
         }
+        const char * K_tile = K_thr + int64_t(k0)*nb11;
+        const char * V_tile = V_thr + int64_t(k0)*nb21;
 
         // scores of KA keys (kg + NKG*i) x the lane's 4 columns, summed over the head dimension in order
         // (split: over each half in order, then the halves added)
@@ -308,9 +310,9 @@ static __global__ void flash_attn_tile_pascal(
             store_K();
             __syncthreads();
             if (g + 1 < S::NKC) {
-                load_K(k0, g + 1);
+                load_K(K_tile, g + 1);
             } else {
-                load_V(k0, 0);
+                load_V(V_tile, 0);
             }
 
             constexpr int DQ = split ? S::DC/2 : S::DC; // dimensions of the lane per chunk
@@ -409,9 +411,9 @@ static __global__ void flash_attn_tile_pascal(
             store_V();
             __syncthreads();
             if (v + 1 < S::NVC) {
-                load_V(k0, v + 1);
+                load_V(V_tile, v + 1);
             } else if (k0 + k_step < k_VKQ_max) {
-                load_K(k0 + k_step, 0);
+                load_K(K_tile + int64_t(k_step)*nb11, 0);
                 load_mask(k0 + k_step);
             }
 
