@@ -31,25 +31,30 @@ constexpr int PK_THREADS = 256; // threads per block
 constexpr int PK_NW      = PK_THREADS / WARP_SIZE;
 
 // Work items: router rows (2 per item) | shared gate/up (4 rows) | routed gate/up (4 rows of one expert slot, slots in
-// turn) | shared down (8 rows) | routed down (8 rows of one expert slot, by row group: g0 e0..e5, g1 e0..e5, ...).
-// Every dependency points to an item with a smaller number.
+// turn) | shared down (CR rows) | routed down (CR rows of one expert slot, by row group: g0 e0..e5, g1 e0..e5, ...).
+// Every dependency points to an item with a smaller number. An output group has CR = 8 rows, or 16 where a down
+// product's warp pass covers 16 rows (K-quants, one super-block per lane).
 constexpr int RT_ROWS = 2;
 constexpr int SG_ROWS = 4;
 constexpr int EG_ROWS = 4;
-constexpr int CR      = 8;            // rows per output group
+constexpr int CR_MIN  = 8;
 constexpr int N_RT    = NE / RT_ROWS;
 constexpr int N_SG    = FS / SG_ROWS;
 constexpr int N_EG1   = F / EG_ROWS;  // routed gate/up items per expert slot
 constexpr int N_EG    = KU * N_EG1;
-constexpr int N_GRP   = H / CR;
-constexpr int N_SD    = N_GRP;
-constexpr int N_ED    = KU * N_GRP;
 constexpr int I_RT    = 0;
 constexpr int I_SG    = I_RT + N_RT;
 constexpr int I_EG    = I_SG + N_SG;
 constexpr int I_SD    = I_EG + N_EG;
-constexpr int I_ED    = I_SD + N_SD;
-constexpr int N_ITEMS = I_ED + N_ED;
+
+template <int CR>
+struct moep_items {
+    static constexpr int N_GRP   = H / CR;
+    static constexpr int N_SD    = N_GRP;
+    static constexpr int N_ED    = KU * N_GRP;
+    static constexpr int I_ED    = I_SD + N_SD;
+    static constexpr int N_ITEMS = I_ED + N_ED;
+};
 
 // Counters and flags at the start of the context's buffer (32-bit words).
 constexpr int S_NEXT    = 0;             // next work item
@@ -62,7 +67,7 @@ constexpr int S_EACT    = S_EG_DONE + KU; // + e: activations of expert slot e q
 constexpr int S_EXIT    = S_EACT + KU;   // warps that have left
 constexpr int S_ERR     = S_EXIT + 1;    // a wait timed out (never reset by the kernel)
 constexpr int S_COMB    = 32;            // + g: contributions to output group g
-constexpr int N_SYNC    = S_COMB + N_GRP;
+constexpr int N_SYNC    = S_COMB + H / CR_MIN;
 
 // The scratch of one layer after the counters, in bytes from the start of the buffer (16-byte aligned).
 struct moep_scratch {
@@ -293,8 +298,9 @@ static __device__ __forceinline__ void moep_quantize_q8_1(const float xi, block_
 // The rows of one warp of mul_mat_vec_q_pascal, as the per-op kernel computes them, with staged weight loads. The lane
 // group grp (lpr lanes) owns rows row0 .. row0 + R - 1 of matrix x0 (and of x1 when M == 2: up in x0, gate in x1), with
 // row0 = ((warp_index << (5 - lpr_log2)) + grp) * R; y is this channel's Q8_1 activations, read as src says. On return
-// every lane of a group holds its rows' sums in acc; returns row0.
-template <ggml_type type, int R, int C, int M, int src, int LPR, int NIT, int RB>
+// every lane of a group holds its rows' sums in acc; returns row0. SEQ (M == 2): the up rows are staged and multiplied,
+// then the gate rows through the same buffer; each row's sum is the same.
+template <ggml_type type, int R, int C, int M, int src, int LPR, int NIT, int RB, bool SEQ = false>
 static __device__ __forceinline__ int moep_rows(
         const char * x0, const char * x1, const int nrows, const char * y, const int warp_index, const int lane,
         char * smw_warp, float (&acc)[M][R]) {
@@ -322,7 +328,8 @@ static __device__ __forceinline__ int moep_rows(
     constexpr int wstep     = WB << LPR;
     constexpr int ystep     = YB << LPR;
     constexpr int seg_units = (WB << LPR) >> 4;
-    char * smw = smw_warp + (grp * R * M * WB << LPR);
+    constexpr int MS = SEQ ? 1 : M;                // matrices staged at once
+    char * smw = smw_warp + (grp * R * MS * WB << LPR);
 
 #pragma unroll
     for (int m = 0; m < M; ++m) {
@@ -332,13 +339,14 @@ static __device__ __forceinline__ int moep_rows(
         }
     }
 
-    for (int it = 0; it < NIT; ++it) {
+    // stage the rows of matrices m0 .. m0 + MS - 1
+    const auto stage = [&](const int m0) {
 #pragma unroll
-        for (int m = 0; m < M; ++m) {
+        for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
             for (int i = 0; i < R; ++i) {
-                uint4       * dsm  = (uint4 *) (smw + ((m*R + i) * WB << LPR));
-                const uint4 * srcw = (const uint4 *) rw[m][i];
+                uint4       * dsm  = (uint4 *) (smw + ((ms*R + i) * WB << LPR));
+                const uint4 * srcw = (const uint4 *) rw[m0 + ms][i];
 #pragma unroll
                 for (int j = 0; j < NU; ++j) {
                     const int u = sl + (j << LPR);
@@ -349,15 +357,30 @@ static __device__ __forceinline__ int moep_rows(
             }
         }
         __syncwarp();
+    };
+
+    for (int it = 0; it < NIT; ++it) {
+        stage(0);
         mmvqp_act<NA> a;
         mmvqp_load_act<type, NA, src>(a, yp);
 #pragma unroll
         for (int m = 0; m < M; ++m) {
+            if (SEQ && m > 0) {
+                __syncwarp();
+                stage(m);
+            }
 #pragma unroll
             for (int i = 0; i < R; ++i) {
-                uint32_t w[WB / 4];
-                mmvqp_lds_words<WB, mmvqp_gcd(WB, 16)>(w, smw + ((m*R + i) * WB << LPR) + sl * WB);
-                acc[m][i] = mmvqp_dot<type, C>(w, a, acc[m][i]);
+                const char * ws = smw + (((SEQ ? 0 : m)*R + i) * WB << LPR) + sl * WB;
+                if constexpr (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS) {
+                    // a whole super-block per lane: its words are read from shared memory where they are used, instead
+                    // of 44 or 34 registers holding them at once (the arithmetic is the same)
+                    acc[m][i] = mmvqp_dot<type, C>((const uint32_t *) ws, a, acc[m][i]);
+                } else {
+                    uint32_t w[WB / 4];
+                    mmvqp_lds_words<WB, mmvqp_gcd(WB, 16)>(w, ws);
+                    acc[m][i] = mmvqp_dot<type, C>(w, a, acc[m][i]);
+                }
                 rw[m][i] += wstep;
             }
         }
@@ -411,15 +434,25 @@ constexpr __host__ __device__ int moep_lpr_log2(const int K, const int na, const
     return l;
 }
 
-// The per-op kernel's shape for a product of K-wide rows; R_DOWN: its R, limited to one output group per warp pass.
+constexpr __host__ __device__ int moep_max(const int a, const int b) {
+    return a > b ? a : b;
+}
+
+constexpr __host__ __device__ int moep_min(const int a, const int b) {
+    return a < b ? a : b;
+}
+
+// The per-op kernel's shape for a product of K-wide rows; RPP1: rows per warp pass with one row per lane group.
 template <ggml_type type, bool gate, int K>
 struct moep_shape {
-    static constexpr mmvqp_shape S      = mmvqp_choose(type, gate);
-    static constexpr int         LPR    = moep_lpr_log2(K, mmvqp_traits<type>::na, S.C);
-    static constexpr int         R_DOWN = (32 >> LPR) * S.R <= CR ? S.R : CR / (32 >> LPR);
+    static constexpr mmvqp_shape S    = mmvqp_choose(type, gate);
+    static constexpr int         LPR  = moep_lpr_log2(K, mmvqp_traits<type>::na, S.C);
+    static constexpr int         RPP1 = 32 >> LPR;
 };
 
-template <ggml_type type, bool gate, int K, int R_WANT>
+// One product inside the persistent kernel: R rows per lane group, SEQ: a fused gate/up stages the up rows and then
+// the gate rows through one buffer (where both at once would leave too little shared memory for two blocks per SM).
+template <ggml_type type, bool gate, int K, int R_WANT, bool SEQ = false>
 struct moep_prod {
     static constexpr int C   = moep_shape<type, gate, K>::S.C;
     static constexpr int NA  = mmvqp_traits<type>::na;
@@ -429,12 +462,26 @@ struct moep_prod {
     static constexpr int R   = R_WANT;
     static constexpr int M   = gate ? 2 : 1;
     static constexpr int ROWS_PER_PASS = (32 >> LPR) * R;
-    static constexpr int STAGE = 32 * R * M * C * mmvqp_traits<type>::bs; // staging bytes per warp
+    static constexpr int STAGE = 32 * R * (SEQ ? 1 : M) * C * mmvqp_traits<type>::bs; // staging bytes per warp
 };
 
-constexpr __host__ __device__ int moep_max(const int a, const int b) {
-    return a > b ? a : b;
-}
+// The kernel's configuration for a (gate/up, down, shared) type combination: rows per output group (CR), the down
+// products' R (the per-op kernel's, limited to one output group per pass), the routed gate/up rows per lane group
+// (RG: 2 where the staging still fits two blocks per SM, which shares each activation load between two rows) and
+// sequential gate/up staging where needed. C, and with it every row's summation order, is always the per-op kernel's.
+template <ggml_type TGU, ggml_type TDN, ggml_type TSH>
+struct moep_cfg {
+    static constexpr int CR    = moep_max(CR_MIN, moep_max(moep_shape<TDN, false, F>::RPP1, moep_shape<TSH, false, FS>::RPP1));
+    static constexpr int R_SD  = moep_min(moep_shape<TSH, false, FS>::S.R, CR / moep_shape<TSH, false, FS>::RPP1);
+    static constexpr int R_ED  = moep_min(moep_shape<TDN, false, F>::S.R,  CR / moep_shape<TDN, false, F>::RPP1);
+    static constexpr int SMEM  = 48 * 1024 - H / QK8_1 * (int) sizeof(block_q8_1) - 32 * (int) sizeof(float); // staging
+    static constexpr int DOWN  = moep_max(moep_prod<TSH, false, FS, R_SD>::STAGE, moep_prod<TDN, false, F, R_ED>::STAGE);
+    static constexpr bool SEQ_SG = PK_NW * moep_max(DOWN, moep_prod<TSH, true, H, 1>::STAGE) > SMEM;
+    static constexpr int OTHER = moep_max(DOWN, moep_prod<TSH, true, H, 1, SEQ_SG>::STAGE);
+    static constexpr bool RG2  = moep_shape<TGU, true, H>::LPR == 5 && PK_NW * moep_max(OTHER, moep_prod<TGU, true, H, 2>::STAGE) <= SMEM;
+    static constexpr int RG    = RG2 ? 2 : 1;
+    static constexpr bool SEQ_GU = !RG2 && PK_NW * moep_max(OTHER, moep_prod<TGU, true, H, 1>::STAGE) > SMEM;
+};
 
 static __device__ __forceinline__ unsigned moep_load_volatile(const unsigned * p) {
     return *(const volatile unsigned *) p;
@@ -499,15 +546,19 @@ static __device__ __forceinline__ bool moep_wait(const unsigned * flag, unsigned
 
 // The persistent kernel for one layer. TGU, TDN, TSH: routed gate/up, routed down and shared expert types; RG: routed
 // gate/up rows per warp pass (2 where the staging buffers still allow two blocks per SM).
-template <ggml_type TGU, ggml_type TDN, ggml_type TSH, int RG>
-__launch_bounds__(PK_THREADS, 2)
+template <ggml_type TGU, ggml_type TDN, ggml_type TSH, int MINB>
+__launch_bounds__(PK_THREADS, MINB)
 static __global__ void k_moe_layer(const moep_args a) {
-    using GU = moep_prod<TGU, true,  H,  RG>;
-    using SG = moep_prod<TSH, true,  H,  1>;
-    using SD = moep_prod<TSH, false, FS, moep_shape<TSH, false, FS>::R_DOWN>;
-    using ED = moep_prod<TDN, false, F,  moep_shape<TDN, false, F>::R_DOWN>;
-    static_assert(GU::LPR == 5 && SG::LPR == 5, "gate/up passes are one lane group per warp");
-    static_assert(EG_ROWS % RG == 0 && CR % SD::ROWS_PER_PASS == 0 && CR % ED::ROWS_PER_PASS == 0,
+    using CFG = moep_cfg<TGU, TDN, TSH>;
+    constexpr int CR = CFG::CR;
+    constexpr int RG = CFG::RG;
+    using IT = moep_items<CR>;
+    using GU = moep_prod<TGU, true,  H,  RG, CFG::SEQ_GU>;
+    using SG = moep_prod<TSH, true,  H,  1,  CFG::SEQ_SG>;
+    using SD = moep_prod<TSH, false, FS, CFG::R_SD>;
+    using ED = moep_prod<TDN, false, F,  CFG::R_ED>;
+    static_assert(EG_ROWS % GU::ROWS_PER_PASS == 0 && SG_ROWS % SG::ROWS_PER_PASS == 0 &&
+                  CR % SD::ROWS_PER_PASS == 0 && CR % ED::ROWS_PER_PASS == 0 && CR <= WARP_SIZE,
                   "items must cover whole passes and output groups");
     constexpr int STAGE = moep_max(moep_max(GU::STAGE, SG::STAGE), moep_max(SD::STAGE, ED::STAGE));
 
@@ -617,7 +668,7 @@ static __global__ void k_moe_layer(const moep_args a) {
     };
 
     unsigned item = moep_fetch(sync, lane);
-    while (item < (unsigned) N_ITEMS) {
+    while (item < (unsigned) IT::N_ITEMS) {
         const unsigned next = moep_fetch(sync, lane);
         if (item < (unsigned) I_SG) {
             // router rows
@@ -657,10 +708,11 @@ static __global__ void k_moe_layer(const moep_args a) {
             }
         } else if (item < (unsigned) I_EG) {
             // shared expert gate/up + SwiGLU
-            for (int p = 0; p < SG_ROWS; ++p) {
+            constexpr int NP = SG_ROWS / SG::ROWS_PER_PASS;
+            for (int p = 0; p < NP; ++p) {
                 float acc[2][1];
-                const int row0 = moep_rows<TSH, 1, SG::C, 2, MMVQP_SRC_SMEM, SG::LPR, SG::NIT, SG::RB>(
-                    a.up_sh, a.gate_sh, FS, (const char *) s_yq, (item - I_SG) * SG_ROWS + p, lane, smw, acc);
+                const int row0 = moep_rows<TSH, 1, SG::C, 2, MMVQP_SRC_SMEM, SG::LPR, SG::NIT, SG::RB, CFG::SEQ_SG>(
+                    a.up_sh, a.gate_sh, FS, (const char *) s_yq, (item - I_SG) * NP + p, lane, smw, acc);
                 moep_store<1, 2, SG::LPR>(acc, row0, lane, FS, sact);
             }
             if (moep_arrive(&sync[S_SG_DONE], N_SG, lane)) {
@@ -683,11 +735,11 @@ static __global__ void k_moe_layer(const moep_args a) {
             const int j = item - I_EG;
             const int e = j / N_EG1;
             const int64_t xoff = (int64_t) __shfl_sync(0xffffffff, eid_l, e) * F * GU::RB;
-            for (int p = 0; p < EG_ROWS / RG; ++p) {
+            constexpr int NP = EG_ROWS / GU::ROWS_PER_PASS;
+            for (int p = 0; p < NP; ++p) {
                 float acc[2][RG];
-                const int row0 = moep_rows<TGU, RG, GU::C, 2, MMVQP_SRC_SMEM, GU::LPR, GU::NIT, GU::RB>(
-                    a.up_exps + xoff, a.gate_exps + xoff, F, (const char *) s_yq, (j % N_EG1) * (EG_ROWS / RG) + p, lane,
-                    smw, acc);
+                const int row0 = moep_rows<TGU, RG, GU::C, 2, MMVQP_SRC_SMEM, GU::LPR, GU::NIT, GU::RB, CFG::SEQ_GU>(
+                    a.up_exps + xoff, a.gate_exps + xoff, F, (const char *) s_yq, (j % N_EG1) * NP + p, lane, smw, acc);
                 moep_store<RG, 2, GU::LPR>(acc, row0, lane, F, act + e * F);
             }
             if (moep_arrive(&sync[S_EG_DONE + e], N_EG1, lane)) {
@@ -702,7 +754,7 @@ static __global__ void k_moe_layer(const moep_args a) {
                 }
                 moep_publish(&sync[S_EACT + e], lane);
             }
-        } else if (item < (unsigned) I_ED) {
+        } else if (item < (unsigned) IT::I_ED) {
             // shared expert down projection, 8 rows
             if (!have_sact) {
                 if (!moep_wait(&sync[S_SACT], sync, a.err, a.spin_limit, lane)) {
@@ -725,7 +777,7 @@ static __global__ void k_moe_layer(const moep_args a) {
             }
         } else {
             // routed expert down projection, 8 rows of one expert slot
-            const int j = item - I_ED;
+            const int j = item - IT::I_ED;
             const int g = j / KU;
             const int e = j % KU;
             if (!need_topk()) {
@@ -772,16 +824,6 @@ static __global__ void k_moe_layer(const moep_args a) {
 
 // ---- the kernels: one per (gate/up, down, shared) type combination ---------------------------------------------------
 
-// routed gate/up rows per warp pass: 2 where every warp's staging buffer (and so 2 blocks per SM) still fits in 48 KB
-template <ggml_type TGU, ggml_type TDN, ggml_type TSH>
-constexpr int moep_rg() {
-    constexpr int fixed = H / QK8_1 * (int) sizeof(block_q8_1) + 32 * (int) sizeof(float);
-    constexpr int other = moep_max(moep_max(moep_prod<TSH, true, H, 1>::STAGE,
-                                            moep_prod<TSH, false, FS, moep_shape<TSH, false, FS>::R_DOWN>::STAGE),
-                                   moep_prod<TDN, false, F, moep_shape<TDN, false, F>::R_DOWN>::STAGE);
-    return fixed + PK_NW * moep_max(other, moep_prod<TGU, true, H, 2>::STAGE) <= 48 * 1024 ? 2 : 1;
-}
-
 typedef void (*moep_kernel_t)(const moep_args);
 
 struct moep_combo {
@@ -791,14 +833,24 @@ struct moep_combo {
     moep_kernel_t kernel;
 };
 
-#define MOEP_COMBO(GU_, DN_, SH_) { GU_, DN_, SH_, k_moe_layer<GU_, DN_, SH_, moep_rg<GU_, DN_, SH_>()> }
+// MINB: blocks per SM the kernel is built for (2: 128 registers per thread)
+#define MOEP_COMBO(GU_, DN_, SH_, MINB_) { GU_, DN_, SH_, k_moe_layer<GU_, DN_, SH_, MINB_> }
 
-// The combinations Flint files use: K2h-r16, G3 and S4-L0 (all of their MoE layers).
+// The combinations Flint files use: K2h-r16, G3 and S4-L0 (all of their MoE layers), and UD-Q4_K_XL (42 of its 47:
+// the others have Q4_K or IQ3_S gate/up or a Q6_K down, which the Pascal products don't cover).
 static const moep_combo moep_combos[] = {
-    MOEP_COMBO(GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0),
-    MOEP_COMBO(GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0),
-    MOEP_COMBO(GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0),
-    MOEP_COMBO(GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0),
+    MOEP_COMBO(GGML_TYPE_Q5_0,   GGML_TYPE_Q5_0,   GGML_TYPE_Q8_0,   2),
+    MOEP_COMBO(GGML_TYPE_Q5_0,   GGML_TYPE_Q5_0,   GGML_TYPE_Q5_0,   2),
+    MOEP_COMBO(GGML_TYPE_Q8_0,   GGML_TYPE_Q5_0,   GGML_TYPE_Q8_0,   2),
+    MOEP_COMBO(GGML_TYPE_Q5_0,   GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   2),
+    MOEP_COMBO(GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   GGML_TYPE_Q8_0,   2),
+    MOEP_COMBO(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0,   2),
+    MOEP_COMBO(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K,   2),
+    MOEP_COMBO(GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   2),
+    MOEP_COMBO(GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K,   GGML_TYPE_Q8_0,   2),
+    MOEP_COMBO(GGML_TYPE_Q5_K,   GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   2),
+    MOEP_COMBO(GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   2),
+    MOEP_COMBO(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, 2),
 };
 constexpr int N_COMBOS = sizeof(moep_combos) / sizeof(moep_combos[0]);
 

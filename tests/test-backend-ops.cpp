@@ -11788,7 +11788,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_rms_norm_mul_q8(GGML_TYPE_Q8_0, 2048, with_add, 2));
     }
 
-    // a whole Flint-shaped MoE layer at one token (the persistent MoE kernel's type combinations: K2h-r16, G3, S4-L0)
+    // a whole Flint-shaped MoE layer at one token (the persistent MoE kernel's type combinations: K2h-r16, G3, S4-L0,
+    // UD-Q4_K_XL)
     for (ggml_type type_router : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         test_cases.emplace_back(new test_moe_layer(type_router, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_moe_layer(type_router, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0));
@@ -11796,6 +11797,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_layer(type_router, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
     test_cases.emplace_back(new test_moe_layer(GGML_TYPE_BF16, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0));
+    // UD-Q4_K_XL's combinations (BF16 router)
+    for (auto [gu, dn, sh] : std::vector<std::array<ggml_type, 3>>{
+            { GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   GGML_TYPE_Q8_0 },   { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0 },
+            { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K },   { GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K },
+            { GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K,   GGML_TYPE_Q8_0 },   { GGML_TYPE_Q5_K,   GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0 },
+            { GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K },   { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS } }) {
+        test_cases.emplace_back(new test_moe_layer(GGML_TYPE_BF16, gu, dn, sh));
+    }
 
     // products of 1 to 4 tokens (one token, and a speculative-decoding verify step) at the shapes of a large MoE model
     // (Flint: hidden 2048, 32 x 128 query heads, 4 x 128 KV heads, 256 experts of width 512 with 6 used, a 1024-wide
