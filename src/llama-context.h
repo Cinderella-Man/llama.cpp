@@ -266,9 +266,9 @@ public:
     // pipelined single-token decoding (experimental, see llama_pipe_* in llama.h)
     //
 
-    int32_t pipe_init(int32_t n_slots);
+    int32_t pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t n_chunk_tokens);
     int32_t pipe_n_slots() const { return (int32_t) pipe_slots.size(); }
-    int32_t pipe_submit(int32_t i_slot, llama_token token, llama_pos pos, llama_seq_id seq_id);
+    int32_t pipe_submit(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id);
     float * pipe_get_logits(int32_t i_slot);
     llama_token pipe_get_sampled(int32_t i_slot);
     void    pipe_drain();
@@ -283,6 +283,7 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_graph) const;
 
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
@@ -442,6 +443,8 @@ private:
         float *                 logits  = nullptr;
 
         bool                    busy    = false;   // submitted and not yet waited for
+
+        int32_t                 n_tokens_max = 1;  // tokens per evaluation the compute buffers are reserved for
     };
 
     std::vector<pipe_slot> pipe_slots;

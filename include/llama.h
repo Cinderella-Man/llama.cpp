@@ -1024,10 +1024,16 @@ extern "C" {
     // To drop submitted tokens (a wrong guess), remove their positions with llama_memory_seq_rm(mem, seq_id, p, -1)
     // and submit the right token at p: their work still finishes on the devices, ahead of the new token, and their
     // slots are reused only after it has. llama_decode waits for all submitted work first.
-    // With a backend sampler (llama_set_sampler, one sequence) only the sampled token comes back: use
-    // llama_pipe_get_sampled. The sampler's graph inputs are set at submit time, before earlier tokens are sampled,
-    // so only samplers without random draws (greedy) give the same tokens as plain decoding.
+    // For a sequence with a backend sampler (llama_set_sampler) only the sampled token comes back: use
+    // llama_pipe_get_sampled; each slot's graph samples for the sequence of its token only. The sampler's graph inputs
+    // are set at submit time, before earlier tokens are sampled: for temperature sampling call llama_sampler_set_pos
+    // before each submit, so the draw depends on the position only.
     LLAMA_API int32_t llama_pipe_init(struct llama_context * ctx, int32_t n_slots);
+
+    // Also n_chunk_slots slots for up to n_chunk_tokens tokens of one sequence per evaluation (prompt chunks submitted with
+    // llama_pipe_submit_tokens, so that a new prompt joins the pipeline instead of draining it through llama_decode);
+    // they come after the n_slots one-token slots. n_chunk_tokens <= n_ubatch.
+    LLAMA_API int32_t llama_pipe_init_ext(struct llama_context * ctx, int32_t n_slots, int32_t n_chunk_slots, int32_t n_chunk_tokens);
 
     // Number of slots set by llama_pipe_init (0 before)
     LLAMA_API int32_t llama_pipe_n_slots(const struct llama_context * ctx);
@@ -1037,6 +1043,16 @@ extern "C" {
             struct llama_context * ctx,
                          int32_t   slot,
                      llama_token   token,
+                       llama_pos   pos,
+                    llama_seq_id   seq_id);
+
+    // n_tokens consecutive tokens of one sequence at pos, pos + 1, ... (a chunk slot for more than one); only the last
+    // one's output is kept
+    LLAMA_API int32_t llama_pipe_submit_tokens(
+            struct llama_context * ctx,
+                         int32_t   slot,
+               const llama_token * tokens,
+                         int32_t   n_tokens,
                        llama_pos   pos,
                     llama_seq_id   seq_id);
 
@@ -1484,6 +1500,13 @@ extern "C" {
     LLAMA_API void                   llama_sampler_accept(      struct llama_sampler * smpl, llama_token token);
     LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p);
     LLAMA_API void                   llama_sampler_reset (      struct llama_sampler * smpl);
+
+    // Backend sampling: the random draw of the next sampled token comes from a generator seeded by (seed, pos), so it
+    // depends only on the position, not on how many tokens were sampled before. Call it before the token's graph inputs
+    // are set (llama_decode or llama_pipe_submit), with pos = the position of the token whose output is sampled.
+    // Pipelined decoding needs it for temperature sampling on the device: guesses are submitted, and their draws taken,
+    // before the earlier tokens are sampled, and dropped guesses must not shift later draws. No effect on host sampling.
+    LLAMA_API void                   llama_sampler_set_pos(struct llama_sampler * smpl, llama_pos pos);
     LLAMA_API struct llama_sampler * llama_sampler_clone (const struct llama_sampler * smpl);
     LLAMA_API void                   llama_sampler_copy  (const struct llama_sampler * src, struct llama_sampler * dst);
     // important: do not free if the sampler has been added to a llama_sampler_chain (via llama_sampler_chain_add)
