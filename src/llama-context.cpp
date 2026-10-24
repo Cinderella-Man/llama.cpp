@@ -1646,6 +1646,13 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
 
     sched_reserve();
 
+    // 2: each split's host inputs in one asynchronous copy from pinned staging memory; 1: one asynchronous copy per
+    // input; 0: one synchronous copy per input, as llama_decode does
+    pipe_upload = 2;
+    if (const char * env = getenv("LLAMA_PIPE_UPLOAD")) {
+        pipe_upload = std::clamp(atoi(env), 0, 2);
+    }
+
     for (auto & slot : pipe_slots) {
         if (slot.ev_out) {
             ggml_backend_event_free(slot.ev_out);
@@ -1696,6 +1703,7 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
         ggml_backend_sched_set_copy_callback(slot.sched.get(), sched_copy_experts, this);
         ggml_backend_sched_set_caller_sync(slot.sched.get(), true);
+        ggml_backend_sched_set_input_upload(slot.sched.get(), pipe_upload);
 
         slot.res.reset(new llm_graph_result(max_nodes));
 
@@ -1737,14 +1745,34 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
 
     this->n_outputs = save_n_outputs;
 
-    LLAMA_LOG_INFO("%s: %d slots + %d chunk slots of %d tokens, compute buffers %.2f MiB in total, %d splits per token\n",
-            __func__, n_slots, n_chunk_slots, n_chunk_tokens, size_total/1024.0/1024.0,
-            ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()));
+    LLAMA_LOG_INFO("%s: %d slots + %d chunk slots of %d tokens, compute buffers %.2f MiB in total, %d splits per token, "
+            "input upload %d\n", __func__, n_slots, n_chunk_slots, n_chunk_tokens, size_total/1024.0/1024.0,
+            ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()), pipe_upload);
 
     return 0;
 }
 
 int32_t llama_context::pipe_submit(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id) {
+    return pipe_submit_impl(i_slot, tokens, n_tokens, pos, seq_id, -1);
+}
+
+int32_t llama_context::pipe_submit_fed(int32_t i_slot, int32_t i_slot_src, llama_pos pos, llama_seq_id seq_id) {
+    if (i_slot_src < 0 || i_slot_src >= (int32_t) pipe_slots.size() || i_slot_src == i_slot) {
+        LLAMA_LOG_ERROR("%s: invalid source slot %d\n", __func__, i_slot_src);
+        return -1;
+    }
+    const auto & src = pipe_slots[i_slot_src];
+    if (!src.res_valid || src.res->t_sampled.empty() || src.res->t_sampled[0] == nullptr) {
+        LLAMA_LOG_ERROR("%s: slot %d holds no evaluation with a sampler on the device\n", __func__, i_slot_src);
+        return -1;
+    }
+    // any valid id: the host's copy of the token input is not uploaded
+    const llama_token placeholder = 0;
+    return pipe_submit_impl(i_slot, &placeholder, 1, pos, seq_id, i_slot_src);
+}
+
+int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos,
+                                        llama_seq_id seq_id, int32_t i_slot_src) {
     if (i_slot < 0 || i_slot >= (int32_t) pipe_slots.size()) {
         LLAMA_LOG_ERROR("%s: invalid slot %d\n", __func__, i_slot);
         return -1;
@@ -1830,6 +1858,32 @@ int32_t llama_context::pipe_submit(int32_t i_slot, const llama_token * tokens, i
         }
 
         slot.res_valid = true;
+
+        // the token input's copy on the one device that reads the token ids; none if the CPU reads them (a node of
+        // the split graph that still has the input itself as a source runs on the CPU) or several devices do
+        slot.tok_cpy     = nullptr;
+        slot.tok_backend = nullptr;
+        ggml_tensor * t_tok = slot.res->get_inp_tokens();
+        bool cpu_reads = t_tok == nullptr;
+        for (int i = 0; t_tok && i < ggml_graph_n_nodes(gf) && !cpu_reads; i++) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                cpu_reads = cpu_reads || node->src[j] == t_tok;
+            }
+        }
+        int n_dev_copies = 0;
+        for (auto * backend : backend_ptrs) {
+            ggml_tensor * cpy = t_tok ? ggml_backend_sched_get_input_copy(slot.sched.get(), t_tok, backend) : nullptr;
+            if (cpy != nullptr && backend != backend_cpu) {
+                slot.tok_cpy     = cpy;
+                slot.tok_backend = backend;
+                n_dev_copies++;
+            }
+        }
+        if (cpu_reads || n_dev_copies != 1) {
+            slot.tok_cpy     = nullptr;
+            slot.tok_backend = nullptr;
+        }
     }
 
     this->n_outputs = save_n_outputs;
@@ -1848,6 +1902,27 @@ int32_t llama_context::pipe_submit(int32_t i_slot, const llama_token * tokens, i
         set_n_threads_fn.second(set_n_threads_fn.first, cparams.n_threads);
     }
     copy_experts.reset();
+
+    // a fed token: the sampled id of slot i_slot_src goes from its device to the token input's copy on the device
+    // that embeds the tokens, ordered after that evaluation's sampling and before this evaluation on both devices
+    if (slot.res->get_inp_tokens() != nullptr) {
+        ggml_backend_sched_set_input_skip(slot.sched.get(), slot.res->get_inp_tokens(), i_slot_src >= 0);
+    }
+    if (i_slot_src >= 0) {
+        auto & src = pipe_slots[i_slot_src];
+        ggml_tensor *  t_src  = src.res->t_sampled[0];
+        ggml_backend_t be_src = ggml_backend_sched_get_tensor_backend(src.sched.get(), t_src);
+        ggml_tensor *  t_dst  = slot.tok_cpy;
+        if (t_dst == nullptr || be_src == nullptr || t_src->type != t_dst->type || ggml_nelements(t_src) != 1 ||
+                ggml_nelements(t_dst) != 1 || ggml_nbytes(t_src) != ggml_nbytes(t_dst)) {
+            LLAMA_LOG_ERROR("%s: a fed token needs the token ids read on one device only (LLAMA_INPUT_ON_GPU=1) and a "
+                    "one-token sampler output\n", __func__);
+            ggml_backend_sched_set_input_skip(slot.sched.get(), slot.res->get_inp_tokens(), false);
+            memory->seq_rm(seq_id, pos, -1);
+            return -1;
+        }
+        ggml_backend_tensor_copy_async(be_src, slot.tok_backend, t_src, t_dst);
+    }
 
     const auto status = ggml_backend_sched_graph_compute_async(slot.sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -5012,6 +5087,10 @@ int32_t llama_pipe_submit(llama_context * ctx, int32_t slot, llama_token token, 
 
 int32_t llama_pipe_submit_tokens(llama_context * ctx, int32_t slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id) {
     return ctx->pipe_submit(slot, tokens, n_tokens, pos, seq_id);
+}
+
+int32_t llama_pipe_submit_fed(llama_context * ctx, int32_t slot, int32_t slot_src, llama_pos pos, llama_seq_id seq_id) {
+    return ctx->pipe_submit_fed(slot, slot_src, pos, seq_id);
 }
 
 float * llama_pipe_get_logits(llama_context * ctx, int32_t slot) {

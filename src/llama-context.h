@@ -269,6 +269,7 @@ public:
     int32_t pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t n_chunk_tokens);
     int32_t pipe_n_slots() const { return (int32_t) pipe_slots.size(); }
     int32_t pipe_submit(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id);
+    int32_t pipe_submit_fed(int32_t i_slot, int32_t i_slot_src, llama_pos pos, llama_seq_id seq_id);
     float * pipe_get_logits(int32_t i_slot);
     llama_token pipe_get_sampled(int32_t i_slot);
     void    pipe_drain();
@@ -445,9 +446,21 @@ private:
         bool                    busy    = false;   // submitted and not yet waited for
 
         int32_t                 n_tokens_max = 1;  // tokens per evaluation the compute buffers are reserved for
+
+        // the copy of the token input on the device that embeds the tokens, if no other device and not the CPU reads
+        // the token ids (set when the graph is allocated); a fed submission writes the token there
+        ggml_tensor *           tok_cpy     = nullptr;
+        ggml_backend_t          tok_backend = nullptr;
     };
 
     std::vector<pipe_slot> pipe_slots;
+
+    // how the slots upload their host inputs (ggml_backend_sched_set_input_upload, LLAMA_PIPE_UPLOAD)
+    int pipe_upload = 2;
+
+    // i_slot_src >= 0: the token is the sampled output of that slot, copied between the devices (pipe_submit_fed)
+    int32_t pipe_submit_impl(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos,
+                             llama_seq_id seq_id, int32_t i_slot_src);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
