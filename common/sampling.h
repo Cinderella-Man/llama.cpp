@@ -103,6 +103,23 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 // the .sorted flag of the result indicates whether the returned candidates are sorted
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort);
 
+// how a sampler's tokens were sampled (one request in llama-server)
+struct common_sampler_stats {
+    int32_t n_sampled         = 0; // tokens sampled
+    int32_t n_device          = 0; // ... drawn by a backend sampler (llama_set_sampler)
+    int32_t n_constrained     = 0; // ... while the grammar could reject them (after a lazy grammar's trigger, outside
+                                   //     the reasoning)
+    int32_t n_rejected        = 0; // ... whose first draw the grammar rejected: resampled from the masked full row
+    int32_t n_rejected_device = 0; // ... of these, first drawn by a backend sampler (the row fetched from the device)
+    int32_t n_forced          = 0; // ... forced by the reasoning budget
+};
+
+const common_sampler_stats & common_sampler_get_stats(const struct common_sampler * gsmpl);
+
+// whether the grammar can reject the next token: there is one, it applies (outside the reasoning) and, if it is lazy,
+// it has seen its trigger
+bool common_sampler_grammar_active(const struct common_sampler * gsmpl);
+
 // get the last accepted token
 llama_token common_sampler_last(const struct common_sampler * gsmpl);
 
