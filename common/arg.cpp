@@ -1709,8 +1709,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--pipe-depth"}, "N",
         string_format("pipelined speculation: up to N guessed tokens enter the first GPUs while the later ones still work "
             "on the current token, each checked by sampling the real token (output unchanged); for a slot that "
-            "generates alone, with backend sampling (-bs) and no grammar, penalties or token probabilities "
-            "(default: %d, off)", params.pipe_depth),
+            "generates alone, with backend sampling (-bs), no penalties or token probabilities, and a grammar only "
+            "until it can reject a token (a tool call's start) (default: %d, off)", params.pipe_depth),
         [](common_params & params, int value) {
             params.pipe_depth = value;
         }

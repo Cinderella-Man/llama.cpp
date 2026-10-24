@@ -3589,7 +3589,16 @@ private:
             return false;
         }
         const auto & sp = slot.task->params.sampling;
-        if (!sp.grammar.empty() || sp.n_probs > 0) {
+        if (sp.n_probs > 0) {
+            return false;
+        }
+        // a grammar may not reject a token in flight: pipelined only while it cannot (a lazy grammar before its
+        // trigger, or inside the reasoning), with the device's token checked on the host afterwards (Q67)
+        if (!sp.grammar.empty() && common_sampler_grammar_active(slot.smpl.get())) {
+            return false;
+        }
+        // a reasoning budget may force a token, which only common_sampler_sample applies
+        if (sp.reasoning_budget_tokens >= 0 || sp.reasoning_control) {
             return false;
         }
         // penalties read the tokens before the one sampled, which a guess's evaluation does not have yet
@@ -3791,6 +3800,15 @@ private:
         }
 
         slot.print_timings_tg();
+
+        // the token switched the grammar on (a tool call starts): batched decoding takes over from it, with every
+        // token checked against the grammar; the token itself is decoded there (slot.sampled)
+        if (!slot.task->params.sampling.grammar.empty() && common_sampler_grammar_active(slot.smpl.get())) {
+            llama_memory_seq_rm(mem, slot.id, cur.pos + 1, -1);
+            llama_pipe_drain(ctx_tgt);
+            slot.pipe_win.clear();
+            return;
+        }
 
         if (hit) {
             // the guess in flight is this token
