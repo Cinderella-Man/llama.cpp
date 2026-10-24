@@ -1476,6 +1476,22 @@ void llama_sampler_backend_set_inputs(llama_sampler * sampler, const std::vector
     llama_sampler_backend_inputs_walk(sampler, nullptr, &inputs, i);
 }
 
+bool llama_sampler_chain_on_backend(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+    if (!chain->is_init || chain->samplers.empty()) {
+        return false;
+    }
+    for (const auto & entry : chain->samplers) {
+        if (!entry.is_backend) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void llama_sampler_set_pos(struct llama_sampler * smpl, llama_pos pos) {
     GGML_ASSERT(smpl != nullptr);
 

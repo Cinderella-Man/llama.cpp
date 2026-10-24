@@ -18,6 +18,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "pipe-guess.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -300,6 +302,20 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // pipelined speculation (--pipe-depth): the slot's tokens in flight in the context's pipe slots (llama_pipe_*),
+    // [0] its newest sampled token, then guesses of the tokens after it
+    struct pipe_entry {
+        int32_t     pslot;
+        llama_token tok;
+        llama_pos   pos;
+    };
+    std::deque<pipe_entry> pipe_win;
+    common_pipe_guesser    pipe_guesser;
+    bool    pipe_draws   = false; // every sampled token's random draw is keyed by its position (llama_sampler_set_pos)
+    int32_t pipe_n_guess = 0;     // this request's guesses, right guesses and wrong guesses
+    int32_t pipe_n_hit   = 0;
+    int32_t pipe_n_miss  = 0;
+
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -441,6 +457,10 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+
+        pipe_n_guess = 0;
+        pipe_n_hit   = 0;
+        pipe_n_miss  = 0;
 
         n_predict_max = -1;
 
@@ -609,6 +629,9 @@ struct server_slot {
                     inp_embd.clear(); // rows are consumed, the next step produces new ones
                 }
             } else {
+                if (pipe_draws) {
+                    llama_sampler_set_pos(common_sampler_get(smpl.get()), prompt.tokens.pos_next());
+                }
                 add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
             }
 
@@ -642,6 +665,14 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            // pipelined tokens still in flight: the newest sampled one stays (its KV cells are being written), the
+            // guesses behind it go
+            if (!pipe_win.empty()) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, pipe_win.front().pos + 1, -1);
+                llama_pipe_drain(ctx_tgt);
+                pipe_win.clear();
+            }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -758,6 +789,12 @@ struct server_slot {
         SLT_INF(*this,
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
+
+        if (pipe_n_guess > 0 || pipe_draws) {
+            SLT_INF(*this,
+                    "       pipelined = %10d guesses, %d right, %d wrong\n",
+                    pipe_n_guess, pipe_n_hit, pipe_n_miss);
+        }
 
         SLT_INF(*this,
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
@@ -1059,6 +1096,8 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    int32_t pipe_next = 0; // the next pipe slot to try (--pipe-depth)
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1537,6 +1576,28 @@ private:
             };
 
             slot.reset();
+        }
+
+        // pipelined speculation: pipe slots for the newest token and up to pipe_depth guesses, with room to refill
+        if (params_base.pipe_depth > 0) {
+            const int32_t n_pipe = 2*(params_base.pipe_depth + 1);
+            if (!params_base.sampling.backend_sampling) {
+                SRV_WRN("%s", "--pipe-depth needs backend sampling (-bs): pipelined speculation off\n");
+                params_base.pipe_depth = 0;
+            } else if (llama_pipe_init(ctx_tgt, n_pipe) != 0) {
+                SRV_WRN("%s", "failed to set up the pipe slots: pipelined speculation off\n");
+                params_base.pipe_depth = 0;
+            } else {
+                SRV_INF("pipelined speculation: up to %d guesses (%s, copy >= %d), %d pipe slots\n",
+                        params_base.pipe_depth, params_base.pipe_guess.c_str(), params_base.pipe_copy_min, n_pipe);
+                for (auto & slot : slots) {
+                    slot.pipe_draws = true;
+                    slot.pipe_guesser.kind = params_base.pipe_guess == "none" ? common_pipe_guesser::NONE :
+                                             params_base.pipe_guess == "copy" ? common_pipe_guesser::COPY :
+                                                                                common_pipe_guesser::CONT;
+                    slot.pipe_guesser.min_match = params_base.pipe_copy_min;
+                }
+            }
         }
 
         {
@@ -3438,6 +3499,195 @@ private:
         return false;
     }
 
+    //
+    // pipelined speculation (--pipe-depth, llama_pipe_*)
+    //
+    // A slot that generates alone keeps its newest sampled token and up to pipe_depth guesses of the tokens after it in
+    // flight, each a one-token evaluation in a pipe slot, so the first GPUs work on a guess while the later ones still
+    // work on the token before it. Tokens are sampled in order, on the device, with every draw keyed by the token's
+    // position: a guess that equals the sampled token is already on its way, a wrong one is dropped with the guesses
+    // behind it (its KV cells removed) and the sampled token goes in instead. The output is the one batched decoding
+    // gives with the same position-keyed draws, whatever the depth, the guesses, or how often the slot switches.
+
+    // whether the slot's next tokens may run pipelined (the caller checks that it generates alone): its sampling runs
+    // entirely on the device and does not depend on the tokens before it, and its window fits in the context
+    bool pipe_eligible(const server_slot & slot) const {
+        if (params_base.pipe_depth <= 0 || slot.state != SLOT_STATE_GENERATING || !slot.task || !slot.smpl) {
+            return false;
+        }
+        if (slot.task->type == SERVER_TASK_TYPE_TTS || !slot.task->need_sampling()) {
+            return false;
+        }
+        if (slot.can_speculate() || slot.audio_stream || !slot.inp_embd.empty() || slot.mctx) {
+            return false;
+        }
+        const auto & sp = slot.task->params.sampling;
+        if (!sp.grammar.empty() || sp.n_probs > 0) {
+            return false;
+        }
+        // penalties read the tokens before the one sampled, which a guess's evaluation does not have yet
+        if (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f) {
+            return false;
+        }
+        for (const auto & lora : slot.lora) {
+            if (lora.scale != 0.0f) {
+                return false;
+            }
+        }
+        if (!llama_sampler_chain_on_backend(common_sampler_get(slot.smpl.get()))) {
+            return false;
+        }
+        return slot.prompt.n_tokens() + params_base.pipe_depth + 2 < slot.n_ctx;
+    }
+
+    // the slot goes back to batched decoding: everything in flight goes, its newest sampled token too, which the batch
+    // decodes again (slot.sampled)
+    void pipe_leave(server_slot & slot) {
+        if (slot.pipe_win.empty()) {
+            return;
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.pipe_win.front().pos, -1);
+        llama_pipe_drain(ctx_tgt);
+        slot.pipe_win.clear();
+        slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - 1);
+    }
+
+    // submits tok at pos in a free pipe slot; false on error
+    bool pipe_submit(server_slot & slot, llama_token tok, llama_pos pos) {
+        const int32_t n_pipe = llama_pipe_n_slots(ctx_tgt);
+        for (int32_t k = 0; k < n_pipe; k++) {
+            const int32_t s = (pipe_next + k) % n_pipe;
+            bool used = false;
+            for (const auto & e : slot.pipe_win) {
+                used = used || e.pslot == s;
+            }
+            if (used) {
+                continue;
+            }
+            pipe_next = (s + 1) % n_pipe;
+            llama_sampler_set_pos(common_sampler_get(slot.smpl.get()), pos);
+            const int32_t ret = llama_pipe_submit(ctx_tgt, s, tok, pos, slot.id);
+            if (ret != 0) {
+                SLT_ERR(slot, "llama_pipe_submit failed (%d) at pos %d\n", ret, pos);
+                return false;
+            }
+            slot.pipe_win.push_back({ s, tok, pos });
+            return true;
+        }
+        SLT_ERR(slot, "%s", "no free pipe slot\n");
+        return false;
+    }
+
+    // keeps up to pipe_depth guesses in flight behind the newest sampled token, within the context and the token limit
+    void pipe_top_up(server_slot & slot) {
+        while ((int32_t) slot.pipe_win.size() < params_base.pipe_depth + 1) {
+            const llama_pos pos = slot.pipe_win.back().pos + 1;
+            if (pos + 1 >= slot.n_ctx) {
+                break;
+            }
+            // tokens beyond the limit would never be sampled
+            if (slot.n_predict_max != -1 && (int32_t) slot.pipe_win.size() >= slot.n_remaining()) {
+                break;
+            }
+            std::vector<llama_token> inflight;
+            for (size_t i = 1; i < slot.pipe_win.size(); i++) {
+                inflight.push_back(slot.pipe_win[i].tok);
+            }
+            const llama_token g = slot.pipe_guesser.guess(inflight.data(), inflight.size());
+            if (g < 0 || !pipe_submit(slot, g, pos)) {
+                break;
+            }
+            slot.pipe_n_guess++;
+        }
+    }
+
+    // one sampled token of a pipelined slot, as post_decode() handles it for a batched one
+    void pipe_step(server_slot & slot) {
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+        if (slot.pipe_win.empty()) {
+            // start: the token sampled last goes in first; the guesses read the prompt and what came out so far
+            const llama_tokens text = slot.prompt.tokens.get_text_tokens();
+            slot.pipe_guesser.reset(text.data(), text.size());
+            if (!pipe_submit(slot, slot.sampled, slot.prompt.tokens.pos_next())) {
+                abort_all_slots("pipelined decoding failed");
+                return;
+            }
+            slot.prompt.tokens.push_back(slot.sampled);
+            slot.pipe_guesser.push(slot.sampled);
+        }
+
+        pipe_top_up(slot);
+
+        const server_slot::pipe_entry cur = slot.pipe_win.front();
+        slot.pipe_win.pop_front();
+
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = llama_pipe_get_sampled(ctx_tgt, cur.pslot);
+        }
+        const bool guessed = !slot.pipe_win.empty();
+        const bool hit     = guessed && slot.pipe_win.front().tok == id;
+
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+
+        slot.stats.update_gen_last();
+
+        const bool special = params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(id) != slot.task->params.sampling.preserved_tokens.end();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, special);
+        result.prob         = 1.0f;
+
+        if (!process_token(result, slot)) {
+            // nothing after the token just sampled belongs to the output
+            llama_memory_seq_rm(mem, slot.id, cur.pos + 1, -1);
+            llama_pipe_drain(ctx_tgt);
+            slot.pipe_win.clear();
+
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+            return;
+        }
+
+        slot.print_timings_tg();
+
+        if (hit) {
+            // the guess in flight is this token
+            slot.pipe_n_hit++;
+        } else {
+            if (guessed) {
+                // a wrong guess: it goes with every guess behind it
+                slot.pipe_n_miss++;
+                llama_memory_seq_rm(mem, slot.id, slot.pipe_win.front().pos, -1);
+                slot.pipe_win.clear();
+            }
+            if (!pipe_submit(slot, id, cur.pos + 1)) {
+                abort_all_slots("pipelined decoding failed");
+                return;
+            }
+        }
+        slot.prompt.tokens.push_back(id);
+        slot.pipe_guesser.push(id);
+
+        // keep the GPUs busy while the server loop turns
+        pipe_top_up(slot);
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3477,6 +3727,28 @@ private:
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
+            }
+        }
+
+        // pipelined speculation: a slot that generates alone runs through the pipe slots, one sampled token per turn
+        if (params_base.pipe_depth > 0) {
+            server_slot * busy   = nullptr;
+            int           n_busy = 0;
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    busy = &slot;
+                    n_busy++;
+                }
+            }
+            const bool pipe = n_busy == 1 && pipe_eligible(*busy);
+            for (auto & slot : slots) {
+                if (!slot.pipe_win.empty() && !(pipe && &slot == busy)) {
+                    pipe_leave(slot);
+                }
+            }
+            if (pipe) {
+                pipe_step(*busy);
+                return;
             }
         }
 
@@ -4431,6 +4703,10 @@ private:
                         slot.i_batch     = batch.size() - 1;
 
                         slot.init_sampler();
+
+                        if (slot.pipe_draws) {
+                            llama_sampler_set_pos(common_sampler_get(slot.smpl.get()), slot.prompt.tokens.pos_next() - 1);
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt

@@ -645,6 +645,11 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+
+    // pipelined speculation in llama-server (llama_pipe_*): guesses in flight behind a generating slot's token, 0 = off
+    int32_t     pipe_depth     = 0;
+    std::string pipe_guess     = "cont"; // none, copy or cont (common_pipe_guesser)
+    int32_t     pipe_copy_min  = 4;      // shortest copy match that makes a guess
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
