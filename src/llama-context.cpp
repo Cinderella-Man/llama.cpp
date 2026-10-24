@@ -755,6 +755,16 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    // 2: an evaluation submitted with nothing in flight stages each split's host inputs and uploads them with one
+    // asynchronous copy, instead of an event wait and a synchronous copy per input (process_ubatch); 0: as stock
+    // llama.cpp. Not 1 (an asynchronous copy from the inputs themselves): the next micro-batch of a llama_decode call
+    // may overwrite them before the copy has run.
+    plain_upload = !model.devices.empty() && llama_backend_dev_has_feature(model.devices[0].dev, "COMPUTE_6_1") ? 2 : 0;
+    if (const char * env = getenv("LLAMA_INPUT_UPLOAD")) {
+        plain_upload = atoi(env) != 0 ? 2 : 0;
+    }
+    ggml_backend_sched_set_input_upload(sched.get(), plain_upload);
 }
 
 void llama_context::sched_reserve() {
@@ -915,6 +925,13 @@ void llama_context::sched_reserve() {
 
 void llama_context::synchronize() {
     if (!sched) {
+        return;
+    }
+
+    // nothing submitted since the last synchronize: every device is idle, so skip the sweep over all backends (a served
+    // token synchronizes four times: after decode, in the sampler and twice in the getters); LLAMA_INPUT_UPLOAD=0 sweeps
+    if (plain_upload > 0 && !gf_in_flight && n_queued_tokens == 0 &&
+            std::none_of(pipe_slots.begin(), pipe_slots.end(), [](const pipe_slot & s) { return s.busy; })) {
         return;
     }
 
@@ -1586,13 +1603,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // LLAMA_GRAPH_REUSE_WAIT=1 restores reuse with the full wait.
     const bool reuse_safe = graph_reuse_wait || !(cparams.pipeline_parallel && gf_in_flight);
 
+    // plain_upload: with nothing in flight, the scheduler need not wait for an earlier evaluation before it overwrites
+    // the input copies, and stages the host inputs (packs are laid out when a graph is allocated, so this is set before);
+    // cleared once the graph is submitted, so that the scheduler's other users (K-shift, training) keep the waits
+    struct caller_sync_scope {
+        ggml_backend_sched_t s;
+        ~caller_sync_scope() { ggml_backend_sched_set_caller_sync(s, false); }
+    } caller_sync_reset { sched.get() };
+    ggml_backend_sched_set_caller_sync(sched.get(), plain_upload > 0 && !gf_in_flight);
+
     if (!graph_reuse_disable && reuse_safe && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading (a no-op wait unless LLAMA_GRAPH_REUSE_WAIT=1).
-        if (cparams.pipeline_parallel) {
+        // that the previous compute is still reading (only with LLAMA_GRAPH_REUSE_WAIT=1).
+        if (cparams.pipeline_parallel && (gf_in_flight || plain_upload == 0)) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -1636,7 +1662,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    gf_in_flight = true;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3228,6 +3253,7 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    gf_in_flight = true;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

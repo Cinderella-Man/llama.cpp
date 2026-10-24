@@ -460,6 +460,10 @@ private:
     // how the slots upload their host inputs (ggml_backend_sched_set_input_upload, LLAMA_PIPE_UPLOAD)
     int pipe_upload = 2;
 
+    // how llama_decode uploads its host inputs when nothing is in flight (ggml_backend_sched_set_input_upload with
+    // caller_sync, LLAMA_INPUT_UPLOAD): 2 where every device is of compute capability 6.1, 0 (stock) elsewhere
+    int plain_upload = 0;
+
     // i_slot_src >= 0: the token is the sampled output of that slot, copied between the devices (pipe_submit_fed)
     int32_t pipe_submit_impl(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos,
                              llama_seq_id seq_id, int32_t i_slot_src);

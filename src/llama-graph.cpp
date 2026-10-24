@@ -3688,14 +3688,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
+    // expand k last, as build_attn with a plain KV cache does, so that its norm, RoPE and cache write are adjacent and
+    // fuse into one kernel
     ggml_build_forward_expand(gf, q_cur);
-
-    if (k_cur) {
-        ggml_build_forward_expand(gf, k_cur);
-    }
 
     if (v_cur) {
         ggml_build_forward_expand(gf, v_cur);
+    }
+
+    if (k_cur) {
+        ggml_build_forward_expand(gf, k_cur);
     }
 
     const auto * mctx_iswa = inp->mctx;

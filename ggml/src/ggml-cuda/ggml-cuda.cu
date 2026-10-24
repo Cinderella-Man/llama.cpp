@@ -6681,6 +6681,15 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
                 break;
             }
         }
+        // every device is of compute capability 6.1 (the 5-SM P106-090 rigs this fork targets): llama.cpp then defaults
+        // its settings for those rigs (the input layer on the first card, packed input uploads)
+        bool all_cc61 = info.device_count > 0;
+        for (int id = 0; id < info.device_count; ++id) {
+            all_cc61 = all_cc61 && GGML_CUDA_CC_IS_NVIDIA(info.devices[id].cc) && info.devices[id].cc == GGML_CUDA_CC_DP4A;
+        }
+        if (all_cc61) {
+            features.push_back({ "COMPUTE_6_1", "1"});
+        }
     }
 
     #undef _STRINGIFY

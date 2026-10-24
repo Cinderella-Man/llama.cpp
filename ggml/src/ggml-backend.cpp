@@ -1875,8 +1875,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 
     // with caller_sync nothing still reads input_cpy, and once no CPU split follows, the host data stays until the
-    // caller reuses the scheduler: the copy can run on the split backend's stream without the host waiting for it
-    if (sched->caller_sync && sched->input_upload >= 1 && (int) (split - sched->splits) > sched->last_cpu_split &&
+    // caller reuses the scheduler: the copy can run on the split backend's stream without the host waiting for it.
+    // input_upload 2 reads host data only while the evaluation is submitted: an input left out of the packs (a graph
+    // allocated without caller_sync) is copied synchronously
+    if (sched->caller_sync && sched->input_upload == 1 && (int) (split - sched->splits) > sched->last_cpu_split &&
             input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
             input_backend == sched->backends[sched->n_backends - 1] && !ggml_backend_sched_is_host_weight(input)) {
         ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
@@ -2301,6 +2303,11 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (sched->input_upload >= 2 && sched->caller_sync) {
         ggml_backend_sched_pack_inputs(sched);
+    } else {
+        // a graph allocated without packs never uploads packed, even if a later evaluation sets caller_sync
+        for (int i = 0; i < sched->packs_capacity; i++) {
+            sched->packs[i].n = 0;
+        }
     }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {

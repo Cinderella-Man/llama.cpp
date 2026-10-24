@@ -367,13 +367,16 @@ extern "C" {
     // The caller guarantees that the previous evaluation of this scheduler has finished on every backend before it
     // computes the next one (for example by waiting on an event recorded after the last split). The scheduler then
     // skips the host-side waits before copying split inputs, so that evaluations of several schedulers that share
-    // backends can be queued behind each other without blocking the host.
+    // backends can be queued behind each other without blocking the host. It can be set per evaluation, before the
+    // graph is allocated (input_upload 2 lays out its packs then); an evaluation computed without it waits as usual.
     GGML_API void                 ggml_backend_sched_set_caller_sync(ggml_backend_sched_t sched, bool caller_sync);
 
     // How host inputs (graph inputs and tensors computed on the CPU) reach the other backends, for a scheduler with
-    // caller_sync: 0 = one synchronous copy each (the default), 1 = one asynchronous copy each on the split backend,
-    // 2 = their copies packed into one buffer per split and uploaded with one asynchronous copy from a pinned staging
-    // buffer (the host data must stay unchanged until the evaluation has finished, which caller_sync guarantees)
+    // caller_sync: 0 = one synchronous copy each (the default), 1 = one asynchronous copy each on the split backend
+    // (the host data must stay unchanged until the evaluation has finished, so the next evaluation must have
+    // caller_sync too), 2 = their copies packed into one buffer per split and uploaded with one asynchronous copy from a
+    // pinned staging buffer (the host data is staged while the evaluation is submitted; inputs of a graph allocated
+    // without caller_sync are copied synchronously)
     GGML_API void                 ggml_backend_sched_set_input_upload(ggml_backend_sched_t sched, int mode);
 
     // The caller fills this input's copies on the split backends itself (for example with a device-to-device copy):
