@@ -36,8 +36,65 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    this->type_r = type_r;
+    this->type_s = type_s;
+
     cells.clear();
     cells.resize(mem_size);
+
+    n_grp = 1 + n_rs_seq;
+    for (auto & cell : cells) {
+        cell.ring_pos.assign(n_grp, -1);
+    }
+
+    layer_buft.assign(n_layer, nullptr);
+
+    for (int i = 0; i < n_layer; i++) {
+        if (filter && !filter(i)) {
+            LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
+            continue;
+        }
+
+        const char * dev_name = "CPU";
+
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+
+        if (offload) {
+            auto * dev = model.dev_layer(i);
+            buft = ggml_backend_dev_buffer_type(dev);
+
+            dev_name = ggml_backend_dev_name(dev);
+        }
+
+        LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
+
+        layer_buft[i] = buft;
+    }
+
+    alloc_tensors(mem_size * (1 + n_rs_seq));
+
+    if (is_empty()) {
+        if (n_rs_seq > 0) {
+            n_rs_seq = 0;
+            LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
+        }
+    }
+
+    {
+        const size_t memory_size_r = size_r_bytes();
+        const size_t memory_size_s = size_s_bytes();
+        const size_t memory_size_p = size_p_bytes();
+
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
+                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
+                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
+                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+    }
+}
+
+void llama_memory_recurrent::alloc_tensors(uint32_t n_rows) {
+    const int32_t n_layer = hparams.n_layer();
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -71,35 +128,22 @@ llama_memory_recurrent::llama_memory_recurrent(
         return it->second.get();
     };
 
-    r_l.resize(n_layer);
-    s_l.resize(n_layer);
-    p_l.resize(n_layer);
+    ctxs_bufs.bufs.clear();
+
+    r_l.assign(n_layer, nullptr);
+    s_l.assign(n_layer, nullptr);
+    p_l.assign(n_layer, nullptr);
 
     for (int i = 0; i < n_layer; i++) {
-        if (filter && !filter(i)) {
-            LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
+        if (layer_buft[i] == nullptr) {
             continue;
         }
 
-        const char * dev_name = "CPU";
-
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-
-        if (offload) {
-            auto * dev = model.dev_layer(i);
-            buft = ggml_backend_dev_buffer_type(dev);
-
-            dev_name = ggml_backend_dev_name(dev);
-        }
-
-        LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
-
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(layer_buft[i]);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
@@ -121,25 +165,95 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
     }
+}
 
-    if (is_empty()) {
-        if (n_rs_seq > 0) {
-            n_rs_seq = 0;
-            LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
+bool llama_memory_recurrent::set_n_groups(uint32_t n) {
+    if (n_rs_seq != 0 || n < 1) {
+        return false;
+    }
+    if (n == n_grp) {
+        return true;
+    }
+
+    if (!is_empty()) {
+        // the new tensors, then each used cell's current state into its row of group 0
+        auto r_old = r_l;
+        auto s_old = s_l;
+        auto p_old = p_l;
+        auto bufs_old = std::move(ctxs_bufs.bufs);
+
+        alloc_tensors(size * n);
+
+        std::vector<uint8_t> row;
+        auto copy_row = [&](const ggml_tensor * src, ggml_tensor * dst, uint32_t i_src, uint32_t i_dst) {
+            // with no_alloc the buffers are dummies: only the sizes count
+            if (src == nullptr || ctxs_bufs.no_alloc) {
+                return;
+            }
+            row.resize(src->nb[1]);
+            ggml_backend_tensor_get(src, row.data(), (size_t) i_src*src->nb[1], src->nb[1]);
+            ggml_backend_tensor_set(dst, row.data(), (size_t) i_dst*dst->nb[1], dst->nb[1]);
+        };
+
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].is_empty()) {
+                continue;
+            }
+            const uint32_t i_src = (uint32_t) cells[i].grp*size + i;
+            for (size_t il = 0; il < r_l.size(); ++il) {
+                copy_row(r_old[il], r_l[il], i_src, i);
+                copy_row(s_old[il], s_l[il], i_src, i);
+                copy_row(p_old[il], p_l[il], i_src, i);
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: %u state groups of %u cells for pipelined decoding: %.2f MiB\n", __func__, n, size,
+                total_size()/1024.0/1024.0);
+    }
+
+    n_grp = n;
+    for (auto & cell : cells) {
+        cell.grp = 0;
+        cell.ring_pos.assign(n_grp, -1);
+        if (!cell.is_empty()) {
+            cell.ring_pos[0] = cell.pos;
         }
     }
 
-    {
-        const size_t memory_size_r = size_r_bytes();
-        const size_t memory_size_s = size_s_bytes();
-        const size_t memory_size_p = size_p_bytes();
+    return true;
+}
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
-                ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
-                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
-                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+int32_t llama_memory_recurrent::pipe_stash(llama_seq_id seq_id, uint32_t g, llama_pos keep) {
+    if (n_rs_seq != 0 || n_grp < 2 || is_empty() || keep < 0 || seq_id < 0 || (uint32_t) seq_id >= size) {
+        return -1;
     }
+
+    const int32_t tail = cells[seq_id].tail;
+    if (tail < 0) {
+        return -1;
+    }
+
+    auto & cell = cells[tail];
+
+    const uint32_t stash = n_grp - 1;
+    if (g >= stash || cell.ring_pos[g] != keep || cell.ring_pos[stash] == keep) {
+        return -1;
+    }
+
+    // the copy is queued before the evaluation that overwrites group g, on the same devices
+    cell.ring_pos[stash] = keep;
+
+    return tail;
+}
+
+void llama_memory_recurrent::ring_set(mem_cell & cell, int32_t g, llama_pos pos, llama_pos p_keep) const {
+    for (uint32_t k = 0; k < n_grp; ++k) {
+        if (cell.ring_pos[k] >= p_keep) {
+            cell.ring_pos[k] = -1;
+        }
+    }
+    cell.ring_pos[g] = pos;
+    cell.grp = g;
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -149,6 +263,8 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].src = -1;
         cells[i].tail = -1;
         cells[i].rs_max = 0;
+        cells[i].grp = 0;
+        cells[i].ring_pos.assign(n_grp, -1);
     }
 
     head = 0;
@@ -205,6 +321,17 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 if (is_empty()) {
                     cell.pos = p0 - 1;
                     return true;
+                }
+                // state groups (pipelined decoding): back to the group that holds the state at p0 - 1, if one does
+                if (n_rs_seq == 0) {
+                    for (uint32_t g = 0; g < n_grp; ++g) {
+                        if (cell.ring_pos[g] == p0 - 1) {
+                            ring_set(cell, (int32_t) g, p0 - 1, p0);
+                            cell.pos = p0 - 1;
+                            return true;
+                        }
+                    }
+                    return false;
                 }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
@@ -354,6 +481,10 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos += shift;
+                // the older states (state groups) in the range move with it, the others are forgotten
+                for (auto & p : cell.ring_pos) {
+                    p = p >= 0 && p0 <= p && p < p1 && p + shift >= 0 ? p + shift : -1;
+                }
             }
         }
     }
@@ -384,6 +515,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos /= d;
+                // positions merge: only the current state stays known
+                ring_set(cell, cell.grp, cell.pos, 0);
             }
         }
     }
@@ -512,9 +645,11 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     return success;
 }
 
-bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch, uint32_t grp) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
+
+    GGML_ASSERT(grp < n_grp && (grp == 0 || n_rs_seq == 0));
 
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
@@ -701,16 +836,36 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
 
+        // whether a row receives another row's state or a zeroed one (its older states then belong to another sequence)
+        std::vector<bool> moved(max - min + 1);
+
         for (int i = min; i <= max; ++i) {
+            moved[i - min] = cells[i].src != i;
             if (cells[i].src < 0) {
                 GGML_ASSERT(rs_z >= 0);
                 cells[i].src0 = rs_z;
+                cells[i].src_grp0 = 0; // the zeroed state is made in group 0 (build_rs)
             } else {
                 // Stage the source ids for all used cells to allow correct seq_* behavior
                 // and still make these values available when setting the inputs
                 cells[i].src0 = cells[i].src;
+                cells[i].src_grp0 = cells[cells[i].src].grp;
             }
             cells[i].src = i; // avoid moving or clearing twice
+        }
+
+        // state groups: the ubatch's rows are written in group grp, the other rows of the range (moved or copied in
+        // place) in group 0 (build_rs)
+        if (n_rs_seq == 0) {
+            for (int i = min; i <= max; ++i) {
+                auto & cell = cells[i];
+                const uint32_t s = i - min;
+                if (s < n_seqs) {
+                    ring_set(cell, (int32_t) grp, cell.pos, moved[s] ? 0 : ubatch.pos[s*n_seq_tokens]);
+                } else if (!cell.is_empty()) {
+                    ring_set(cell, 0, cell.pos, moved[s] ? 0 : cell.pos);
+                }
+            }
         }
     }
 
@@ -817,7 +972,9 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            // the current state: the rollback group, or with state groups (pipelined decoding) the group holding it
+            const int32_t  data_id = cell.src >= 0 ? cell.src : (int32_t) i;
+            const uint32_t cell_id = (n_rs_seq == 0 ? (uint32_t) cells[data_id].grp : rs_idx_cur) * size + data_id;
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -889,6 +1046,11 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
+    } else {
+        // the restored rows are in group 0, with no older states
+        for (uint32_t i = cell_head; i < cell_head + cell_count && i < size; ++i) {
+            ring_set(cells[i], 0, cells[i].pos, 0);
+        }
     }
 }
 
@@ -1292,7 +1454,7 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
 
 llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
+        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)), grp(mem->grp_next) {}
 
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
@@ -1317,7 +1479,7 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    mem->find_slot(ubatches[i_next], grp);
 
     return true;
 }
@@ -1348,6 +1510,10 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+uint32_t llama_memory_recurrent_context::get_grp() const {
+    return grp;
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }
@@ -1365,7 +1531,8 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
     if (mem->n_rs_seq == 0) {
-        return src0;
+        // the source's state in the group that holds it (0 unless pipe slots write their own groups)
+        return mem->cells[cell_idx].src_grp0*(int32_t) mem->size + src0;
     }
 
     uint32_t idx = 0;
