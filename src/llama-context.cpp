@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -347,6 +348,10 @@ llama_context::llama_context(
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+
+    if (const char * env = getenv("LLAMA_SAMPLER_RESERVE")) {
+        sampling.reserve_always = atoi(env) != 0;
+    }
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -781,12 +786,39 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_input_upload(sched.get(), plain_upload);
 }
 
+// a backend sampler chain by its samplers' names: chains with the same names build graphs of the same shape, up to
+// sizes such as top-k's k, which the scheduler's allocator handles by growing its buffers if ever needed
+static std::string sampler_chain_sig(llama_sampler * chain) {
+    std::string sig;
+    for (int32_t i = 0; i < llama_sampler_chain_n(chain); i++) {
+        sig += llama_sampler_name(llama_sampler_chain_get(chain, i));
+        sig += ',';
+    }
+    return sig;
+}
+
+static std::vector<std::string> sampler_chain_sigs(const std::map<llama_seq_id, llama_sampler *> & samplers) {
+    std::vector<std::string> res;
+    for (const auto & entry : samplers) {
+        res.push_back(sampler_chain_sig(entry.second));
+    }
+    std::sort(res.begin(), res.end());
+    return res;
+}
+
+bool llama_context::sampler_reserve_covered() const {
+    const auto cur = sampler_chain_sigs(sampling.samplers);
+    return std::includes(sampling.reserved_chains.begin(), sampling.reserved_chains.end(), cur.begin(), cur.end());
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
 
     sched_need_reserve = false;
+
+    sampling.reserved_chains = sampler_chain_sigs(sampling.samplers);
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -1534,6 +1566,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampler->iface->backend_apply &&
         llama_sampler_chain_n(sampler) > 0;
 
+    // a server attaches each request's chain and detaches it at the end: a full reserve (a new scheduler and three
+    // worst-case graphs) per request is not needed when the reserve already covered the same chains, and a detach only
+    // makes the graphs smaller
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
@@ -1541,7 +1576,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        if (sampling.reserve_always || !sampler_reserve_covered()) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -1549,7 +1586,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && !can_offload) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        if (sampling.samplers.count(seq_id) > 0) {
+        if (sampling.samplers.count(seq_id) > 0 && sampling.reserve_always) {
             sched_need_reserve = true;
         }
 
@@ -1560,7 +1597,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    if (sampling.reserve_always) {
+        sched_need_reserve = true;
+    }
 
     return true;
 }
