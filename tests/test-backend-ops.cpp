@@ -6038,6 +6038,145 @@ struct test_add_rms_norm_mul_q8 : public test_case {
     }
 };
 
+// One MoE layer of a Flint-shaped model at one token (hidden 2048, 256 experts of width 512 of which 6 are used, a
+// shared expert of width 1024, sigmoid routing with normalized weights), built with the calls and expansion order of
+// llama.cpp's build_moe_ffn, then the shared expert and the residual add. The CUDA backend runs the layer as one
+// persistent kernel with GGML_CUDA_PERSISTENT_MOE (moe-persistent.cu), and as its per-op path without. Six experts get
+// a clear lead from the router, so that every backend picks the same ones.
+struct test_moe_layer : public test_case {
+    const ggml_type type_router;
+    const ggml_type type_gu;   // routed gate and up
+    const ggml_type type_dn;   // routed down
+    const ggml_type type_sh;   // shared expert
+    static constexpr int64_t n_embd   = 2048;
+    static constexpr int64_t n_expert = 256;
+    static constexpr int64_t n_used   = 6;
+    static constexpr int64_t n_ff     = 512;
+    static constexpr int64_t n_ff_sh  = 1024;
+    static constexpr float   eps      = 1e-6f;
+
+    test_moe_layer(ggml_type type_router, ggml_type type_gu, ggml_type type_dn, ggml_type type_sh)
+        : type_router(type_router), type_gu(type_gu), type_dn(type_dn), type_sh(type_sh) {}
+
+    std::string vars() override { return VARS_TO_STR4(type_router, type_gu, type_dn, type_sh); }
+    std::string op_desc(ggml_tensor *) override { return "MOE_LAYER"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(norm_w, "norm_w");
+        ggml_tensor * router = ggml_new_tensor_2d(ctx, type_router, n_embd, n_expert);
+        ggml_set_name(router, "router");
+        ggml_tensor * gate_exps = ggml_new_tensor_3d(ctx, type_gu, n_embd, n_ff, n_expert);
+        ggml_tensor * up_exps   = ggml_new_tensor_3d(ctx, type_gu, n_embd, n_ff, n_expert);
+        ggml_tensor * down_exps = ggml_new_tensor_3d(ctx, type_dn, n_ff, n_embd, n_expert);
+        ggml_tensor * gate_sh   = ggml_new_tensor_2d(ctx, type_sh, n_embd, n_ff_sh);
+        ggml_tensor * up_sh     = ggml_new_tensor_2d(ctx, type_sh, n_embd, n_ff_sh);
+        ggml_tensor * down_sh   = ggml_new_tensor_2d(ctx, type_sh, n_ff_sh, n_embd);
+
+        // build_moe_ffn: router, sigmoid, top-k, normalized weights (expanded early, as there)
+        ggml_tensor * cur      = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), norm_w);
+        ggml_tensor * logits   = ggml_mul_mat(ctx, router, cur);
+        ggml_tensor * probs    = ggml_sigmoid(ctx, logits);
+        ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_used);
+        ggml_tensor * weights  = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, 1), selected);
+        weights = ggml_reshape_2d(ctx, weights, n_used, 1);
+        ggml_tensor * wsum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5, INFINITY);
+        weights = ggml_reshape_3d(ctx, ggml_div(ctx, weights, wsum), 1, n_used, 1);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, weights);
+        }
+
+        // routed experts and their weighted sum
+        ggml_tensor * cur3    = ggml_reshape_3d(ctx, cur, n_embd, 1, 1);
+        ggml_tensor * up      = ggml_mul_mat_id(ctx, up_exps, cur3, selected);
+        ggml_tensor * gate    = ggml_mul_mat_id(ctx, gate_exps, cur3, selected);
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, down_exps, ggml_swiglu_split(ctx, gate, up), selected);
+        experts = ggml_mul(ctx, experts, weights);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, experts);
+        }
+        ggml_tensor * views[n_used];
+        for (int64_t i = 0; i < n_used; ++i) {
+            views[i] = ggml_view_2d(ctx, experts, n_embd, 1, experts->nb[2], i * experts->nb[1]);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, views[i]);
+            }
+        }
+        ggml_tensor * moe_out = views[0];
+        for (int64_t i = 1; i < n_used; ++i) {
+            moe_out = ggml_add(ctx, moe_out, views[i]);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, moe_out);
+            }
+        }
+
+        // shared expert, ffn_out, residual
+        ggml_tensor * sup   = ggml_mul_mat(ctx, up_sh, cur);
+        ggml_tensor * sgate = ggml_mul_mat(ctx, gate_sh, cur);
+        ggml_tensor * shexp = ggml_mul_mat(ctx, down_sh, ggml_swiglu_split(ctx, sgate, sup));
+        ggml_tensor * out   = ggml_add(ctx, ggml_add(ctx, moe_out, shexp), x);
+        ggml_set_name(out, "l_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        std::vector<float> xv(n_embd), wv(n_embd);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            xv[i] = u(rng);
+            wv[i] = u(rng);
+        }
+        // router: small noise (logits of about 0.15), plus a lead of 2.0, 2.5, ..., 4.5 for six experts along the normed
+        // input, so the top 6 and their order don't depend on rounding
+        double ss = 0.0;
+        double sabs = 0.0;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            ss   += (double) xv[i] * xv[i];
+            sabs += std::fabs((double) xv[i] * wv[i]);
+        }
+        const double inv_rms = 1.0 / std::sqrt(ss / n_embd + eps);
+        std::vector<float> rv(n_embd * n_expert);
+        for (float & r : rv) {
+            r = 0.01f * u(rng);
+        }
+        const int lead[n_used] = { 201, 3, 128, 77, 255, 160 };
+        for (int k = 0; k < n_used; ++k) {
+            const double c = (2.0 + 0.5 * k) / (inv_rms * sabs);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                rv[lead[k] * n_embd + i] += (float) (xv[i] * wv[i] >= 0.0f ? c : -c);
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "x") {
+                ggml_backend_tensor_set(t, xv.data(), 0, ggml_nbytes(t));
+            } else if (name == "norm_w") {
+                ggml_backend_tensor_set(t, wv.data(), 0, ggml_nbytes(t));
+            } else if (name == "router") {
+                if (t->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(t, rv.data(), 0, ggml_nbytes(t));
+                } else if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> h(rv.size());
+                    ggml_fp32_to_fp16_row(rv.data(), h.data(), (int64_t) rv.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+                } else {
+                    std::vector<ggml_bf16_t> h(rv.size());
+                    ggml_fp32_to_bf16_row(rv.data(), h.data(), (int64_t) rv.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+                }
+            } else if (t->op == GGML_OP_NONE && !ggml_is_empty(t)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -11648,6 +11787,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_rms_norm_mul_q8(GGML_TYPE_Q8_0, 1536, with_add, 1));
         test_cases.emplace_back(new test_add_rms_norm_mul_q8(GGML_TYPE_Q8_0, 2048, with_add, 2));
     }
+
+    // a whole Flint-shaped MoE layer at one token (the persistent MoE kernel's type combinations: K2h-r16, G3, S4-L0)
+    for (ggml_type type_router : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_moe_layer(type_router, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_moe_layer(type_router, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0));
+        test_cases.emplace_back(new test_moe_layer(type_router, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_moe_layer(type_router, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    test_cases.emplace_back(new test_moe_layer(GGML_TYPE_BF16, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0));
 
     // products of 1 to 4 tokens (one token, and a speculative-decoding verify step) at the shapes of a large MoE model
     // (Flint: hidden 2048, 32 x 128 query heads, 4 x 128 KV heads, 256 experts of width 512 with 6 used, a 1024-wide
