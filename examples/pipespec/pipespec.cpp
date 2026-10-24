@@ -688,6 +688,10 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     struct trace_row { int64_t t_us; int inflight; char outcome; };
     std::vector<trace_row> trace;
 
+    // the prompt's last evaluations may still run on the cards (llama_decode returns before they finish): wait for them
+    // here, so that the generation time starts at the prompt's end and not at a varying point inside it
+    llama_synchronize(ctx);
+
     // generation time includes the race; t_race is the time until the race ended
     const int64_t t_gen_start = ggml_time_us();
     double        t_race      = 0.0;
