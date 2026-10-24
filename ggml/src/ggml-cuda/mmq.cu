@@ -91,6 +91,17 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// GGML_CUDA_MMQ_MOE_LEGACY=1: MUL_MAT_ID as before the MoE tile list (llama.cpp PR #31047) at every batch size, for
+// measuring it inside one build: the tile width chosen against all tokens and the per-expert tiles that steps of up to
+// MMVQ_MAX_BATCH_SIZE tokens use anyway.
+static bool ggml_cuda_mmq_moe_legacy() {
+    static const bool legacy = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_MOE_LEGACY");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return legacy;
+}
+
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one
 static ggml_prec ggml_cuda_mmq_get_prec_env() {
     const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
@@ -196,7 +207,7 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = ne12;
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average (the tile list's rule, prompt batches only).
-            if (ne12 > MMVQ_MAX_BATCH_SIZE) {
+            if (ne12 > MMVQ_MAX_BATCH_SIZE && !ggml_cuda_mmq_moe_legacy()) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
         }
@@ -290,7 +301,10 @@ void ggml_cuda_mul_mat_q(
     // MMQ only for the types whose vector kernel gives up below that width (get_mmvq_mmid_max_batch: speculative verify
     // and multi-token steps), keep the per-expert tiles from before it: ceil(ne12/J) tiles for every expert, each from
     // the expert's first column, the ones past its last column empty.
-    const int tiles_per_expert = ne12 <= MMVQ_MAX_BATCH_SIZE ? (ne12 + J_best - 1) / J_best : 0;
+    // (GGML_CUDA_MMQ_MOE_LEGACY: at every batch size, as far as the CUDA grid's y dimension allows)
+    const bool per_expert = ne12 <= MMVQ_MAX_BATCH_SIZE ||
+        (ggml_cuda_mmq_moe_legacy() && ne02*((ne12 + J_best - 1) / J_best) <= 65535);
+    const int tiles_per_expert = per_expert ? (ne12 + J_best - 1) / J_best : 0;
     const int ntj = tiles_per_expert > 0 ? ne02*tiles_per_expert : (ne_get_rows + J_best - 1) / J_best + ne02;
     ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), ntj);
 

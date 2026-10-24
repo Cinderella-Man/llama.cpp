@@ -462,6 +462,10 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // env: LLAMA_GRAPH_REUSE_WAIT=1 reuses a graph under pipeline parallelism while a ubatch is in flight, after waiting
+    // for all devices (the behavior before the in-flight rule)
+    bool graph_reuse_wait = false;
+
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 

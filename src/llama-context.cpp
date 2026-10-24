@@ -400,6 +400,9 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_GRAPH_REUSE_WAIT = getenv("LLAMA_GRAPH_REUSE_WAIT");
+        graph_reuse_wait = LLAMA_GRAPH_REUSE_WAIT ? (atoi(LLAMA_GRAPH_REUSE_WAIT) != 0) : graph_reuse_wait;
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1580,14 +1583,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // takes the scheduler's next input copy and overlaps with the ones in flight (up to n_copies ubatches, as for
     // prompts whose KV length changes every ubatch). So reuse only when nothing is in flight: one ubatch per decode
     // call after the caller synchronized, as in token generation and speculative verify steps, which keep their graphs.
-    const bool reuse_safe = !(cparams.pipeline_parallel && gf_in_flight);
+    // LLAMA_GRAPH_REUSE_WAIT=1 restores reuse with the full wait.
+    const bool reuse_safe = graph_reuse_wait || !(cparams.pipeline_parallel && gf_in_flight);
 
     if (!graph_reuse_disable && reuse_safe && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading (reuse_safe makes this a no-op wait).
+        // that the previous compute is still reading (a no-op wait unless LLAMA_GRAPH_REUSE_WAIT=1).
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
