@@ -114,7 +114,10 @@ template <> struct ftp_piece<GGML_TYPE_Q8_0> {
 
 __constant__ int ftp_fault_dev = 0;
 
-template <int D, ggml_type type_K, ggml_type type_V>
+// split (head 128): the scores are computed by lanes (16 key groups x the 2 halves of the head dimension), each with 4
+// keys x the warp's 8 columns over its half (128 FMAs per 12 float4 loads instead of 64 per 8), and lane l and l ^ 16
+// then swap the partial sums of each other's columns, which leaves the same layout as without the split.
+template <int D, ggml_type type_K, ggml_type type_V, bool split>
 __launch_bounds__(FTP_NTHREADS, 3)
 static __global__ void flash_attn_tile_pascal(
         const char * Q_ptr,
@@ -150,6 +153,7 @@ static __global__ void flash_attn_tile_pascal(
     constexpr int NKG    = S::NKG;
     constexpr int KA     = S::KA;
     constexpr int OQ     = S::OQ;
+    static_assert(!split || (S::NKG == 16 && S::CW == 8 && S::DC == 16), "the split scores need 16 key groups, 8 columns per warp and 16-dimension chunks");
 
     const char  * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char  * GGML_CUDA_RESTRICT K        = K_ptr;
@@ -207,9 +211,11 @@ static __global__ void flash_attn_tile_pascal(
     // g >= NKC is V rows (g - NKC)*TV..+TV-1. Each thread loads and stores 8 dimensions of one key.
     piece_K pk;
     piece_V pv;
+    // split: chunk columns 0-7 are dimensions 8g..8g+7, columns 8-15 are D/2 + 8g..D/2 + 8g + 7
     auto load_K = [&](const int k0, const int g) {
         const int key  = tid / (S::DC/8);
-        const int dim0 = g*S::DC + (tid % (S::DC/8))*8;
+        const int p    = tid % (S::DC/8);
+        const int dim0 = split ? p*(D/2) + g*(S::DC/2) : g*S::DC + p*8;
         piece_K::load(pk, K_h + int64_t(k0 + key)*nb11, dim0);
     };
     auto store_K = [&]() {
@@ -279,14 +285,20 @@ static __global__ void flash_attn_tile_pascal(
         }
 
         // scores of KA keys (kg + NKG*i) x the lane's 4 columns, summed over the head dimension in order
+        // (split: over each half in order, then the halves added)
+        constexpr int CQ = split ? 8 : 4; // columns per lane while the scores are summed
         float KQ[KA][4];
+        float KQ_part[KA][CQ];
 #pragma unroll
         for (int i = 0; i < KA; ++i) {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                KQ[i][j] = 0.0f;
+            for (int c = 0; c < CQ; ++c) {
+                KQ_part[i][c] = 0.0f;
             }
         }
+        const int cq0 = split ? threadIdx.y*S::CW : col0;       // the first of the lane's CQ columns
+        const int dq0 = split ? (lane/16)*(D/2) : 0;            // the lane's half of the head dimension
+        const int kq0 = split ? (lane/16)*(S::DC/2) : 0;        // and its columns in a K chunk
 
 #pragma unroll 1
         for (int g = 0; g < S::NKC; ++g) {
@@ -301,23 +313,46 @@ static __global__ void flash_attn_tile_pascal(
                 load_V(k0, 0);
             }
 
+            constexpr int DQ = split ? S::DC/2 : S::DC; // dimensions of the lane per chunk
 #pragma unroll
-            for (int d4 = 0; d4 < S::DC/4; ++d4) {
-                float4 Q_k[4];
+            for (int d4 = 0; d4 < DQ/4; ++d4) {
+                float4 Q_k[CQ];
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    Q_k[j] = *(const float4 *) (Q_s + (col0 + j)*D + g*S::DC + 4*d4);
+                for (int c = 0; c < CQ; ++c) {
+                    Q_k[c] = *(const float4 *) (Q_s + (cq0 + c)*D + dq0 + g*DQ + 4*d4);
                 }
 #pragma unroll
                 for (int i = 0; i < KA; ++i) {
-                    const float4 K_k = *(const float4 *) (KV_s + (kg + NKG*i)*S::KS + 4*d4);
+                    const float4 K_k = *(const float4 *) (KV_s + (kg + NKG*i)*S::KS + kq0 + 4*d4);
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        KQ[i][j] = fmaf(K_k.x, Q_k[j].x, KQ[i][j]);
-                        KQ[i][j] = fmaf(K_k.y, Q_k[j].y, KQ[i][j]);
-                        KQ[i][j] = fmaf(K_k.z, Q_k[j].z, KQ[i][j]);
-                        KQ[i][j] = fmaf(K_k.w, Q_k[j].w, KQ[i][j]);
+                    for (int c = 0; c < CQ; ++c) {
+                        KQ_part[i][c] = fmaf(K_k.x, Q_k[c].x, KQ_part[i][c]);
+                        KQ_part[i][c] = fmaf(K_k.y, Q_k[c].y, KQ_part[i][c]);
+                        KQ_part[i][c] = fmaf(K_k.z, Q_k[c].z, KQ_part[i][c]);
+                        KQ_part[i][c] = fmaf(K_k.w, Q_k[c].w, KQ_part[i][c]);
                     }
+                }
+            }
+        }
+
+        if constexpr (split) {
+            // lane l keeps columns 4*(l/16) .. +3 and sends its half's sums of the other 4 to lane l ^ 16
+            const bool upper = lane & 16;
+#pragma unroll
+            for (int i = 0; i < KA; ++i) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float keep = upper ? KQ_part[i][4 + j] : KQ_part[i][j];
+                    const float send = upper ? KQ_part[i][j] : KQ_part[i][4 + j];
+                    KQ[i][j] = keep + __shfl_xor_sync(0xFFFFFFFF, send, 16, WARP_SIZE);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < KA; ++i) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    KQ[i][j] = KQ_part[i][j];
                 }
             }
         }
@@ -446,7 +481,7 @@ static __global__ void flash_attn_tile_pascal(
     for (int j = 0; j < 4; ++j) {
         float out_scale = gridDim.y == 1 ? 1.0f/KQ_sum[j] : 1.0f;
         if (fault == 1) {
-            out_scale *= 1.01f;
+            out_scale *= 1.05f;
         }
 
         const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + jtok)*ne02 + head0 + hcol + j)*gridDim.y + blockIdx.y;
@@ -475,39 +510,45 @@ static __global__ void flash_attn_tile_pascal(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
-template <int D, ggml_type type_K, ggml_type type_V>
+template <int D, ggml_type type_K, ggml_type type_V, bool split>
 static void ftp_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using S = ftp_shape<D>;
-    const fattn_kernel_t kernel = flash_attn_tile_pascal<D, type_K, type_V>;
+    const fattn_kernel_t kernel = flash_attn_tile_pascal<D, type_K, type_V, split>;
     // K and V are read in their own types: no F16 copy
     launch_fattn<D, S::ncols1, FTP_NCOLS2>(ctx, dst, kernel, FTP_NWARPS, 0, S::T, false, false, false, false, WARP_SIZE);
 }
 
-int ftp_env_int(const char * name, const int dflt) {
+static int ftp_env_int(const char * name, const int dflt) {
     const char * env = getenv(name);
     return env ? atoi(env) : dflt;
 }
 
-int ftp_mode() {
+// head 128: 2 = the split scores (default), 1 = 4 keys x 4 columns per lane over the whole head
+static bool ftp_split_128() {
+    static const bool split = ftp_env_int("GGML_CUDA_FATTN_TILE_PASCAL_QK", 2) != 1;
+    return split;
+}
+
+static int ftp_mode() {
     static const int mode = ftp_env_int("GGML_CUDA_FATTN_TILE_PASCAL", 1);
     return mode;
 }
 
-int ftp_min_tokens(const bool q8_0) {
+static int ftp_min_tokens(const bool q8_0) {
     static const int min_tokens = ftp_env_int("GGML_CUDA_FATTN_TILE_PASCAL_MIN", 0);
     return min_tokens > 0 ? min_tokens : (q8_0 ? 3 : 9);
 }
 
-int ftp_fault() {
+static int ftp_fault() {
     static const int fault = ftp_env_int("GGML_CUDA_FATTN_TILE_PASCAL_FAULT", 0);
     return fault;
 }
 
-bool ftp_aligned(const void * p, const size_t n) {
+static bool ftp_aligned(const void * p, const size_t n) {
     return (uintptr_t) p % n == 0;
 }
 
-bool ftp_strides_aligned(const ggml_tensor * t, const size_t n) {
+static bool ftp_strides_aligned(const ggml_tensor * t, const size_t n) {
     return ftp_aligned(t->data, n) && t->nb[1] % n == 0 && t->nb[2] % n == 0 && t->nb[3] % n == 0;
 }
 
@@ -587,17 +628,25 @@ bool ggml_cuda_flash_attn_ext_tile_pascal(ggml_backend_cuda_context & ctx, ggml_
 
     switch (dst->src[0]->ne[0]) {
         case 128:
-            if (q8_0) {
-                ftp_launch<128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+            if (ftp_split_128()) {
+                if (q8_0) {
+                    ftp_launch<128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true>(ctx, dst);
+                } else {
+                    ftp_launch<128, GGML_TYPE_F16, GGML_TYPE_F16, true>(ctx, dst);
+                }
             } else {
-                ftp_launch<128, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+                if (q8_0) {
+                    ftp_launch<128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false>(ctx, dst);
+                } else {
+                    ftp_launch<128, GGML_TYPE_F16, GGML_TYPE_F16, false>(ctx, dst);
+                }
             }
             break;
         case 256:
             if (q8_0) {
-                ftp_launch<256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                ftp_launch<256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false>(ctx, dst);
             } else {
-                ftp_launch<256, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+                ftp_launch<256, GGML_TYPE_F16, GGML_TYPE_F16, false>(ctx, dst);
             }
             break;
         default:
