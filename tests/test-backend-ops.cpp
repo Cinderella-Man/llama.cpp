@@ -11528,6 +11528,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_large_act(type, 2048, 1, 4096));
     }
 
+    // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
+    // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
+    // leave partial tiles. One case at Flint's own expert shapes.
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
+                            GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (int n : { 9, 33, 128, 200, 512 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 6, true,  256, n, 512));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 6, false, 512, n, 256));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 6, true,  512, 512, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 6, false, 2048, 512, 512));
+
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
