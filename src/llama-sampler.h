@@ -38,6 +38,11 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// the graph input tensors a backend sampler (or a chain's backend samplers) set in backend_set_input, as left by the
+// last backend_apply; and pointing it at those of another graph (the same samplers, in the same order)
+std::vector<std::vector<ggml_tensor *>> llama_sampler_backend_get_inputs(llama_sampler * sampler);
+void llama_sampler_backend_set_inputs(llama_sampler * sampler, const std::vector<std::vector<ggml_tensor *>> & inputs);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

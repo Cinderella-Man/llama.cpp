@@ -1138,6 +1138,9 @@ struct llama_sampler_dist : public llama_sampler_backend {
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
 
+    // llama_sampler_set_pos: the backend draws come from rng_backend, seeded by (seed, position)
+    bool pos_keyed = false;
+
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
         seed_cur                  = src.seed_cur;
@@ -1145,6 +1148,7 @@ struct llama_sampler_dist : public llama_sampler_backend {
         rng_backend               = src.rng_backend;
         n_backend_draws_generated = src.n_backend_draws_generated;
         n_backend_draws_committed = src.n_backend_draws_committed;
+        pos_keyed                 = src.pos_keyed;
     }
 };
 
@@ -1251,6 +1255,7 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
         result_ctx->rng_backend               = ctx->rng_backend;
         result_ctx->n_backend_draws_generated = ctx->n_backend_draws_generated;
         result_ctx->n_backend_draws_committed = ctx->n_backend_draws_committed;
+        result_ctx->pos_keyed                 = ctx->pos_keyed;
     }
 
     return result;
@@ -1353,7 +1358,7 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     // different sequences).
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
 
-    auto & rng = sctx->backend_transactional ? sctx->rng_backend : sctx->rng;
+    auto & rng = sctx->backend_transactional || sctx->pos_keyed ? sctx->rng_backend : sctx->rng;
 
     for (auto * inp_uniform : sctx->inp_uniforms) {
         GGML_ASSERT(inp_uniform != nullptr);
@@ -1433,11 +1438,65 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
         }
     } else if (sampler->iface == &llama_sampler_dist_i) {
         auto * ctx = (llama_sampler_dist *) sampler->ctx;
-        if (ctx->backend_transactional) {
+        if (ctx->backend_transactional && !ctx->pos_keyed) {
             ctx->rng_backend = ctx->rng;
             ctx->n_backend_draws_generated = 0;
             ctx->n_backend_draws_committed = 0;
         }
+    }
+}
+
+// visits the dist samplers of a sampler or chain in order: get appends each one's input tensors, set restores them
+static void llama_sampler_backend_inputs_walk(llama_sampler * sampler, std::vector<std::vector<ggml_tensor *>> * get,
+                                              const std::vector<std::vector<ggml_tensor *>> * set, size_t & i) {
+    if (sampler->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) sampler->ctx;
+        for (auto & entry : chain->samplers) {
+            llama_sampler_backend_inputs_walk(entry.ptr, get, set, i);
+        }
+    } else if (sampler->iface == &llama_sampler_dist_i) {
+        auto * ctx = (llama_sampler_dist *) sampler->ctx;
+        if (get) {
+            get->push_back(ctx->inp_uniforms);
+        } else if (i < set->size()) {
+            ctx->inp_uniforms = (*set)[i++];
+        }
+    }
+}
+
+std::vector<std::vector<ggml_tensor *>> llama_sampler_backend_get_inputs(llama_sampler * sampler) {
+    std::vector<std::vector<ggml_tensor *>> res;
+    size_t i = 0;
+    llama_sampler_backend_inputs_walk(sampler, &res, nullptr, i);
+    return res;
+}
+
+void llama_sampler_backend_set_inputs(llama_sampler * sampler, const std::vector<std::vector<ggml_tensor *>> & inputs) {
+    size_t i = 0;
+    llama_sampler_backend_inputs_walk(sampler, nullptr, &inputs, i);
+}
+
+void llama_sampler_set_pos(struct llama_sampler * smpl, llama_pos pos) {
+    GGML_ASSERT(smpl != nullptr);
+
+    if (smpl->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) smpl->ctx;
+        for (auto & entry : chain->samplers) {
+            llama_sampler_set_pos(entry.ptr, pos);
+        }
+    } else if (smpl->iface == &llama_sampler_dist_i) {
+        auto * ctx = (llama_sampler_dist *) smpl->ctx;
+
+        // splitmix64 of (seed, pos): the draw depends on the position only, not on how many draws came before
+        uint64_t x = ((uint64_t) ctx->seed_cur << 32) ^ (uint64_t) (uint32_t) pos;
+        x += 0x9e3779b97f4a7c15ULL;
+        x  = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x  = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        x ^=  x >> 31;
+
+        ctx->pos_keyed = true;
+        ctx->rng_backend.seed((uint32_t) (x ^ (x >> 32)));
+        ctx->n_backend_draws_generated = 0;
     }
 }
 
