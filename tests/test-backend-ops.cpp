@@ -12549,6 +12549,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Flint's one-token decode (head size 128, 4 KV heads of 8 query heads each, the K and V caches as permuted views):
+    // the Pascal decode attention kernel (fattn-pascal.cu; GGML_CUDA_FATTN_PASCAL=2 runs it on any GPU) takes these with
+    // a padded KV length, also with large logits (the online softmax rescales) and with 8 KV heads (two block columns);
+    // two tokens, an unpadded length and ALiBi fall through to the stock kernels
+    for (int kv : { 256, 768, 1280, 8192 }) {
+        for (bool sinks : { false, true }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 1, true, sinks, 0, 0, GGML_PREC_F32,
+                                                            GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128, 4, {8, 1}, kv, 1, true, sinks, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {8, 1},  512, 1, true,  true,  0,    0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  256, 1, false, true,  0,    0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  256, 2, true,  true,  0,    0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  113, 1, true,  true,  0,    0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1},  256, 1, true,  false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -13196,6 +13214,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
+    }
+
+    // Flint's one-token decode attention per layer call (4 KV heads of 8 query heads, head size 128, F16 cache viewed as
+    // in the KV cache, sinks): the Pascal decode kernel against the stock ones (GGML_CUDA_FATTN_PASCAL=0/1)
+    for (int kv : { 256, 768, 8192, 32768, 131072 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32,
+                                                        GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

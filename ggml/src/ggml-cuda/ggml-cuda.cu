@@ -773,6 +773,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(q8_1_row.buf));
     }
     ggml_cuda_moe_persistent_free(*this);
+    if (fattn_pascal.counters != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(fattn_pascal.counters));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
