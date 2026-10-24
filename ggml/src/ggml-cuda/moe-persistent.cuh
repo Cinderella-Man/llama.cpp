@@ -17,11 +17,26 @@
 // github.com/Cinderella-Man/llms-on-crypto-mining-rigs has the prototype and the argument why it cannot deadlock.
 //
 // GGML_CUDA_PERSISTENT_MOE:       0 off (default), 1 compute capability 6.1, 2 any NVIDIA GPU (for testing)
-// GGML_CUDA_PERSISTENT_MOE_CHECK: 1 runs the per-op path as well and compares ffn_out bit for bit on the device; the
-//                                 counts are logged per graph evaluation (CUDA graphs are off in this mode)
+// GGML_CUDA_PERSISTENT_MOE_CHECK: 1 runs the per-op path as well and compares its results bit for bit on the device
+//                                 with the kernel's: router logits, expert ids and weights, routed activations, routed
+//                                 down outputs, shared activations and ffn_out; the counts are logged per graph
+//                                 evaluation (CUDA graphs are off in this mode)
 // GGML_CUDA_PERSISTENT_MOE_GRID:  N blocks per launch instead of the resident maximum (for testing)
 // GGML_CUDA_PERSISTENT_MOE_FAULT: a deliberate error, to show the tests catch one: 1 a wait that times out, 2 routing
 //                                 weights off by 1e-4, 3 the shared expert missing from ffn_out
+
+// the per-op path's results that check mode compares with the kernel's
+enum ggml_cuda_moe_stage {
+    GGML_CUDA_MOE_STAGE_LOGITS,  // router logits [n_expert]
+    GGML_CUDA_MOE_STAGE_IDS,     // selected experts [n_expert_used] (the first entries of a row of n_expert)
+    GGML_CUDA_MOE_STAGE_WEIGHTS, // routing weights [n_expert_used]
+    GGML_CUDA_MOE_STAGE_ACT,     // routed SwiGLU outputs [n_ff_exp, n_expert_used]
+    GGML_CUDA_MOE_STAGE_DOWN,    // routed down outputs [n_embd, n_expert_used]
+    GGML_CUDA_MOE_STAGE_SACT,    // shared SwiGLU output [n_ff_shexp]
+    GGML_CUDA_MOE_STAGE_MOE,     // weighted sum of the routed experts [n_embd]
+    GGML_CUDA_MOE_STAGE_OUT,     // ffn_out [n_embd]
+    GGML_CUDA_MOE_STAGE_COUNT,
+};
 
 struct ggml_cuda_moe_layer {
     const ggml_tensor * x         = nullptr; // layer input (residual stream), F32 [n_embd]
@@ -37,7 +52,9 @@ struct ggml_cuda_moe_layer {
     float               eps       = 0.0f;
     float               clamp_val = 0.0f;    // lower bound of the routing weights' sum
     float               scale_val = 1.0f;    // routing weight scale
+    int                 router_prec = 0;     // ggml_prec of the router product (F16 accumulates in half where fast)
     int                 n_nodes   = 0;       // graph nodes from the RMS norm to dst, foreign view nodes included
+    const ggml_tensor * stage[GGML_CUDA_MOE_STAGE_COUNT] = {}; // the per-op path's nodes, for check mode
 };
 
 // whether the kernel is switched on for a device of compute capability cc

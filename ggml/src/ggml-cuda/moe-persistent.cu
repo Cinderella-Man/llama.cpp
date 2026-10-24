@@ -5,7 +5,10 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdlib>
+#include <cstring>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 // Layer shapes the kernel is built for (Flint).
 #define MOEP_H   2048 // hidden size
@@ -73,10 +76,12 @@ struct moep_scratch {
     static constexpr size_t sq      = sact    + FS * sizeof(float);                // block_q8_1 [FS/32]
     static constexpr size_t sd      = sq      + FS / QK8_1 * sizeof(block_q8_1);   // float [H]
     static constexpr size_t check   = sd      + H * sizeof(float);                 // float [H]: check mode output
-    static constexpr size_t size    = check   + H * sizeof(float);
+    static constexpr size_t moe     = check   + H * sizeof(float);                 // float [H]: check mode routed sum
+    static constexpr size_t size    = moe     + H * sizeof(float);
 };
 
-enum moep_router_type { MOEP_ROUTER_F32 = 0, MOEP_ROUTER_F16 = 1, MOEP_ROUTER_BF16 = 2 };
+// F16_HACC: F16 weights accumulated in half2, as mul_mat_vec_f does where FP16 is fast (not on a compute 6.1 build)
+enum moep_router_type { MOEP_ROUTER_F32 = 0, MOEP_ROUTER_F16 = 1, MOEP_ROUTER_BF16 = 2, MOEP_ROUTER_F16_HACC = 3 };
 
 struct moep_args {
     const float * x;          // layer input (residual stream)
@@ -89,6 +94,7 @@ struct moep_args {
     const char  * up_sh;
     const char  * down_sh;
     float       * out;        // ffn_out
+    float       * moe;        // check mode: the routed experts' weighted sum, else nullptr
     char        * buf;        // counters, then scratch
     unsigned    * err;        // mapped host word: a wait timed out
     int           router_type;
@@ -123,12 +129,27 @@ static __device__ __forceinline__ float moep_rms_apply(const float scale, const 
 }
 
 // One thread's partial dot product of a router row (T = float, half or nv_bfloat16) with the normed input, which xn2(c)
-// returns as a float2 for columns 2c and 2c + 1; columns c = tid, tid + 256, ... (mul_mat_vec_f, FP32 accumulation).
-template <typename T, typename XN2>
+// returns as a float2 for columns 2c and 2c + 1; columns c = tid, tid + 256, ... (mul_mat_vec_f: FP32 accumulation, or
+// half2 accumulation of F16 weights with hacc).
+template <typename T, bool hacc, typename XN2>
 static __device__ __forceinline__ float moep_router_partial(const T * x, const XN2 & xn2, const int tid) {
     constexpr int ncols2 = H / 2;
     float sumf = 0.0f;
-    if constexpr (std::is_same_v<T, float>) {
+    if constexpr (hacc) {
+#ifdef FP16_AVAILABLE
+        const half2 * x2 = (const half2 *) x;
+        half2 sumh2 = make_half2(0.0f, 0.0f);
+#pragma unroll
+        for (int col2 = tid; col2 < ncols2; col2 += 256) {
+            const half2  tmpx = __ldg(x2 + col2);
+            const float2 tmpy = xn2(col2);
+            sumh2 += tmpx * make_half2(tmpy.x, tmpy.y);
+        }
+        sumf = __low2float(sumh2) + __high2float(sumh2);
+#else
+        NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+    } else if constexpr (std::is_same_v<T, float>) {
         const float2 * x2 = (const float2 *) x;
 #pragma unroll
         for (int col2 = tid; col2 < ncols2; col2 += 256) {
@@ -163,12 +184,12 @@ static __device__ __forceinline__ float moep_router_partial(const T * x, const X
 
 // One router row computed by one warp standing in for mul_mat_vec_f's 256-thread block: each lane takes the columns of
 // eight of the block's threads, then the same two butterfly reductions (per warp, then over the eight warp sums).
-template <typename T, typename XN2>
+template <typename T, bool hacc, typename XN2>
 static __device__ __forceinline__ float moep_router_row(const T * xr, const XN2 & xn2, const int lane) {
     float s[8];
 #pragma unroll
     for (int vw = 0; vw < 8; ++vw) {
-        s[vw] = moep_router_partial<T>(xr, xn2, vw * WARP_SIZE + lane);
+        s[vw] = moep_router_partial<T, hacc>(xr, xn2, vw * WARP_SIZE + lane);
     }
 #pragma unroll
     for (int vw = 0; vw < 8; ++vw) {
@@ -578,10 +599,16 @@ static __global__ void k_moe_layer(const moep_args a) {
         }
         if (lane < CR) {
             const int r = g * CR + lane;
-            float sum = __ldcg(&dexp[r]) * w[0]; // no expert scale in the matched graph: its factor 1 is exact
+            // moe_weighted_reduction_f32 compiles to a rounded first product and one FMA per further expert (its
+            // (expert * scale) * weight with scale 1, exact); written out, so that the compiler can't fuse the first
+            // product into the second sum instead
+            float sum = __fmul_rn(__ldcg(&dexp[r]), w[0]);
 #pragma unroll
             for (int e = 1; e < KU; ++e) {
-                sum += __ldcg(&dexp[e * H + r]) * w[e];
+                sum = __fmaf_rn(__ldcg(&dexp[e * H + r]), w[e], sum);
+            }
+            if (a.moe != nullptr) {
+                a.moe[r] = sum;
             }
             float result = a.fault == 3 ? 0.0f : __ldcg(&sd[r]);
             result += sum;
@@ -605,11 +632,13 @@ static __global__ void k_moe_layer(const moep_args a) {
                 const int row = (item - I_RT) * RT_ROWS + k;
                 float sumf;
                 if (a.router_type == MOEP_ROUTER_F16) {
-                    sumf = moep_router_row<half>((const half *) a.router + (int64_t) row * H, xn2, lane);
+                    sumf = moep_router_row<half, false>((const half *) a.router + (int64_t) row * H, xn2, lane);
+                } else if (a.router_type == MOEP_ROUTER_F16_HACC) {
+                    sumf = moep_router_row<half, true>((const half *) a.router + (int64_t) row * H, xn2, lane);
                 } else if (a.router_type == MOEP_ROUTER_BF16) {
-                    sumf = moep_router_row<nv_bfloat16>((const nv_bfloat16 *) a.router + (int64_t) row * H, xn2, lane);
+                    sumf = moep_router_row<nv_bfloat16, false>((const nv_bfloat16 *) a.router + (int64_t) row * H, xn2, lane);
                 } else {
-                    sumf = moep_router_row<float>((const float *) a.router + (int64_t) row * H, xn2, lane);
+                    sumf = moep_router_row<float, false>((const float *) a.router + (int64_t) row * H, xn2, lane);
                 }
                 if (lane == 0) {
                     logits[row] = sumf;
@@ -834,6 +863,18 @@ static __global__ void k_moep_compare(const uint32_t * a, const uint32_t * b, co
     }
 }
 
+// check mode: the per-op path's nodes still to be compared with the kernel's scratch, per context (the layers of one
+// context run one after another on its main stream)
+struct moep_pending {
+    const ggml_tensor * node;
+    size_t              offset; // in the context's buffer
+    int                 n;      // 32-bit words
+    int                 stage;
+};
+static std::unordered_map<const ggml_backend_cuda_context *, std::vector<moep_pending>> moep_check_pending;
+
+constexpr int MOEP_ERR_WORDS = 2 + GGML_CUDA_MOE_STAGE_COUNT; // [0] timeout, [1] unused, [2 + stage] layers differing
+
 static void moep_alloc(ggml_backend_cuda_context & ctx) {
     auto & st = ctx.moe_persistent;
     if (st.buf != nullptr) {
@@ -844,8 +885,8 @@ static void moep_alloc(ggml_backend_cuda_context & ctx) {
     ggml_cuda_set_device(ctx.device);
     CUDA_CHECK(cudaMalloc(&st.buf, moep_scratch::size));
     CUDA_CHECK(cudaMemsetAsync(st.buf, 0, moep_scratch::size, ctx.stream()));
-    CUDA_CHECK(cudaHostAlloc((void **) &st.err_host, 2 * sizeof(unsigned), cudaHostAllocMapped));
-    st.err_host[0] = st.err_host[1] = 0;
+    CUDA_CHECK(cudaHostAlloc((void **) &st.err_host, MOEP_ERR_WORDS * sizeof(unsigned), cudaHostAllocMapped));
+    memset(st.err_host, 0, MOEP_ERR_WORDS * sizeof(unsigned));
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &st.err_dev, st.err_host, 0));
 }
 
@@ -921,9 +962,15 @@ void ggml_cuda_op_moe_persistent(ggml_backend_cuda_context & ctx, const ggml_cud
     a.up_sh       = (const char *) L.up_sh->data;
     a.down_sh     = (const char *) L.down_sh->data;
     a.out         = check ? (float *) ((char *) st.buf + moep_scratch::check) : (float *) L.dst->data;
+    a.moe         = check ? (float *) ((char *) st.buf + moep_scratch::moe) : nullptr;
     a.buf         = (char *) st.buf;
     a.err         = st.err_dev;
-    a.router_type = L.router->type == GGML_TYPE_F16 ? MOEP_ROUTER_F16 : L.router->type == GGML_TYPE_BF16 ? MOEP_ROUTER_BF16 : MOEP_ROUTER_F32;
+    if (L.router->type == GGML_TYPE_F16) {
+        const bool hacc = fast_fp16_available(ggml_cuda_info().devices[ctx.device].cc) && L.router_prec == GGML_PREC_DEFAULT;
+        a.router_type = hacc ? MOEP_ROUTER_F16_HACC : MOEP_ROUTER_F16;
+    } else {
+        a.router_type = L.router->type == GGML_TYPE_BF16 ? MOEP_ROUTER_BF16 : MOEP_ROUTER_F32;
+    }
     a.ncols       = H;
     a.eps         = L.eps;
     a.clamp_val   = L.clamp_val;
@@ -937,19 +984,35 @@ void ggml_cuda_op_moe_persistent(ggml_backend_cuda_context & ctx, const ggml_cud
     st.n_layers++;
     if (check) {
         st.check_dst = L.dst;
+        auto & pending = moep_check_pending[&ctx];
+        pending.clear();
+        const size_t off[GGML_CUDA_MOE_STAGE_COUNT] = {
+            moep_scratch::logits, moep_scratch::ids, moep_scratch::weights, moep_scratch::act, moep_scratch::dexp,
+            moep_scratch::sact, moep_scratch::moe, moep_scratch::check };
+        const int n[GGML_CUDA_MOE_STAGE_COUNT] = { NE, KU, KU, KU * F, KU * H, FS, H, H };
+        for (int s = 0; s < GGML_CUDA_MOE_STAGE_COUNT; ++s) {
+            pending.push_back({ L.stage[s], off[s], n[s], s });
+        }
     }
 }
 
 void ggml_cuda_moe_persistent_check_node(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
     auto & st = ctx.moe_persistent;
-    if (node != st.check_dst) {
-        return;
+    auto & pending = moep_check_pending[&ctx];
+    for (auto it = pending.begin(); it != pending.end(); ) {
+        if (it->node != node) {
+            ++it;
+            continue;
+        }
+        k_moep_compare<<<1, 256, 0, ctx.stream()>>>((const uint32_t *) ((const char *) st.buf + it->offset),
+            (const uint32_t *) node->data, it->n, st.err_dev + 2 + it->stage);
+        CUDA_CHECK(cudaGetLastError());
+        it = pending.erase(it);
     }
-    k_moep_compare<<<1, 256, 0, ctx.stream()>>>(
-        (const uint32_t *) ((const char *) st.buf + moep_scratch::check), (const uint32_t *) node->data, H, st.err_dev + 1);
-    CUDA_CHECK(cudaGetLastError());
-    st.check_dst = nullptr;
-    st.n_checked++;
+    if (node == st.check_dst) {
+        st.check_dst = nullptr;
+        st.n_checked++;
+    }
 }
 
 void ggml_cuda_moe_persistent_begin_graph(ggml_backend_cuda_context & ctx) {
@@ -969,10 +1032,17 @@ void ggml_cuda_moe_persistent_end_graph(ggml_backend_cuda_context & ctx) {
         return;
     }
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
-    const unsigned n_differ = *(volatile unsigned *) &st.err_host[1];
-    st.err_host[1] = 0;
-    GGML_LOG_INFO("%s: %s: persistent MoE kernel ran %d layers, %d compared with the per-op path, %u differed\n",
-                  __func__, ctx.name.c_str(), st.n_layers, st.n_checked, n_differ);
+    unsigned n_differ[GGML_CUDA_MOE_STAGE_COUNT];
+    for (int s = 0; s < GGML_CUDA_MOE_STAGE_COUNT; ++s) {
+        n_differ[s] = *(volatile unsigned *) &st.err_host[2 + s];
+        st.err_host[2 + s] = 0;
+    }
+    GGML_LOG_INFO("%s: %s: persistent MoE kernel ran %d layers, %d compared with the per-op path, %u differed "
+                  "(logits %u, ids %u, weights %u, routed act %u, routed down %u, shared act %u, routed sum %u)\n", __func__,
+                  ctx.name.c_str(), st.n_layers, st.n_checked, n_differ[GGML_CUDA_MOE_STAGE_OUT],
+                  n_differ[GGML_CUDA_MOE_STAGE_LOGITS], n_differ[GGML_CUDA_MOE_STAGE_IDS],
+                  n_differ[GGML_CUDA_MOE_STAGE_WEIGHTS], n_differ[GGML_CUDA_MOE_STAGE_ACT],
+                  n_differ[GGML_CUDA_MOE_STAGE_DOWN], n_differ[GGML_CUDA_MOE_STAGE_SACT], n_differ[GGML_CUDA_MOE_STAGE_MOE]);
 }
 
 void ggml_cuda_moe_persistent_free(ggml_backend_cuda_context & ctx) {
