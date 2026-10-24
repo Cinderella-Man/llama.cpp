@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -725,6 +727,33 @@ static bool mmvqp_stage_act() {
     return stage;
 }
 
+// GGML_CUDA_MMVQ_PASCAL_SKIP=q4_K,q6_K: weight types (ggml type names, comma-separated) left to mul_mat_vec_q, so that
+// one binary measures each type's kernel on and off while the other types keep theirs
+static bool mmvqp_skip_type(const ggml_type type) {
+    static const std::vector<ggml_type> skip = [] {
+        std::vector<ggml_type> types;
+        const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_SKIP");
+        const std::string list = env ? env : "";
+        size_t a = 0;
+        while (a < list.size()) {
+            size_t b = list.find(',', a);
+            if (b == std::string::npos) {
+                b = list.size();
+            }
+            const std::string name = list.substr(a, b - a);
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                const char * tn = ggml_type_name((ggml_type) t);
+                if (tn && name == tn) {
+                    types.push_back((ggml_type) t);
+                }
+            }
+            a = b + 1;
+        }
+        return types;
+    }();
+    return std::find(skip.begin(), skip.end(), type) != skip.end();
+}
+
 static bool mmvqp_aligned(const void * ptr, const int64_t al) {
     return ptr == nullptr || (uintptr_t) ptr % al == 0;
 }
@@ -749,6 +778,9 @@ bool ggml_cuda_mmvq_pascal(
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
             type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K) {
+        return false;
+    }
+    if (mmvqp_skip_type(type)) {
         return false;
     }
     if (fusion.x_scale || fusion.gate_scale) {
@@ -877,6 +909,9 @@ static bool mmvqp_prepare_plain_staged(const void * vx, const ggml_type type, co
                                        const int64_t ncols_x, const int64_t nrows_x, mmvqp_args & p, int & nblocks) {
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
             type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS) {
+        return false;
+    }
+    if (mmvqp_skip_type(type)) {
         return false;
     }
     const mmvqp_shape s = mmvqp_choose(type, false);
