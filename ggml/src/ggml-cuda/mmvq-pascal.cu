@@ -631,9 +631,10 @@ static bool mmvqp_aligned(const void * ptr, const int64_t al) {
 
 } // namespace
 
+// 1 (default): compute capability 6.1 only; 2: any NVIDIA GPU (testing)
 bool ggml_cuda_mmvq_pascal_active(const int cc) {
     const int mode = mmvqp_mode();
-    return mode != 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && (mode != 1 || cc == GGML_CUDA_CC_DP4A);
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && (mode == 2 || (mode == 1 && cc == GGML_CUDA_CC_DP4A));
 }
 
 bool ggml_cuda_mmvq_pascal(
