@@ -370,6 +370,19 @@ extern "C" {
     // backends can be queued behind each other without blocking the host.
     GGML_API void                 ggml_backend_sched_set_caller_sync(ggml_backend_sched_t sched, bool caller_sync);
 
+    // How host inputs (graph inputs and tensors computed on the CPU) reach the other backends, for a scheduler with
+    // caller_sync: 0 = one synchronous copy each (the default), 1 = one asynchronous copy each on the split backend,
+    // 2 = their copies packed into one buffer per split and uploaded with one asynchronous copy from a pinned staging
+    // buffer (the host data must stay unchanged until the evaluation has finished, which caller_sync guarantees)
+    GGML_API void                 ggml_backend_sched_set_input_upload(ggml_backend_sched_t sched, int mode);
+
+    // The caller fills this input's copies on the split backends itself (for example with a device-to-device copy):
+    // the scheduler does not upload it, until skip is unset or the scheduler is reset
+    GGML_API void                 ggml_backend_sched_set_input_skip(ggml_backend_sched_t sched, struct ggml_tensor * input, bool skip);
+
+    // The copy of a graph input on a backend in the allocated graph, or NULL if no split on that backend reads it
+    GGML_API struct ggml_tensor * ggml_backend_sched_get_input_copy(ggml_backend_sched_t sched, struct ggml_tensor * input, ggml_backend_t backend);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.

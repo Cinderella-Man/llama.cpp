@@ -1046,6 +1046,18 @@ extern "C" {
                        llama_pos   pos,
                     llama_seq_id   seq_id);
 
+    // A token that is the device-sampled output of slot_src's evaluation, which may still be in flight: the id is copied
+    // between the devices into the token input of this evaluation and never reaches the host, so the host can submit a
+    // sequence's next token before its current one is sampled (llama_pipe_get_sampled(ctx, slot_src) still returns it).
+    // Needs the token embeddings on a device (LLAMA_INPUT_ON_GPU=1, the token ids then read on that device only) and a
+    // sampler that does not read the host's token history. Returns as llama_pipe_submit.
+    LLAMA_API int32_t llama_pipe_submit_fed(
+            struct llama_context * ctx,
+                         int32_t   slot,
+                         int32_t   slot_src,
+                       llama_pos   pos,
+                    llama_seq_id   seq_id);
+
     // n_tokens consecutive tokens of one sequence at pos, pos + 1, ... (a chunk slot for more than one); only the last
     // one's output is kept
     LLAMA_API int32_t llama_pipe_submit_tokens(

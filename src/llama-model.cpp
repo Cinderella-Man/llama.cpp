@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1694,6 +1695,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+    }
+
+    // LLAMA_INPUT_ON_GPU=1: the input layer goes with the first layer instead, so that the embedding lookup runs on
+    // that device: the token ids are then the only per-token input of the embeddings, and a token sampled on a device
+    // can be fed to the next evaluation without the host (llama_pipe_submit_fed)
+    if (const char * env = getenv("LLAMA_INPUT_ON_GPU"); env && atoi(env) != 0 && n_layer_all > 0 &&
+            pimpl->dev_layer[0].dev != cpu_dev) {
+        pimpl->dev_input = pimpl->dev_layer[0];
+        LLAMA_LOG_INFO("%s: input layer assigned to device %s (LLAMA_INPUT_ON_GPU)\n", __func__,
+                ggml_backend_dev_name(pimpl->dev_input.dev));
     }
 
     // assign the output layer
