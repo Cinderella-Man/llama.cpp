@@ -1347,7 +1347,14 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    // the mask built on the device: its input (can_reuse or the graph build pointed it at this step's cache context)
+    if (inp_attn->kq_dev.upd && inp_attn->kq_dev.upd->buffer) {
+        inp_attn->kq_dev.set_input(ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1380,7 +1387,16 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    // the mask built on the device or on the host, as the new ubatch needs, and the same shapes
+    const bool kq_mask_dev = llama_kq_mask_on_device(params.hparams, params.cparams, params.ubatch) &&
+        mctx->get_attn()->get_kq_cells_resident();
+    res &= kq_mask_dev == (inp_attn->kq_dev.upd != nullptr);
+    if (inp_attn->kq_dev.upd) {
+        inp_attn->kq_dev.caches[0].mctx = mctx->get_attn();
+        res &= inp_attn->kq_dev.can_reuse(params.ubatch, params.cparams);
+    } else {
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -4273,7 +4289,9 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    // the attention part builds its mask on the devices as a plain KV cache does (LLAMA_GPU_KQ_MASK)
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), /*kq_mask_dev =*/ true,
+            [this](ggml_tensor * t, const char * name, int i) { cb(t, name, i); });
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
