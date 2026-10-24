@@ -19,6 +19,9 @@
 //   --pipe-guess G          none
 //                           copy: the token after the longest earlier match of the history's suffix, if that match is
 //                             at least --pipe-copy-min tokens long (history includes the guesses in flight)
+//                           cont: the copy lookup if it finds a match of at least --pipe-copy-min, else the most
+//                             frequent continuation of the longest 1-8-token context in the request so far (prompt
+//                             and committed output) plus, with --pipe-table FILE, a table of other outputs
 //                           ngram-simple: llama.cpp's ngram-simple lookup on the same history (--spec-ngram-simple-size-n/-m)
 //                           spec: any llama.cpp drafter, --pipe-spec TYPE (e.g. ngram-map-k), drafted from committed
 //                             tokens only and consumed one guess at a time
@@ -30,6 +33,8 @@
 //   --pipe-probe N          after generation, decode N more tokens with llama_decode; their logits hash checks every KV
 //                           cell that is still visible
 //   --pipe-state-out FILE   the sequence's KV state (llama_state_seq_get_data) after generation
+//   --pipe-jsonl FILE       append {id, category, prompt_tokens, gen_tokens} (bench/ngram_replay's transcript format, for
+//                           its pipeline simulator); --pipe-cat sets the category (default chat)
 //   --pipe-trace FILE       one line per sampled token: microseconds since the first submit, guesses in flight, outcome
 //                           (h right guess behind it, m wrong, n none, p plain, r a raced sample's token)
 //   --pipe-backend-greedy   greedy sampling on the GPU (llama_set_sampler) in both modes: only the token id comes back
@@ -59,10 +64,14 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // greedy sampling on the device that computes the logits (--pipe-backend-greedy)
 static bool g_backend_greedy = false;
+
+// token file of other outputs for the continuation guesser (--pipe-table), one output per line
+static std::string g_table_path;
 
 struct pipe_job {
     std::string name     = "run";
@@ -82,6 +91,8 @@ struct pipe_job {
     std::string trace;
     int         race     = 0;
     std::string race_stop = "</think>";
+    std::string jsonl;
+    std::string cat      = "chat";
 };
 
 static bool job_set(pipe_job & j, const std::string & k, const std::string & v) {
@@ -102,6 +113,8 @@ static bool job_set(pipe_job & j, const std::string & k, const std::string & v) 
     else if (k == "trace")     { j.trace     = v; }
     else if (k == "race")      { j.race      = atoi(v.c_str()); }
     else if (k == "race_stop") { j.race_stop = v; }
+    else if (k == "jsonl")     { j.jsonl     = v; }
+    else if (k == "cat")       { j.cat       = v; }
     else {
         return false;
     }
@@ -115,7 +128,7 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
         {"--pipe-copy-min", "copy_min"}, {"--pipe-miss", "miss"}, {"--pipe-oracle", "oracle"},
         {"--pipe-prompt", "prompt"}, {"--pipe-spec", "spec"}, {"--pipe-probe", "probe"}, {"--pipe-out", "out"},
         {"--pipe-state-out", "state_out"}, {"--pipe-trace", "trace"}, {"--pipe-race", "race"},
-        {"--pipe-race-stop", "race_stop"},
+        {"--pipe-race-stop", "race_stop"}, {"--pipe-jsonl", "jsonl"}, {"--pipe-cat", "cat"},
     };
     int j = 1;
     for (int i = 1; i < argc; i++) {
@@ -137,7 +150,9 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
             return false;
         }
         const std::string v = argv[++i];
-        if (a == "--pipe-jobs") {
+        if (a == "--pipe-table") {
+            g_table_path = v;
+        } else if (a == "--pipe-jobs") {
             jobs_file = v;
         } else if (a == "--pipe-slots") {
             n_slots = atoi(v.c_str());
@@ -204,14 +219,14 @@ struct row_sampler {
     }
 };
 
-// the token after the longest earlier occurrence of the history's suffix (the most recent one on ties), or -1 if
-// that occurrence is shorter than min_match
+// the token after the longest earlier occurrence of the history's suffix, up to 12 tokens long (the most recent one on
+// ties), or -1 if that occurrence is shorter than min_match; the same lookup as bench/ngram_replay's simulator
 static llama_token copy_guess(const std::vector<llama_token> & h, int min_match) {
     const int n = (int) h.size();
     if (n < 2) {
         return -1;
     }
-    const int max_len = 64;
+    const int max_len = 12;
     int best_len = 0;
     int best_end = -1;
     for (int i = n - 2; i >= 0; --i) {
@@ -234,6 +249,112 @@ static llama_token copy_guess(const std::vector<llama_token> & h, int min_match)
         return -1;
     }
     return h[best_end + 1];
+}
+
+// counts of the token after every 1..8-token context of a token history
+struct cont_counts {
+    static constexpr int max_ctx = 8;
+
+    std::unordered_map<uint64_t, std::vector<std::pair<llama_token, int32_t>>> counts;
+    size_t n_counted = 0; // tokens of the history already counted
+
+    static uint64_t key(const llama_token * p, int n) {
+        return fnv1a(p, n*sizeof(llama_token)) ^ (uint64_t) n;
+    }
+
+    // count the tokens of h from n_counted on
+    void update(const std::vector<llama_token> & h) {
+        for (size_t j = std::max<size_t>(n_counted, 1); j < h.size(); j++) {
+            for (int ln = 1; ln <= max_ctx && ln <= (int) j; ln++) {
+                auto & v = counts[key(&h[j - ln], ln)];
+                bool found = false;
+                for (auto & e : v) {
+                    if (e.first == h[j]) {
+                        e.second++;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    v.push_back({ h[j], 1 });
+                }
+            }
+        }
+        n_counted = h.size();
+    }
+
+    const std::vector<std::pair<llama_token, int32_t>> * get(uint64_t k) const {
+        const auto it = counts.find(k);
+        return it == counts.end() ? nullptr : &it->second;
+    }
+};
+
+// the most frequent continuation (summed over the request's counts and the table's; the first seen on ties) of the
+// longest context at the end of ctx that either has seen, or -1
+static llama_token cont_guess(const cont_counts & req, const cont_counts * table, const std::vector<llama_token> & ctx) {
+    const int n = (int) ctx.size();
+    for (int ln = std::min(cont_counts::max_ctx, n); ln >= 1; ln--) {
+        const uint64_t k = cont_counts::key(&ctx[n - ln], ln);
+        const auto * t = table ? table->get(k) : nullptr;
+        const auto * r = req.get(k);
+        if (!t && !r) {
+            continue;
+        }
+        std::vector<std::pair<llama_token, int32_t>> sum;
+        for (const auto * v : { t, r }) {
+            if (!v) {
+                continue;
+            }
+            for (const auto & e : *v) {
+                bool found = false;
+                for (auto & x : sum) {
+                    if (x.first == e.first) {
+                        x.second += e.second;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    sum.push_back(e);
+                }
+            }
+        }
+        llama_token best = -1;
+        int32_t     bc   = 0;
+        for (const auto & x : sum) {
+            if (x.second > bc) {
+                best = x.first;
+                bc   = x.second;
+            }
+        }
+        return best;
+    }
+    return -1;
+}
+
+// the continuation table of --pipe-table: counts within each line (output) of the file
+static const cont_counts * cont_table() {
+    static cont_counts table;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        std::ifstream f(g_table_path);
+        std::string line;
+        size_t n_tok = 0;
+        while (std::getline(f, line)) {
+            std::istringstream ss(line);
+            std::vector<llama_token> toks;
+            long t;
+            while (ss >> t) {
+                toks.push_back((llama_token) t);
+            }
+            table.n_counted = 0;
+            table.update(toks);
+            n_tok += toks.size();
+        }
+        LOG_INF("%s: continuation table of %zu tokens, %zu contexts\n", __func__, n_tok, table.counts.size());
+    }
+    return g_table_path.empty() ? nullptr : &table;
 }
 
 static std::vector<llama_token> read_tokens(const std::string & path) {
@@ -625,6 +746,9 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             common_speculative_begin(spec, 0, prompt_tgt);
         }
 
+        // the request's own continuation counts (guess "cont"), over committed tokens only
+        cont_counts req_counts;
+
         // history including the guesses in flight
         auto hist_inflight = [&]() {
             std::vector<llama_token> h(hist);
@@ -650,6 +774,15 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             }
             if (job.guess == "copy") {
                 return copy_guess(hist_inflight(), job.copy_min);
+            }
+            if (job.guess == "cont") {
+                const std::vector<llama_token> h = hist_inflight();
+                const llama_token g = copy_guess(h, job.copy_min);
+                if (g >= 0) {
+                    return g;
+                }
+                req_counts.update(hist);
+                return cont_guess(req_counts, cont_table(), h);
             }
             if (job.guess == "ngram-simple") {
                 std::vector<llama_token> h = hist_inflight();
@@ -779,6 +912,20 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         for (size_t i = 0; i < gen.size(); i++) {
             fprintf(f, "%zu %d %016" PRIx64 "\n", i, gen[i], hashes[i]);
         }
+        fclose(f);
+    }
+
+    if (!job.jsonl.empty()) {
+        FILE * f = fopen(job.jsonl.c_str(), "a");
+        auto list = [&](const std::vector<llama_token> & v) {
+            std::string r = "[";
+            for (size_t i = 0; i < v.size(); i++) {
+                r += (i ? ", " : "") + std::to_string(v[i]);
+            }
+            return r + "]";
+        };
+        fprintf(f, "{\"id\": \"%s\", \"category\": \"%s\", \"prompt_tokens\": %s, \"gen_tokens\": %s}\n",
+                job.name.c_str(), job.cat.c_str(), list(inp).c_str(), list(gen).c_str());
         fclose(f);
     }
 
