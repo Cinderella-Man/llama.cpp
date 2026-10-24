@@ -103,7 +103,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_PASCAL_DP4A, // code for compute capability 6.1 (5-SM P106-090 class): the generic table, 2 warps at one token
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -119,10 +120,31 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif __CUDA_ARCH__ == GGML_CUDA_CC_DP4A
+    return MMVQ_PARAMETERS_PASCAL_DP4A;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void mmvq_arch_probe() {}
+
+// The architecture the current device's kernels were compiled for (the PTX virtual architecture of the code it runs),
+// which picks the device-side table above. It is the highest compiled architecture up to the device's, except under
+// CUDA_FORCE_PTX_JIT=1, where the driver compiles the PTX instead of loading machine code (tests run the compute_61 PTX
+// on newer GPUs that way); the host must pick the same table, since the kernels' warp counts are compile-time.
+static int mmvq_device_code_arch() {
+    static int arch[GGML_CUDA_MAX_DEVICES] = {};
+    const int device = ggml_cuda_get_device();
+    if (arch[device] == 0) {
+        cudaFuncAttributes attr;
+        CUDA_CHECK(cudaFuncGetAttributes(&attr, mmvq_arch_probe));
+        arch[device] = 10 * attr.ptxVersion;
+    }
+    return arch[device];
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
@@ -137,6 +159,11 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && mmvq_device_code_arch() == GGML_CUDA_CC_DP4A) {
+        return MMVQ_PARAMETERS_PASCAL_DP4A;
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
     }
@@ -453,12 +480,18 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (table_id == MMVQ_PARAMETERS_PASCAL_DP4A) {
+        // 5-SM Pascal cards at one token: 2 warps per block for wide rows (llama.cpp PR #25479); the generic shape
+        // otherwise, including 4 warps for the small-K shapes, where 2 warps are slower (81 against 43 GB/s for a
+        // Q8_0 expert down-projection at K = 512 on a P106-090)
+        if (ncols_dst == 1 && !small_k) {
+            return 2;
+        }
+        table_id = MMVQ_PARAMETERS_GENERIC;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
-                // 5-SM Pascal cards at one token: 2 warps per block for rows of >= 2048 values (llama.cpp PR #25479),
-                // the stock 4 warps for the small-K shapes, where 2 warps are slower (this build targets sm_61 only)
-                return small_k ? 4 : 2;
             case 2:
             case 3:
             case 4:
@@ -599,6 +632,9 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_PASCAL_DP4A) {
+        table_id = MMVQ_PARAMETERS_GENERIC;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
