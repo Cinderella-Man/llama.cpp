@@ -65,6 +65,11 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // staircase drafter (llama_pipe_draft_*): layer inputs the pipe evaluations copy out (kept as graph outputs), and
+    // whether a micro-batch with fewer outputs than tokens also computes every position's final hidden state
+    std::vector<bool> pipe_tap_layer; // [n_layer() + 1]
+    bool              pipe_embd_all = false;
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

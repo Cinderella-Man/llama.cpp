@@ -217,6 +217,7 @@ llama_context::llama_context(
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
+    cparams.pipe_tap_layer.resize(hparams.n_layer() + 1, false);
 
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
@@ -619,6 +620,7 @@ llama_context::~llama_context() {
             ggml_backend_event_free(slot.ev_out);
         }
     }
+    pipe_drafter.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1828,6 +1830,68 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
     return 0;
 }
 
+int32_t llama_context::pipe_draft_init(const llama_pipe_draft_params & params) {
+    if (params.path == nullptr) {
+        LLAMA_LOG_ERROR("%s: no drafter file\n", __func__);
+        return -1;
+    }
+    // the drafter's device: the params.device-th GPU, or the first layer's device
+    ggml_backend_dev_t dev = nullptr;
+    if (params.device >= 0) {
+        int32_t k = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU && k++ == params.device) {
+                dev = d;
+                break;
+            }
+        }
+    } else {
+        dev = model.dev_layer(0);
+    }
+    if (dev == nullptr) {
+        LLAMA_LOG_ERROR("%s: no device %d for the drafter\n", __func__, params.device);
+        return -1;
+    }
+
+    synchronize();
+    pipe_drain();
+
+    auto d = llama_pipe_drafter::load(params, model.tok_embd, dev);
+    if (!d) {
+        return -1;
+    }
+    for (int32_t l : d->tap_layers()) {
+        if (l <= 0 || l >= (int32_t) cparams.pipe_tap_layer.size() - 1) {
+            LLAMA_LOG_ERROR("%s: the drafter reads layer %d, the model has %u layers\n", __func__, l, model.hparams.n_layer());
+            return -1;
+        }
+        cparams.pipe_tap_layer[l] = true;
+    }
+    pipe_drafter = std::move(d);
+    pipe_drafter->reset(-1, 0);
+
+    // graphs are built again, with the taps kept as outputs
+    gf_res_prev_active = nullptr;
+    for (auto & slot : pipe_slots) {
+        slot.res_valid = false;
+    }
+    return 0;
+}
+
+void llama_context::pipe_draft_reset(llama_seq_id seq_id, llama_pos n_keep) {
+    if (!pipe_drafter) {
+        return;
+    }
+    pipe_drafter->reset(seq_id, n_keep);
+    // prompt micro-batches of an active drafter also compute every position's final hidden state
+    const bool all = seq_id >= 0;
+    if (cparams.pipe_embd_all != all) {
+        cparams.pipe_embd_all = all;
+        gf_res_prev_active = nullptr;
+    }
+}
+
 int32_t llama_context::pipe_submit(int32_t i_slot, const llama_token * tokens, int32_t n_tokens, llama_pos pos, llama_seq_id seq_id) {
     return pipe_submit_impl(i_slot, tokens, n_tokens, pos, seq_id, -1);
 }
@@ -2014,6 +2078,11 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
         LLAMA_LOG_ERROR("%s: graph compute failed with status %d\n", __func__, status);
         memory->seq_rm(seq_id, pos, -1);
         return -3;
+    }
+
+    // the staircase drafter's taps: each device copies out its anchors right after its work for this token
+    if (pipe_drafter && n_tokens == 1 && i_slot_src < 0) {
+        pipe_drafter->on_submit(i_slot, tokens[0], pos, seq_id, slot.res.get(), slot.sched.get());
     }
 
     // with a backend sampler only the sampled token comes back, otherwise the logits
@@ -2547,6 +2616,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        // the staircase drafter commits this micro-batch's positions of its sequence
+        if (pipe_drafter) {
+            pipe_drafter->on_ubatch(ubatch, res, sched.get());
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -5203,6 +5277,47 @@ llama_token llama_pipe_get_sampled(llama_context * ctx, int32_t slot) {
 
 void llama_pipe_drain(llama_context * ctx) {
     ctx->pipe_drain();
+}
+
+llama_pipe_draft_params llama_pipe_draft_default_params(void) {
+    llama_pipe_draft_params p = {
+        /*.path   =*/ nullptr,
+        /*.device =*/ -1,
+        /*.n_ctx  =*/ 4096,
+        /*.n_rows =*/ 8,
+        /*.alpha  =*/ 0.0f,
+        /*.top_k  =*/ 16,
+        /*.stair  =*/ nullptr,
+    };
+    return p;
+}
+
+int32_t llama_pipe_draft_init(llama_context * ctx, llama_pipe_draft_params params) {
+    return ctx->pipe_draft_init(params);
+}
+
+bool llama_pipe_draft_ready(const llama_context * ctx) {
+    return ctx->get_pipe_drafter() != nullptr;
+}
+
+void llama_pipe_draft_reset(llama_context * ctx, llama_seq_id seq_id, llama_pos n_keep) {
+    ctx->pipe_draft_reset(seq_id, n_keep);
+}
+
+void llama_pipe_draft_commit(llama_context * ctx, llama_token token, llama_pos pos, int32_t slot) {
+    if (auto * d = ctx->get_pipe_drafter()) {
+        d->commit(token, pos, slot);
+    }
+}
+
+int32_t llama_pipe_draft_launch(llama_context * ctx, const llama_pipe_draft_row * rows, int32_t n_rows) {
+    auto * d = ctx->get_pipe_drafter();
+    return d ? d->launch(rows, n_rows) : -1;
+}
+
+llama_token llama_pipe_draft_get(llama_context * ctx, float u, float * p_top) {
+    auto * d = ctx->get_pipe_drafter();
+    return d ? d->get(u, p_top) : -1;
 }
 
 //

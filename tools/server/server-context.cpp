@@ -308,6 +308,7 @@ struct server_slot {
         int32_t     pslot;
         llama_token tok;
         llama_pos   pos;
+        bool        drafted = false; // guessed by the staircase drafter
     };
     std::deque<pipe_entry> pipe_win;
     common_pipe_guesser    pipe_guesser;
@@ -315,6 +316,9 @@ struct server_slot {
     int32_t pipe_n_guess = 0;     // this request's guesses, right guesses and wrong guesses
     int32_t pipe_n_hit   = 0;
     int32_t pipe_n_miss  = 0;
+    int32_t pipe_n_draft     = 0; // of them, the staircase drafter's guesses and right ones
+    int32_t pipe_n_draft_hit = 0;
+    llama_pos pipe_draft_pending = -1; // the position the drafter's pending launch guesses
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -461,6 +465,9 @@ struct server_slot {
         pipe_n_guess = 0;
         pipe_n_hit   = 0;
         pipe_n_miss  = 0;
+        pipe_n_draft     = 0;
+        pipe_n_draft_hit = 0;
+        pipe_draft_pending = -1;
 
         n_predict_max = -1;
 
@@ -792,8 +799,8 @@ struct server_slot {
 
         if (pipe_n_guess > 0 || pipe_draws) {
             SLT_INF(*this,
-                    "       pipelined = %10d guesses, %d right, %d wrong\n",
-                    pipe_n_guess, pipe_n_hit, pipe_n_miss);
+                    "       pipelined = %10d guesses, %d right, %d wrong; drafter %d guesses, %d right\n",
+                    pipe_n_guess, pipe_n_hit, pipe_n_miss, pipe_n_draft, pipe_n_draft_hit);
         }
 
         SLT_INF(*this,
@@ -1098,6 +1105,10 @@ private:
     common_params params_base;
 
     int32_t pipe_next = 0; // the next pipe slot to try (--pipe-depth)
+
+    // --pipe-guess staircase: the drafter is loaded, and the slot whose sequence it follows (-1: none)
+    bool         pipe_draft_on  = false;
+    llama_seq_id pipe_draft_seq = -1;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1581,6 +1592,21 @@ private:
         // pipelined speculation: pipe slots for the newest token and up to pipe_depth guesses, with room to refill
         if (params_base.pipe_depth > 0) {
             const int32_t n_pipe = 2*(params_base.pipe_depth + 1);
+            if (params_base.sampling.backend_sampling && params_base.pipe_guess == "staircase") {
+                llama_pipe_draft_params dp = llama_pipe_draft_default_params();
+                dp.path   = params_base.pipe_draft.c_str();
+                dp.device = params_base.pipe_draft_dev;
+                dp.n_ctx  = params_base.pipe_draft_ctx;
+                dp.n_rows = std::max(8, ((params_base.pipe_depth + 2 + 7)/8)*8);
+                dp.alpha  = params_base.pipe_draft_alpha;
+                dp.stair  = params_base.pipe_draft_stair.empty() ? nullptr : params_base.pipe_draft_stair.c_str();
+                if (params_base.pipe_draft.empty() || llama_pipe_draft_init(ctx_tgt, dp) != 0) {
+                    SRV_WRN("%s", "--pipe-guess staircase needs a drafter (--pipe-draft): guessing with cont\n");
+                    params_base.pipe_guess = "cont";
+                } else {
+                    pipe_draft_on = true;
+                }
+            }
             if (!params_base.sampling.backend_sampling) {
                 SRV_WRN("%s", "--pipe-depth needs backend sampling (-bs): pipelined speculation off\n");
                 params_base.pipe_depth = 0;
@@ -1593,8 +1619,10 @@ private:
                         params_base.pipe_floor, n_pipe);
                 for (auto & slot : slots) {
                     slot.pipe_draws = true;
+                    // staircase: the copy lookup first, the drafter for the rest
                     slot.pipe_guesser.kind = params_base.pipe_guess == "none" ? common_pipe_guesser::NONE :
                                              params_base.pipe_guess == "copy" ? common_pipe_guesser::COPY :
+                                             params_base.pipe_guess == "staircase" ? common_pipe_guesser::COPY :
                                                                                 common_pipe_guesser::CONT;
                     slot.pipe_guesser.min_match = params_base.pipe_copy_min;
                 }
@@ -3551,6 +3579,43 @@ private:
         llama_pipe_drain(ctx_tgt);
         slot.pipe_win.clear();
         slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - 1);
+        slot.pipe_draft_pending = -1;
+    }
+
+    // whether the staircase drafter guesses for this slot
+    bool pipe_drafts(const server_slot & slot) const {
+        return pipe_draft_on && pipe_draft_seq == slot.id;
+    }
+
+    // the guess of the copy lookup for the position after the slot's window, or -1
+    llama_token pipe_copy_guess(server_slot & slot) {
+        std::vector<llama_token> inflight;
+        for (size_t i = 1; i < slot.pipe_win.size(); i++) {
+            inflight.push_back(slot.pipe_win[i].tok);
+        }
+        return slot.pipe_guesser.guess(inflight.data(), inflight.size());
+    }
+
+    // starts the drafter on the position after the slot's window: the tokens in flight with their pipe slots
+    void pipe_draft_launch(server_slot & slot) {
+        std::vector<llama_pipe_draft_row> rows;
+        for (const auto & e : slot.pipe_win) {
+            rows.push_back({ e.tok, e.pos, e.pslot });
+        }
+        if (llama_pipe_draft_launch(ctx_tgt, rows.data(), (int32_t) rows.size()) == 0) {
+            slot.pipe_draft_pending = slot.pipe_win.back().pos + 1;
+        }
+    }
+
+    // after a submission: the drafter starts on the next position at once (unless the copy lookup has it), so that its
+    // guess is ready when a pipe slot opens
+    void pipe_draft_ahead(server_slot & slot) {
+        if (!pipe_drafts(slot) || slot.pipe_win.empty() || slot.pipe_win.back().pos + 2 >= slot.n_ctx) {
+            return;
+        }
+        if (pipe_copy_guess(slot) < 0) {
+            pipe_draft_launch(slot);
+        }
     }
 
     // submits tok at pos in a free pipe slot; false on error
@@ -3572,7 +3637,7 @@ private:
                 SLT_ERR(slot, "llama_pipe_submit failed (%d) at pos %d\n", ret, pos);
                 return false;
             }
-            slot.pipe_win.push_back({ s, tok, pos });
+            slot.pipe_win.push_back({ s, tok, pos, false });
             return true;
         }
         SLT_ERR(slot, "%s", "no free pipe slot\n");
@@ -3590,19 +3655,28 @@ private:
             if (slot.n_predict_max != -1 && (int32_t) slot.pipe_win.size() >= slot.n_remaining()) {
                 break;
             }
-            std::vector<llama_token> inflight;
-            for (size_t i = 1; i < slot.pipe_win.size(); i++) {
-                inflight.push_back(slot.pipe_win[i].tok);
+            const size_t n_inflight = slot.pipe_win.size() - 1;
+            llama_token g = pipe_copy_guess(slot);
+            bool drafted = false;
+            if (g < 0 && pipe_drafts(slot)) {
+                // the drafter's guess, drawn with the uniform the device sampler takes at the position before
+                if (slot.pipe_draft_pending != pos) {
+                    pipe_draft_launch(slot);
+                }
+                slot.pipe_draft_pending = -1;
+                g = llama_pipe_draft_get(ctx_tgt, llama_sampler_pos_uniform(common_sampler_get(slot.smpl.get()), pos - 1), nullptr);
+                drafted = g >= 0;
             }
-            llama_token g = slot.pipe_guesser.guess(inflight.data(), inflight.size());
-            if (g < 0 && (int32_t) inflight.size() < params_base.pipe_floor) {
+            if (g < 0 && (int32_t) n_inflight < params_base.pipe_floor) {
                 // a filler: almost always wrong, but it keeps the GPUs busy, so their clocks stay up
                 g = slot.pipe_win.back().tok;
             }
             if (g < 0 || !pipe_submit(slot, g, pos)) {
                 break;
             }
+            slot.pipe_win.back().drafted = drafted;
             slot.pipe_n_guess++;
+            pipe_draft_ahead(slot);
         }
     }
 
@@ -3620,12 +3694,17 @@ private:
             }
             slot.prompt.tokens.push_back(slot.sampled);
             slot.pipe_guesser.push(slot.sampled);
+            pipe_draft_ahead(slot);
         }
 
         pipe_top_up(slot);
 
         const server_slot::pipe_entry cur = slot.pipe_win.front();
         slot.pipe_win.pop_front();
+        if (pipe_drafts(slot)) {
+            // its output is about to be sampled: its row is a committed one from now on
+            llama_pipe_draft_commit(ctx_tgt, cur.tok, cur.pos, cur.pslot);
+        }
 
         llama_token id;
         {
@@ -3634,6 +3713,10 @@ private:
         }
         const bool guessed = !slot.pipe_win.empty();
         const bool hit     = guessed && slot.pipe_win.front().tok == id;
+        if (guessed && slot.pipe_win.front().drafted) {
+            slot.pipe_n_draft++;
+            slot.pipe_n_draft_hit += hit;
+        }
 
         common_sampler_accept(slot.smpl.get(), id, true);
 
@@ -3680,6 +3763,7 @@ private:
                 slot.pipe_n_miss++;
                 llama_memory_seq_rm(mem, slot.id, slot.pipe_win.front().pos, -1);
                 slot.pipe_win.clear();
+                slot.pipe_draft_pending = -1;
             }
             if (!pipe_submit(slot, id, cur.pos + 1)) {
                 abort_all_slots("pipelined decoding failed");
@@ -4479,6 +4563,12 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // the staircase drafter follows the slot that started last, from its prompt on
+                        if (pipe_draft_on) {
+                            llama_pipe_draft_reset(ctx_tgt, slot.id, n_past);
+                            pipe_draft_seq = slot.id;
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {

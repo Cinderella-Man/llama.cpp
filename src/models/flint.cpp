@@ -123,55 +123,69 @@ llama_model_flint::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, model.layers[il].attn_sinks, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
         }
+        // the feed-forward half of the layer: from the attention output and the layer input to the layer output
+        auto ffn_half = [&](ggml_tensor * att, ggml_tensor * inp) {
+            ggml_tensor * ffn_inp = ggml_add(ctx0, att, inp);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // MoE branch
+            ggml_tensor * x = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+            cb(x, "ffn_norm", il);
+
+            if ((uint32_t) il < hparams.n_layer_dense_lead) {
+                x = build_ffn(x,
+                        model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
+                        model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                        model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                cb(x, "ffn_out", il);
+            } else {
+                ggml_tensor * moe_out = build_moe_ffn(x,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il, nullptr, nullptr,
+                    model.layers[il].ffn_up_exps_s,
+                    model.layers[il].ffn_gate_exps_s,
+                    model.layers[il].ffn_down_exps_s);
+                cb(moe_out, "ffn_moe_out", il);
+
+                {
+                    ggml_tensor * ffn_shexp =
+                        build_ffn(x,
+                            model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                            model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                            model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                            NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    cb(ffn_shexp, "ffn_shexp", il);
+
+                    x = ggml_add(ctx0, moe_out, ffn_shexp);
+                    cb(x, "ffn_out", il);
+                }
+            }
+            return ggml_add(ctx0, x, ffn_inp);
+        };
+
         if (il == n_layer - 1 && inp_out_ids) {
+            if (cparams.pipe_embd_all) {
+                // the staircase drafter's committed rows need the final hidden state of every position: the last
+                // layer's feed-forward half once more for all of them, next to the output rows' own path below
+                ggml_tensor * all = ffn_half(cur, inpSA);
+                res->t_embd_all = build_norm(all, model.output_norm, NULL, LLM_NORM_RMS, -1);
+                ggml_set_name(res->t_embd_all, "result_norm_all");
+                // nothing below reads it: put it in the graph explicitly
+                ggml_build_forward_expand(gf, res->t_embd_all);
+            }
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
-        cb(ffn_inp, "ffn_inp", il);
-
-        // MoE branch
-        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
-
-        if ((uint32_t) il < hparams.n_layer_dense_lead) {
-            cur = build_ffn(cur,
-                    model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
-                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-                    model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
-                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(cur, "ffn_out", il);
-        } else {
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il, nullptr, nullptr,
-                model.layers[il].ffn_up_exps_s,
-                model.layers[il].ffn_gate_exps_s,
-                model.layers[il].ffn_down_exps_s);
-            cb(moe_out, "ffn_moe_out", il);
-
-            {
-                ggml_tensor * ffn_shexp =
-                    build_ffn(cur,
-                        model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                        model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                        model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
-                cb(ffn_shexp, "ffn_shexp", il);
-
-                cur = ggml_add(ctx0, moe_out, ffn_shexp);
-                cb(cur, "ffn_out", il);
-            }
-        }
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        cur = ffn_half(cur, inpSA);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);

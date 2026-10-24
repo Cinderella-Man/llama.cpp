@@ -651,6 +651,11 @@ struct common_params {
     std::string pipe_guess     = "cont"; // none, copy or cont (common_pipe_guesser)
     int32_t     pipe_copy_min  = 4;      // shortest copy match that makes a guess
     int32_t     pipe_floor     = 0;      // guesses kept in flight with a filler token when the guesser has none
+    std::string pipe_draft;              // staircase drafter file for --pipe-guess staircase (llama_pipe_draft_*)
+    int32_t     pipe_draft_dev   = -1;   // its GPU (-1: the first layer's)
+    int32_t     pipe_draft_ctx   = 4096; // committed positions it attends to
+    float       pipe_draft_alpha = 0.0f; // q^alpha for its draw (<= 0: the file's value)
+    std::string pipe_draft_stair;        // anchors of the tokens in flight, newest first (empty: the file's)
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.

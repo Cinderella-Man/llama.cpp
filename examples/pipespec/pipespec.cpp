@@ -27,6 +27,11 @@
 //                             tokens only and consumed one guess at a time
 //                           oracle: the tokens of a reference run (--pipe-oracle FILE from --pipe-out), with a share
 //                             --pipe-miss of the guesses made wrong on purpose (deterministic per position)
+//                           staircase: the copy lookup if it finds a match of at least --pipe-copy-min, else the
+//                             staircase drafter of --pipe-draft FILE (llama_pipe_draft_*), launched right after each
+//                             submission so that its guess is ready when a slot opens; with --pipe-backend-sample its
+//                             guess is drawn with the sampler's own uniform for that position, else it is the head's
+//                             most likely token
 //   --pipe-prompt FILE      prompt file (default: -p / -f)
 //   --pipe-chat             wrap the prompt as one user message with the model's chat template
 //   --pipe-out FILE         one line per generated token: index, token id, FNV-1a hash of the logits it was sampled from
@@ -61,6 +66,10 @@
 //                           device: a sequence's next token is submitted before its current token is sampled, fed on
 //                           the devices from that token's sampled output (llama_pipe_submit_fed; run with
 //                           LLAMA_INPUT_ON_GPU=1), so the host stays one token ahead instead of waiting in between
+// Staircase drafter options (one drafter per run): --pipe-draft FILE, --pipe-draft-dev N (GPU index; default: the first
+// layer's), --pipe-draft-ctx N (committed positions it attends to, 4096), --pipe-draft-rows N (rows per guess, default
+// 8 or depth + 2 rounded up to 8), --pipe-draft-alpha A, --pipe-draft-topk K, --pipe-draft-stair L9,L17,... (anchors of
+// the tokens in flight, newest first; default: the file's), --pipe-draft-top1 (the head's most likely token, no draw).
 // Pipe and streams jobs also report the host time per generated token: inside the submit calls (host_submit_us), inside
 // the waits for results (host_wait_us) and the rest (host_rest_us, the executor's own work).
 // LLAMA_PIPE_UPLOAD=0|1|2 sets how the slots upload their host inputs (llama-context; 2, one packed asynchronous copy
@@ -107,6 +116,13 @@ static int g_n_chunk_slots = 0;
 
 // token file of other outputs for the continuation guesser (--pipe-table), one output per line
 static std::string g_table_path;
+
+// the staircase drafter (--pipe-draft*)
+static llama_pipe_draft_params g_draft = llama_pipe_draft_default_params();
+static std::string g_draft_path;
+static std::string g_draft_stair;
+static bool        g_draft_rows_set = false;
+static bool        g_draft_top1     = false;
 
 // host time in the current job: inside the submit calls (building, uploading and launching an evaluation) and inside
 // the waits for results
@@ -220,6 +236,10 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
             g_backend_sample = true;
             continue;
         }
+        if (a == "--pipe-draft-top1") {
+            g_draft_top1 = true;
+            continue;
+        }
         if (i + 1 >= argc) {
             fprintf(stderr, "missing value for %s\n", a.c_str());
             return false;
@@ -227,6 +247,21 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
         const std::string v = argv[++i];
         if (a == "--pipe-table") {
             g_table_path = v;
+        } else if (a == "--pipe-draft") {
+            g_draft_path = v;
+        } else if (a == "--pipe-draft-dev") {
+            g_draft.device = atoi(v.c_str());
+        } else if (a == "--pipe-draft-ctx") {
+            g_draft.n_ctx = atoi(v.c_str());
+        } else if (a == "--pipe-draft-rows") {
+            g_draft.n_rows = atoi(v.c_str());
+            g_draft_rows_set = true;
+        } else if (a == "--pipe-draft-alpha") {
+            g_draft.alpha = (float) atof(v.c_str());
+        } else if (a == "--pipe-draft-topk") {
+            g_draft.top_k = atoi(v.c_str());
+        } else if (a == "--pipe-draft-stair") {
+            g_draft_stair = v;
         } else if (a == "--pipe-jobs") {
             jobs_file = v;
         } else if (a == "--pipe-slots") {
@@ -536,6 +571,16 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 
     llama_memory_clear(mem, false);
 
+    // the drafter follows this job's sequence (its prompt included) only when it guesses for it
+    const bool stair = job.mode == "pipe" && job.guess == "staircase";
+    if (stair && (!llama_pipe_draft_ready(ctx) || job.race >= 1 || job.feed)) {
+        LOG_ERR("%s: %s: guess staircase needs --pipe-draft, no race and no feed\n", __func__, job.name.c_str());
+        return false;
+    }
+    if (llama_pipe_draft_ready(ctx)) {
+        llama_pipe_draft_reset(ctx, stair ? job.seq : -1, 0);
+    }
+
     const uint32_t seed0 = job.seed >= 0 ? (uint32_t) job.seed : params.sampling.seed;
     if (job.seq != 0 && job.race >= 1) {
         LOG_ERR("%s: %s: a race starts in sequence 0\n", __func__, job.name.c_str());
@@ -623,6 +668,8 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 
     // stats
     int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0;
+    // staircase: guesses and right guesses of the copy lookup and of the drafter
+    int n_copy_guess = 0, n_copy_hit = 0, n_draft_guess = 0, n_draft_hit = 0;
 
     struct trace_row { int64_t t_us; int inflight; char outcome; };
     std::vector<trace_row> trace;
@@ -861,10 +908,11 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         const common_ngram_simple_config simple_cfg = {
             params.speculative.ngram_simple.size_n, params.speculative.ngram_simple.size_m };
 
-        struct entry { int slot; llama_token tok; llama_pos pos; };
+        struct entry { int slot; llama_token tok; llama_pos pos; char src; };
         std::deque<entry> win; // win[0]: the newest committed token, in flight; win[1..]: guesses
         int next_slot = 0;
         bool failed = false;
+        char guess_src = 0;    // who made the guess being submitted: 'c' the copy lookup, 'd' the drafter
 
         // src_slot >= 0: the token is the sampled output of that slot, fed on the devices (tok is not known yet)
         auto submit = [&](llama_token tok, llama_pos pos, int src_slot = -1) {
@@ -891,7 +939,8 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                     failed = true;
                     return;
                 }
-                win.push_back({ s, tok, pos });
+                win.push_back({ s, tok, pos, guess_src });
+                guess_src = 0;
                 n_submit++;
                 return;
             }
@@ -922,6 +971,35 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             return h;
         };
 
+        // staircase: the position the drafter's pending launch guesses (-1: none), and the uniform the sampler draws at
+        // the position before the guessed one (its output is the guessed token)
+        llama_pos draft_pending = -1;
+        auto draft_launch = [&]() {
+            std::vector<llama_pipe_draft_row> rows;
+            for (const auto & e : win) {
+                rows.push_back({ e.tok, e.pos, e.slot });
+            }
+            if (llama_pipe_draft_launch(ctx, rows.data(), (int32_t) rows.size()) == 0) {
+                draft_pending = win.back().pos + 1;
+            }
+        };
+        auto draft_u = [&](llama_pos pos_guess) -> float {
+            if (g_draft_top1 || params.sampling.temp <= 0.0f || !g_backend_sample || seq >= (llama_seq_id) g_backend_chains.size() ||
+                    !g_backend_chains[seq]) {
+                return -1.0f;
+            }
+            return llama_sampler_pos_uniform(g_backend_chains[seq], pos_guess - 1);
+        };
+        // after a submission: start the drafter on the next position unless the copy lookup has it
+        auto draft_ahead = [&]() {
+            if (!stair || failed || win.empty() || win.back().pos + 1 >= n_prompt + n_predict) {
+                return;
+            }
+            if (copy_guess(hist_inflight(), job.copy_min) < 0) {
+                draft_launch();
+            }
+        };
+
         // the next guess, for the position after win.back(), or -1
         auto next_guess = [&]() -> llama_token {
             const llama_pos pos = win.back().pos + 1;
@@ -938,6 +1016,22 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             }
             if (job.guess == "copy") {
                 return copy_guess(hist_inflight(), job.copy_min);
+            }
+            if (stair) {
+                const llama_token g = copy_guess(hist_inflight(), job.copy_min);
+                if (g >= 0) {
+                    guess_src = 'c';
+                    return g;
+                }
+                if (draft_pending != pos) {
+                    draft_launch();
+                }
+                draft_pending = -1;
+                const llama_token d = llama_pipe_draft_get(ctx, draft_u(pos), nullptr);
+                if (d >= 0) {
+                    guess_src = 'd';
+                }
+                return d;
             }
             if (job.guess == "cont") {
                 const std::vector<llama_token> h = hist_inflight();
@@ -986,6 +1080,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
         };
 
         submit(gen.back(), n_prompt + (int) gen.size() - 1);
+        draft_ahead();
 
         while (!failed && !done()) {
             // keep up to D guesses in flight behind the newest committed token
@@ -996,10 +1091,12 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                     g = win.back().tok;
                 }
                 if (g < 0) {
+                    guess_src = 0;
                     break;
                 }
                 submit(g, win.back().pos + 1);
                 n_guess++;
+                draft_ahead();
             }
             if (failed) {
                 break;
@@ -1020,6 +1117,10 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
 
             const entry cur = win.front();
             win.pop_front();
+            if (stair) {
+                // its output is about to be sampled: its row is a committed one from now on
+                llama_pipe_draft_commit(ctx, cur.tok, cur.pos, cur.slot);
+            }
 
             llama_token id;
             if (backend_sampling()) {
@@ -1059,6 +1160,14 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                 continue;
             }
 
+            if (outcome == 'h' || outcome == 'm') {
+                const char src = win.front().src;
+                n_copy_guess  += src == 'c';
+                n_draft_guess += src == 'd';
+                n_copy_hit    += src == 'c' && outcome == 'h';
+                n_draft_hit   += src == 'd' && outcome == 'h';
+            }
+
             if (outcome == 'h') {
                 n_hit++;
                 chain_hits++;
@@ -1068,6 +1177,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             if (outcome == 'm') {
                 // wrong guess: drop it and everything behind it
                 n_miss++;
+                draft_pending = -1;
                 n_wasted += (int) win.size();
                 if (!llama_memory_seq_rm(mem, seq, win.front().pos, -1)) {
                     LOG_ERR("%s: llama_memory_seq_rm failed\n", __func__);
@@ -1079,6 +1189,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
             }
 
             submit(id, cur.pos + 1);
+            draft_ahead();
         }
 
         // drop whatever is still in flight beyond the last fed token: plain decoding never fed it
@@ -1175,14 +1286,16 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     LOG_INF("PIPESPEC name=%s mode=%s guess=%s depth=%d n_prompt=%d n_gen=%d t_gen=%.3f tok_s=%.3f submits=%d guesses=%d "
             "hits=%d misses=%d wasted=%d avg_inflight_guesses=%.3f tokens=%016" PRIx64 " logits=%016" PRIx64 " state=%016" PRIx64
             " probe=%016" PRIx64 " race=%d winner=%d race_tokens=%d t_race=%.3f race_hash=%016" PRIx64
-            " fed=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f\n",
+            " fed=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f"
+            " copy_guesses=%d copy_hits=%d draft_guesses=%d draft_hits=%d\n",
             job.name.c_str(), job.mode.c_str(), job.mode == "plain" ? "-" : job.guess.c_str(), job.mode == "plain" ? 0 : job.depth,
             n_prompt, n_gen, t_gen, (n_gen - 1)/t_gen, n_submit, n_guess, n_hit, n_miss, n_wasted,
             depth_n ? depth_sum/depth_n : 0.0,
             fnv1a(gen.data(), gen.size()*sizeof(llama_token)), fnv1a(hashes.data(), hashes.size()*sizeof(uint64_t)),
             h_state, h_probe, n_race, race_winner, race_tokens, t_race, race_hash, n_fed,
             n_gen ? (double) g_t_submit_us/n_gen : 0.0, n_gen ? (double) g_t_wait_us/n_gen : 0.0,
-            n_gen ? (t_gen*1e6 - g_t_submit_us - g_t_wait_us)/n_gen : 0.0);
+            n_gen ? (t_gen*1e6 - g_t_submit_us - g_t_wait_us)/n_gen : 0.0,
+            n_copy_guess, n_copy_hit, n_draft_guess, n_draft_hit);
 
     return true;
 }
@@ -1761,6 +1874,19 @@ int main(int argc, char ** argv) {
     // a device sampler for sequence 0 before the slots are reserved, so that their buffers include it
     if (backend_sampling() && !set_backend_samplers(ctx, params.sampling, { params.sampling.seed })) {
         return 1;
+    }
+
+    if (!g_draft_path.empty()) {
+        g_draft.path  = g_draft_path.c_str();
+        g_draft.stair = g_draft_stair.empty() ? nullptr : g_draft_stair.c_str();
+        if (!g_draft_rows_set) {
+            // the tokens in flight plus a committed one
+            g_draft.n_rows = std::max(8, ((std::max(0, depth_max) + 2 + 7)/8)*8);
+        }
+        if (llama_pipe_draft_init(ctx, g_draft) != 0) {
+            LOG_ERR("%s: llama_pipe_draft_init failed\n", __func__);
+            return 1;
+        }
     }
 
     if (depth_max >= 0) {

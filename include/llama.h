@@ -1077,6 +1077,57 @@ extern "C" {
     // Waits for all submitted tokens
     LLAMA_API void llama_pipe_drain(struct llama_context * ctx);
 
+    // Staircase drafter for pipelined speculation (experimental): a small head on one device that guesses the next token
+    // from the hidden states the pipe slots compute anyway. Each pipe evaluation of the drafter's sequence copies the
+    // inputs of the drafter's anchor layers and its final hidden state into host memory as soon as each device is done
+    // with the token; llama_decode micro-batches of that sequence (the prompt) hand over their final hidden states. A
+    // guess reads, for every token still in flight, the deepest anchor of the drafter's staircase, and for every older
+    // token its final state. The executor still samples every token and compares, so the output never depends on it.
+    //
+    // Usage, one sequence:
+    //   llama_pipe_draft_init before llama_pipe_init (and before the prompt is decoded)
+    //   llama_pipe_draft_reset(ctx, seq_id, n_keep) before a request's prompt is decoded (seq_id -1: no captures)
+    //   after each llama_pipe_submit of a token that may need a guess after it: llama_pipe_draft_launch with the tokens in
+    //   flight (oldest first, each with its slot); llama_pipe_draft_get waits for the guess
+    //   when a token's output has been sampled and the token is part of the output: llama_pipe_draft_commit
+    struct llama_pipe_draft_params {
+        const char * path;   // drafter file (bench/staircase_drafter/export_gguf.py)
+        int32_t device;      // index among the GPUs (-1: the device of the first layer)
+        int32_t n_ctx;       // committed positions the head attends to (the newest ones)
+        int32_t n_rows;      // rows per guess: committed tokens since the last guess plus the tokens in flight
+        float   alpha;       // the head's distribution q^alpha for the draw (<= 0: the file's value)
+        int32_t top_k;       // candidates the draw chooses from
+        const char * stair;  // anchors of the tokens in flight, newest first, e.g. "L9,L17,L33,L41" (NULL: the file's)
+    };
+
+    struct llama_pipe_draft_row {
+        llama_token token;
+        llama_pos   pos;
+        int32_t     slot;    // the pipe slot evaluating it
+    };
+
+    LLAMA_API struct llama_pipe_draft_params llama_pipe_draft_default_params(void);
+
+    // Returns 0 on success
+    LLAMA_API int32_t llama_pipe_draft_init(struct llama_context * ctx, struct llama_pipe_draft_params params);
+
+    // True once llama_pipe_draft_init succeeded
+    LLAMA_API bool llama_pipe_draft_ready(const struct llama_context * ctx);
+
+    // Starts over on sequence seq_id (-1: none, nothing is captured), keeping the committed rows below n_keep
+    LLAMA_API void llama_pipe_draft_reset(struct llama_context * ctx, llama_seq_id seq_id, llama_pos n_keep);
+
+    // The token at pos, evaluated by pipe slot `slot`, is part of the output (call it when its output has been sampled)
+    LLAMA_API void llama_pipe_draft_commit(struct llama_context * ctx, llama_token token, llama_pos pos, int32_t slot);
+
+    // Enqueues a guess for the position after rows[n_rows - 1]; returns 0 on success
+    LLAMA_API int32_t llama_pipe_draft_launch(struct llama_context * ctx, const struct llama_pipe_draft_row * rows, int32_t n_rows);
+
+    // Waits for the last launch's guess: drawn with u in [0, 1), the uniform the sampler uses for that position
+    // (llama_sampler_pos_uniform), against the head's candidates in descending order, so that a good head and the
+    // sampler tend to pick the same token; the head's most likely token for u < 0. -1 if there is none.
+    LLAMA_API llama_token llama_pipe_draft_get(struct llama_context * ctx, float u, float * p_top);
+
     //
     // Extended batch API
     //
@@ -1529,6 +1580,11 @@ extern "C" {
     // Pipelined decoding needs it for temperature sampling on the device: guesses are submitted, and their draws taken,
     // before the earlier tokens are sampled, and dropped guesses must not shift later draws. No effect on host sampling.
     LLAMA_API void                   llama_sampler_set_pos(struct llama_sampler * smpl, llama_pos pos);
+
+    // The uniform random draw in [0, 1) that the chain's dist sampler takes at pos after llama_sampler_set_pos(smpl, pos)
+    // (the sampled token is the first, in descending order of probability, whose cumulative probability exceeds it);
+    // -1 if the chain has no dist sampler
+    LLAMA_API float                  llama_sampler_pos_uniform(const struct llama_sampler * smpl, llama_pos pos);
 
     // True for a chain bound to a context (llama_set_sampler) whose samplers all run there, so that the context returns
     // the sampled token itself (llama_get_sampled_token_ith, llama_pipe_get_sampled)
