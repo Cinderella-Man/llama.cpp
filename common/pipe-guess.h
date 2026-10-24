@@ -13,12 +13,23 @@
 //       suffix, if that occurrence is at least min_match tokens long; the newest 256 occurrences of the last token are
 //       searched
 // cont: the copy lookup if it finds a match, else the most frequent continuation of the longest 1..8-token context at
-//       the end of the history among the request's own tokens (prompt and committed output)
+//       the end of the history among the request's own tokens (prompt and committed output). With a store
+//       (common_pipe_store, Q161): the copy lookup, else the request's continuations of contexts of 2 tokens or more,
+//       else the store's most frequent continuation of the longest context (2 tokens or more) it holds, if that token
+//       has at least 30 % of the context's occurrences, else the request's continuations of any context
+struct common_pipe_store;
+
 struct common_pipe_guesser {
     enum type { NONE, COPY, CONT };
 
     type kind      = CONT;
     int  min_match = 4;
+
+    // continuations of other answers for cont (not owned; the slots share it), or nullptr
+    common_pipe_store * store = nullptr;
+
+    // guesses that came from the store (counted up; the owner clears it)
+    int32_t n_store = 0;
 
     // starts a request: the prompt's tokens (the counts of the continuation lookup cover its last max_count tokens)
     void reset(const llama_token * tokens, size_t n);
@@ -53,5 +64,5 @@ private:
     void count_to(size_t n);
 
     llama_token copy_guess() const;
-    llama_token cont_guess() const;
+    llama_token cont_guess(int min_len = 1) const;   // from a context of at least min_len tokens
 };
