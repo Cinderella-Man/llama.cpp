@@ -23,7 +23,7 @@
 //
 // GGML_CUDA_FATTN_TILE_PASCAL: 0 off, 1 compute capability 6.1 only (default), 2 any NVIDIA GPU (for testing).
 // GGML_CUDA_FATTN_TILE_PASCAL_MIN: fewest query tokens it takes (default 9 with F16 K/V, 3 with Q8_0 K/V).
-// GGML_CUDA_FATTN_TILE_PASCAL_FAULT (tests of the tests): 1 output x 1.01, 2 sinks dropped, 3 each block's last key
+// GGML_CUDA_FATTN_TILE_PASCAL_FAULT (tests of the tests): 1 output x 1.05, 2 sinks dropped, 3 each block's last key
 // tile dropped.
 
 // Whether the kernel takes this FLASH_ATTN_EXT node on this device (the same answer at allocation and compute time).
