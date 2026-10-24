@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_memory_recurrent;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -453,9 +454,24 @@ private:
         // the token ids (set when the graph is allocated); a fed submission writes the token there
         ggml_tensor *           tok_cpy     = nullptr;
         ggml_backend_t          tok_backend = nullptr;
+
+        // its evaluation is still to be read by the executor (set at submit; cleared when its output is read, when
+        // its sequence is submitted again at or before its position, or decoded with llama_decode): of a recurrent
+        // model's sequence, the state before the oldest such token is one a rollback may still need
+        bool                    live = false;
+        llama_seq_id            seq  = -1;
+        llama_pos               pos  = -1; // of its first token
     };
 
+    // before slot i_slot writes seq_id's recurrent state for pos: saves the state a rollback may still need if the
+    // slot's state group holds it (see llama_memory_recurrent::pipe_stash)
+    void pipe_protect_state(int32_t i_slot, llama_seq_id seq_id, llama_pos pos);
+
     std::vector<pipe_slot> pipe_slots;
+
+    // the recurrent part of the memory for a hybrid or recurrent model (null otherwise): each pipe slot writes its
+    // states to its own group of it (llama_memory_recurrent::n_grp), so a wrong guess can be dropped
+    llama_memory_recurrent * pipe_mem_recr = nullptr;
 
     // how the slots upload their host inputs (ggml_backend_sched_set_input_upload, LLAMA_PIPE_UPLOAD)
     int pipe_upload = 2;

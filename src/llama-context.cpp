@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -1721,8 +1723,35 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
         return -1;
     }
 
+    // a recurrent state can't drop a tail: each slot writes the recurrent states of its tokens to its own state group,
+    // and a token reads its source state from whichever group holds it, so a wrong guess leaves the state before it in
+    // place. The delta-net models (Qwen3.5/3.6, Qwen3-Next) write their states that way; others are refused
+    llama_memory_recurrent * mem_recr = nullptr;
+    if (llama_model_is_recurrent(&model) || llama_model_is_hybrid(&model)) {
+        auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        mem_recr = mem_hybrid ? mem_hybrid->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
+        const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
+                             model.arch == LLM_ARCH_QWEN3NEXT;
+        if (mem_recr == nullptr || !arch_ok || cparams.n_rs_seq != 0) {
+            LLAMA_LOG_ERROR("%s: pipelined decoding of a recurrent model supports the delta-net models with "
+                    "n_rs_seq 0 only (architecture %s, n_rs_seq %u)\n", __func__, llm_arch_name(model.arch), cparams.n_rs_seq);
+            return -1;
+        }
+    }
+
     synchronize();
     pipe_drain();
+
+    // one state group per slot and the stash, before the reserve, which drops every graph that still points at the old
+    // state tensors
+    pipe_mem_recr = nullptr;
+    if (mem_recr) {
+        if (!mem_recr->set_n_groups(n_slots + n_chunk_slots + 1)) {
+            LLAMA_LOG_ERROR("%s: failed to set up %d recurrent state groups\n", __func__, n_slots + n_chunk_slots + 1);
+            return -1;
+        }
+        pipe_mem_recr = mem_recr;
+    }
 
     sched_reserve();
 
@@ -1895,7 +1924,15 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
     // handle any pending shifts/copies
     memory_update(false);
 
+    // the slot's recurrent states go to its own state group, which may hold the state a rollback still needs
+    if (pipe_mem_recr) {
+        pipe_protect_state(i_slot, seq_id, pos);
+        pipe_mem_recr->grp_next = (uint32_t) i_slot;
+    }
     llama_memory_context_ptr mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
+    if (pipe_mem_recr) {
+        pipe_mem_recr->grp_next = 0;
+    }
     if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to find a memory slot for pos %d\n", __func__, pos);
         return 1;
@@ -2056,7 +2093,84 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
 
     slot.busy = slot.ev_out != nullptr;
 
+    slot.live = true;
+    slot.seq  = seq_id;
+    slot.pos  = pos;
+
     return 0;
+}
+
+void llama_context::pipe_protect_state(int32_t i_slot, llama_seq_id seq_id, llama_pos pos) {
+    // the sequence's tokens still to be read: an executor submits a position again only after dropping the tokens
+    // from there on, and reads a slot's output before it reuses the slot
+    llama_pos front = pos;
+    for (size_t k = 0; k < pipe_slots.size(); k++) {
+        auto & s = pipe_slots[k];
+        if (!s.live || s.seq != seq_id) {
+            continue;
+        }
+        if ((int32_t) k == i_slot || s.pos >= pos) {
+            s.live = false;
+            continue;
+        }
+        front = std::min(front, s.pos);
+    }
+
+    // the state before the oldest of them: a wrong guess or leaving pipelined decoding rolls back to it at most
+    const int32_t row = pipe_mem_recr->pipe_stash(seq_id, (uint32_t) i_slot, front - 1);
+    if (row < 0) {
+        return;
+    }
+
+    // copy that row of every recurrent layer from the slot's group to the stash, on the layer's device and queued
+    // before this slot's evaluation, which overwrites it
+    const size_t   size  = pipe_mem_recr->size;
+    const uint32_t stash = pipe_mem_recr->n_grp - 1;
+
+    std::vector<ggml_tensor *> tensors;
+    for (const auto * v : { &pipe_mem_recr->r_l, &pipe_mem_recr->s_l, &pipe_mem_recr->p_l }) {
+        for (ggml_tensor * t : *v) {
+            if (t != nullptr) {
+                tensors.push_back(t);
+            }
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*tensors.size()*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_views { ggml_init(params) };
+
+    for (ggml_tensor * t : tensors) {
+        ggml_tensor * src = ggml_view_1d(ctx_views.get(), t, t->ne[0], ((size_t) i_slot*size + row)*t->nb[1]);
+        ggml_tensor * dst = ggml_view_1d(ctx_views.get(), t, t->ne[0], ((size_t) stash *size + row)*t->nb[1]);
+        const ggml_status st_src = ggml_backend_view_init(src);
+        const ggml_status st_dst = ggml_backend_view_init(dst);
+        GGML_ASSERT(st_src == GGML_STATUS_SUCCESS && st_dst == GGML_STATUS_SUCCESS);
+
+        // host memory (the CPU buffer type has no device): the CPU runs its part of every evaluation before the
+        // submit returns, so a plain copy now is in order
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            ggml_backend_tensor_copy(src, dst);
+            continue;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        ggml_backend_t backend = nullptr;
+        for (auto * be : backend_ptrs) {
+            if (ggml_backend_get_device(be) == dev) {
+                backend = be;
+                break;
+            }
+        }
+        GGML_ASSERT(backend != nullptr);
+
+        ggml_backend_tensor_copy_async(backend, backend, src, dst);
+    }
+
+    LLAMA_LOG_DEBUG("%s: seq %d: the state at pos %d goes from group %d to the stash\n", __func__, seq_id, front - 1, i_slot);
 }
 
 float * llama_context::pipe_get_logits(int32_t i_slot) {
@@ -2070,6 +2184,9 @@ float * llama_context::pipe_get_logits(int32_t i_slot) {
         ggml_backend_event_synchronize(slot.ev_out);
         slot.busy = false;
     }
+
+    // read: no longer in flight for the executor
+    slot.live = false;
 
     return slot.logits;
 }
@@ -2349,6 +2466,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // a regular decode may reserve or update the memory module: let pipelined evaluations finish first
     pipe_drain();
+
+    // and a sequence decoded here has left pipelined decoding: none of its pipelined tokens is still to be read (what
+    // the recurrent state groups keep depends on that)
+    if (pipe_mem_recr) {
+        for (const auto & tok : batch_inp.tokens) {
+            for (auto & ps : pipe_slots) {
+                if (ps.live && (tok.seq_ids.empty() ? ps.seq == 0 : tok.seq_ids.count(ps.seq) > 0)) {
+                    ps.live = false;
+                }
+            }
+        }
+    }
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
