@@ -21,7 +21,9 @@
 //                             at least --pipe-copy-min tokens long (history includes the guesses in flight)
 //                           cont: the copy lookup if it finds a match of at least --pipe-copy-min, else the most
 //                             frequent continuation of the longest 1-8-token context in the request so far (prompt
-//                             and committed output) plus, with --pipe-table FILE, a table of other outputs
+//                             and committed output) plus, with --pipe-table FILE, a table of other outputs; with
+//                             --pipe-store FILE (Q161) the store (common_pipe_store) comes after the request's
+//                             continuations of 2-token or longer contexts (job key store=0 leaves it out)
 //                           ngram-simple: llama.cpp's ngram-simple lookup on the same history (--spec-ngram-simple-size-n/-m)
 //                           spec: any llama.cpp drafter, --pipe-spec TYPE (e.g. ngram-map-k), drafted from committed
 //                             tokens only and consumed one guess at a time
@@ -87,6 +89,7 @@
 #include "log.h"
 #include "llama.h"
 #include "ngram-map.h"
+#include "pipe-store.h"
 #include "speculative.h"
 
 #include <algorithm>
@@ -133,6 +136,10 @@ static std::string g_draft_stair;
 static bool        g_draft_rows_set = false;
 static bool        g_draft_top1     = false;
 
+// continuation store for the continuation guesser (--pipe-store)
+static std::string         g_store_path;
+static common_pipe_store * g_store = nullptr;
+
 // host time in the current job: inside the submit calls (building, uploading and launching an evaluation) and inside
 // the waits for results
 static int64_t g_t_submit_us = 0;
@@ -176,6 +183,7 @@ struct pipe_job {
     int         floor    = 0;      // pipe mode: guesses kept in flight when the guesser has none (a filler token)
     int         chunks   = 0;      // streams: prompt chunks in flight (0 = 2)
     int         chunks_gen = -1;   // streams: prompt chunks in flight while a conversation generates (-1 = chunks)
+    bool        store    = true;   // cont: use the --pipe-store store, if given
 };
 
 static bool job_set(pipe_job & j, const std::string & k, const std::string & v) {
@@ -209,6 +217,7 @@ static bool job_set(pipe_job & j, const std::string & k, const std::string & v) 
     else if (k == "floor")     { j.floor     = atoi(v.c_str()); }
     else if (k == "chunks")    { j.chunks    = atoi(v.c_str()); }
     else if (k == "chunks_gen") { j.chunks_gen = atoi(v.c_str()); }
+    else if (k == "store")     { j.store     = v != "0"; }
     else {
         return false;
     }
@@ -276,6 +285,8 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
             g_draft.top_k = atoi(v.c_str());
         } else if (a == "--pipe-draft-stair") {
             g_draft_stair = v;
+        } else if (a == "--pipe-store") {
+            g_store_path = v;
         } else if (a == "--pipe-jobs") {
             jobs_file = v;
         } else if (a == "--pipe-slots") {
@@ -414,10 +425,11 @@ struct cont_counts {
 };
 
 // the most frequent continuation (summed over the request's counts and the table's; the first seen on ties) of the
-// longest context at the end of ctx that either has seen, or -1
-static llama_token cont_guess(const cont_counts & req, const cont_counts * table, const std::vector<llama_token> & ctx) {
+// longest context of at least min_len tokens at the end of ctx that either has seen, or -1
+static llama_token cont_guess(const cont_counts & req, const cont_counts * table, const std::vector<llama_token> & ctx,
+                              int min_len = 1) {
     const int n = (int) ctx.size();
-    for (int ln = std::min(cont_counts::max_ctx, n); ln >= 1; ln--) {
+    for (int ln = std::min(cont_counts::max_ctx, n); ln >= min_len; ln--) {
         const uint64_t k = cont_counts::key(&ctx[n - ln], ln);
         const auto * t = table ? table->get(k) : nullptr;
         const auto * r = req.get(k);
@@ -479,6 +491,24 @@ static const cont_counts * cont_table() {
         LOG_INF("%s: continuation table of %zu tokens, %zu contexts\n", __func__, n_tok, table.counts.size());
     }
     return g_table_path.empty() ? nullptr : &table;
+}
+
+// cont after the copy lookup: with the store (--pipe-store, store=1), the request's continuations of contexts of 2 tokens
+// or more, else the store's guess (counted in *n_store), else the request's continuations of any context
+static llama_token cont_chain(const pipe_job & job, const cont_counts & req, const std::vector<llama_token> & h,
+                              int * n_store) {
+    if (g_store && job.store) {
+        const llama_token r = cont_guess(req, cont_table(), h, 2);
+        if (r >= 0) {
+            return r;
+        }
+        const llama_token s = common_pipe_store_guess(g_store, h.data(), (int) h.size());
+        if (s >= 0) {
+            (*n_store)++;
+            return s;
+        }
+    }
+    return cont_guess(req, cont_table(), h);
 }
 
 static std::vector<llama_token> read_tokens(const std::string & path) {
@@ -681,7 +711,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     };
 
     // stats
-    int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0;
+    int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0, n_store = 0;
     // staircase: guesses and right guesses of the copy lookup and of the drafter
     int n_copy_guess = 0, n_copy_hit = 0, n_draft_guess = 0, n_draft_hit = 0;
 
@@ -1058,7 +1088,7 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
                     return g;
                 }
                 req_counts.update(hist);
-                return cont_guess(req_counts, cont_table(), h);
+                return cont_chain(job, req_counts, h, &n_store);
             }
             if (job.guess == "ngram-simple") {
                 std::vector<llama_token> h = hist_inflight();
@@ -1304,13 +1334,13 @@ static bool run_job(const pipe_job & job, common_params & params, llama_model * 
     LOG_INF("PIPESPEC name=%s mode=%s guess=%s depth=%d n_prompt=%d n_gen=%d t_gen=%.3f tok_s=%.3f submits=%d guesses=%d "
             "hits=%d misses=%d wasted=%d avg_inflight_guesses=%.3f tokens=%016" PRIx64 " logits=%016" PRIx64 " state=%016" PRIx64
             " probe=%016" PRIx64 " race=%d winner=%d race_tokens=%d t_race=%.3f race_hash=%016" PRIx64
-            " fed=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f"
+            " fed=%d store_guesses=%d host_submit_us=%.1f host_wait_us=%.1f host_rest_us=%.1f"
             " copy_guesses=%d copy_hits=%d draft_guesses=%d draft_hits=%d\n",
             job.name.c_str(), job.mode.c_str(), job.mode == "plain" ? "-" : job.guess.c_str(), job.mode == "plain" ? 0 : job.depth,
             n_prompt, n_gen, t_gen, (n_gen - 1)/t_gen, n_submit, n_guess, n_hit, n_miss, n_wasted,
             depth_n ? depth_sum/depth_n : 0.0,
             fnv1a(gen.data(), gen.size()*sizeof(llama_token)), fnv1a(hashes.data(), hashes.size()*sizeof(uint64_t)),
-            h_state, h_probe, n_race, race_winner, race_tokens, t_race, race_hash, n_fed,
+            h_state, h_probe, n_race, race_winner, race_tokens, t_race, race_hash, n_fed, n_store,
             n_gen ? (double) g_t_submit_us/n_gen : 0.0, n_gen ? (double) g_t_wait_us/n_gen : 0.0,
             n_gen ? (t_gen*1e6 - g_t_submit_us - g_t_wait_us)/n_gen : 0.0,
             n_copy_guess, n_copy_hit, n_draft_guess, n_draft_hit);
@@ -1393,7 +1423,7 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         std::unique_ptr<row_sampler> smpl;
         cont_counts              req;
         int                      next_slot = 0;
-        int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0, n_chunks = 0;
+        int n_submit = 0, n_guess = 0, n_hit = 0, n_miss = 0, n_wasted = 0, n_chunks = 0, n_store = 0;
         int64_t                  t_join = 0, t_first = 0, t_done = 0;
     };
 
@@ -1522,7 +1552,7 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
             return g;
         }
         v.req.update(v.hist);
-        return cont_guess(v.req, cont_table(), h);
+        return cont_chain(job, v.req, h, &v.n_store);
     };
 
     auto conv_done = [&](conv_state & v) {
@@ -1811,10 +1841,10 @@ static bool run_streams(const pipe_job & job, common_params & params, llama_mode
         const int    n_gen = (int) v.gen.size();
         const double t_gen = (v.t_done - v.t_first)/1e6;
         LOG_INF("PIPESPEC name=%s mode=streams guess=%s depth=%d n_prompt=%d n_gen=%d t_gen=%.3f tok_s=%.3f t_first=%.3f "
-                "submits=%d chunks=%d guesses=%d hits=%d misses=%d wasted=%d tokens=%016" PRIx64 " logits=%016" PRIx64
-                " state=%016" PRIx64 " probe=%016" PRIx64 "\n",
+                "submits=%d chunks=%d guesses=%d hits=%d misses=%d wasted=%d store_guesses=%d tokens=%016" PRIx64
+                " logits=%016" PRIx64 " state=%016" PRIx64 " probe=%016" PRIx64 "\n",
                 name.c_str(), job.guess.c_str(), D, n_prompt, n_gen, t_gen, t_gen > 0 ? (n_gen - 1)/t_gen : 0.0,
-                (v.t_first - v.t_join)/1e6, v.n_submit, v.n_chunks, v.n_guess, v.n_hit, v.n_miss, v.n_wasted,
+                (v.t_first - v.t_join)/1e6, v.n_submit, v.n_chunks, v.n_guess, v.n_hit, v.n_miss, v.n_wasted, v.n_store,
                 fnv1a(v.gen.data(), v.gen.size()*sizeof(llama_token)), fnv1a(v.hashes.data(), v.hashes.size()*sizeof(uint64_t)),
                 h_state, h_probe);
 
@@ -1912,6 +1942,15 @@ int main(int argc, char ** argv) {
         params.kv_unified = false;
     }
 
+    if (!g_store_path.empty()) {
+        g_store = common_pipe_store_load(g_store_path);
+        if (!g_store) {
+            LOG_ERR("%s: cannot read the continuation store %s\n", __func__, g_store_path.c_str());
+            return 1;
+        }
+        LOG_INF("continuation store %s: %lld tokens\n", g_store_path.c_str(), (long long) common_pipe_store_size(g_store));
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -1982,6 +2021,8 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_free();
+
+    common_pipe_store_free(g_store);
 
     for (auto * c : g_backend_chains) {
         if (c) {
