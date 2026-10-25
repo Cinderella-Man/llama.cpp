@@ -47,14 +47,15 @@ static ggml_tensor * build_attn_inp_kq_mask(
     return res;
 }
 
-// LLAMA_GPU_KQ_MASK=<n>: micro-batches of at least n tokens (default 1: all) build their attention masks on each device
+// LLAMA_GPU_KQ_MASK=<n>: micro-batches of at least n tokens build their attention masks on each device
 // (ggml_kq_mask) from the copy of the cells' positions and sequences that each device keeps, which a step updates with
 // the 8 bytes of each cell it writes, instead of copying the n_kv x n_tokens mask, 2 bytes per cell and token, to every
-// device; 0 turns it off
+// device; 0 (the default) turns it off. Off by default: on nine P106-090 cards it read an 8k-token prompt 3.6x slower
+// (Flint K2h-r16, -b 8192 -ub 512: 211 against 764 tok/s).
 static uint32_t llama_kq_mask_dev_min_tokens() {
     static const uint32_t n_min = [] {
         const char * env = getenv("LLAMA_GPU_KQ_MASK");
-        return env ? (uint32_t) std::max(0, atoi(env)) : 1u;
+        return env ? (uint32_t) std::max(0, atoi(env)) : 0u;
     }();
     return n_min;
 }
