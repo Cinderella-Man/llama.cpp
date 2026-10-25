@@ -75,8 +75,10 @@
 //                           LLAMA_INPUT_ON_GPU=1), so the host stays one token ahead instead of waiting in between
 // Staircase drafter options (one drafter per run): --pipe-draft FILE, --pipe-draft-dev N (GPU index; default: the first
 // layer's), --pipe-draft-ctx N (committed positions it attends to, 4096), --pipe-draft-rows N (rows per guess, default
-// 8 or depth + 2 rounded up to 8), --pipe-draft-alpha A, --pipe-draft-topk K, --pipe-draft-stair L9,L17,... (anchors of
-// the tokens in flight, newest first; default: the file's), --pipe-draft-top1 (the head's most likely token, no draw).
+// 8 or depth + 2 rounded up to 8), --pipe-draft-alpha A, --pipe-draft-topk K, --pipe-draft-stair L9,L17,... (depths of
+// the tokens in flight, newest first; default: from the layer split), --pipe-draft-kind stair|pre (the head starts after
+// its device's stage, or with the cycle on a spare device; default: by whether its device holds layers),
+// --pipe-draft-top1 (the head's most likely token, no draw).
 // Pipe and streams jobs also report the host time per generated token: inside the submit calls (host_submit_us), inside
 // the waits for results (host_wait_us) and the rest (host_rest_us, the executor's own work).
 // LLAMA_PIPE_UPLOAD=0|1|2 sets how the slots upload their host inputs (llama-context; 2, one packed asynchronous copy
@@ -133,6 +135,7 @@ static std::string g_table_path;
 static llama_pipe_draft_params g_draft = llama_pipe_draft_default_params();
 static std::string g_draft_path;
 static std::string g_draft_stair;
+static std::string g_draft_kind;
 static bool        g_draft_rows_set = false;
 static bool        g_draft_top1     = false;
 
@@ -285,6 +288,8 @@ static bool parse_pipe_args(int & argc, char ** argv, pipe_job & def, std::strin
             g_draft.top_k = atoi(v.c_str());
         } else if (a == "--pipe-draft-stair") {
             g_draft_stair = v;
+        } else if (a == "--pipe-draft-kind") {
+            g_draft_kind = v;
         } else if (a == "--pipe-store") {
             g_store_path = v;
         } else if (a == "--pipe-jobs") {
@@ -1982,6 +1987,7 @@ int main(int argc, char ** argv) {
     if (!g_draft_path.empty()) {
         g_draft.path  = g_draft_path.c_str();
         g_draft.stair = g_draft_stair.empty() ? nullptr : g_draft_stair.c_str();
+        g_draft.kind  = g_draft_kind.empty() ? nullptr : g_draft_kind.c_str();
         if (!g_draft_rows_set) {
             // the tokens in flight plus a committed one
             g_draft.n_rows = std::max(8, ((std::max(0, depth_max) + 2 + 7)/8)*8);

@@ -1,20 +1,23 @@
 // llama-pipe-drafter-check: runs the staircase drafter (src/llama-pipe-drafter.cpp) on a test case written by
 // bench/staircase_drafter/check_export.py and compares the newest window row's logits of every guess with the
-// reference from drafter.Drafter.forward (float32 on the CPU).
+// reference from drafter.Drafter.forward (float32 on the CPU), or times one guess.
 //
-//   llama-pipe-drafter-check drafter.gguf case.bin [--dev N] [--host-table] [--tol T]
-//   llama-pipe-drafter-check drafter.gguf --bench N [--window W] [--commits C] [--ctx P] [--dev N] [--host-table]
+//   llama-pipe-drafter-check drafter.gguf case.bin [--split 9,8,8,8,8,8] [--kind stair|pre] [--stair L9,...]
+//                            [--dev N] [--cpu] [--host-table] [--tol T]
+//   llama-pipe-drafter-check drafter.gguf --bench N [--split ...] [--window W] [--commits C] [--ctx P] [--dev N]
+//                            [--host-table]
 //
-// --cpu runs the drafter on the CPU instead of a GPU (dev is then ignored).
-// --host-table keeps the embedding table in host memory, so the drafter looks the rows up on the host instead of
-// gathering them on its device. Exit status 0 when every guess is within tolerance: the largest logit difference at
-// most T (default 0.05) times the reference's standard deviation, and the same most likely id.
+// --split: the target's layers per device the drafter derives its window from (Flint's 49 layers); --stair overrides
+// that window. --cpu runs the drafter on the CPU instead of a GPU (dev is then ignored). --host-table keeps the
+// embedding table in host memory, so the drafter looks the rows up on the host instead of gathering them on its
+// device. Exit status 0 when every guess is within tolerance: the largest logit difference at most T (default 0.05)
+// times the reference's standard deviation, and the same most likely id.
 //
 // --bench: the cost of one guess on one GPU, as the executor sees it (from the launch to the guess on the host), with a
 // random embedding table and random hidden states: P committed positions first (default 2048), then N guesses, each
-// with C new committed rows (default 1) and W tokens in flight (default 4), every row's anchors uploaded fresh (as in
-// the pipeline, where each token in flight has gone one card deeper since the last guess). Prints the median, 90th
-// percentile and mean in microseconds after 20 warm-up guesses.
+// with C new committed rows (default 1) and W tokens in flight (default: the split's window), every row's hidden
+// states uploaded fresh (as in the pipeline, where each token in flight has gone one device deeper since the last
+// guess). Prints the median, 90th percentile and mean in microseconds after 20 warm-up guesses.
 
 #include "llama.h"
 #include "llama-pipe-drafter.h"
@@ -26,11 +29,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <random>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
+
+static const int32_t N_TARGET = 49;   // Flint's layers: depth 49 is the final state
 
 static bool read_all(FILE * f, void * dst, size_t n) {
     return fread(dst, 1, n, f) == n;
@@ -51,10 +56,43 @@ static ggml_backend_dev_t gpu(int idx) {
     return nullptr;
 }
 
-static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit, int n_ctx_fill, int dev_idx, bool host_table) {
-    ggml_backend_dev_t dev = gpu(dev_idx);
+static std::vector<int32_t> parse_list(const std::string & s) {
+    std::vector<int32_t> v;
+    size_t p = 0;
+    while (p < s.size()) {
+        size_t q = s.find(',', p);
+        if (q == std::string::npos) {
+            q = s.size();
+        }
+        v.push_back(atoi(s.substr(p, q - p).c_str()));
+        p = q + 1;
+    }
+    return v;
+}
+
+struct opts {
+    std::vector<int32_t> split = { 9, 8, 8, 8, 8, 8 };
+    std::string kind;
+    std::string stair;
+    int  dev_idx    = 0;
+    bool host_table = false;
+};
+
+static std::unique_ptr<llama_pipe_drafter> load(const char * path, ggml_tensor * table, ggml_backend_dev_t dev, const opts & o,
+                                                int32_t n_rows, int32_t n_ctx) {
+    llama_pipe_draft_params params = llama_pipe_draft_default_params();
+    params.path   = path;
+    params.n_rows = n_rows;
+    params.n_ctx  = n_ctx;
+    params.stair  = o.stair.empty() ? nullptr : o.stair.c_str();
+    params.kind   = o.kind.empty() ? nullptr : o.kind.c_str();
+    return llama_pipe_drafter::load(params, table, dev, o.split, N_TARGET, true);
+}
+
+static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit, int n_ctx_fill, const opts & o) {
+    ggml_backend_dev_t dev = gpu(o.dev_idx);
     if (!dev) {
-        fprintf(stderr, "no GPU %d\n", dev_idx);
+        fprintf(stderr, "no GPU %d\n", o.dev_idx);
         return 2;
     }
     const int64_t n_tab = 32000;
@@ -68,18 +106,26 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
     ggml_init_params ip = { ggml_tensor_overhead()*2, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * t_table = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, n_tab);
-    ggml_backend_buffer_type_t buft = host_table ? ggml_backend_cpu_buffer_type() : ggml_backend_dev_buffer_type(dev);
+    ggml_backend_buffer_type_t buft = o.host_table ? ggml_backend_cpu_buffer_type() : ggml_backend_dev_buffer_type(dev);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     ggml_backend_tensor_set(t_table, table.data(), 0, table.size()*sizeof(ggml_fp16_t));
 
-    llama_pipe_draft_params params = llama_pipe_draft_default_params();
-    params.path   = path_drafter;
-    params.n_rows = std::max(8, ((n_win + n_commit + 7)/8)*8);
-    params.n_ctx  = std::max(4096, n_ctx_fill + 64);
-    auto dr = llama_pipe_drafter::load(params, t_table, dev);
+    // the split's window decides how many tokens are in flight unless --window says
+    int32_t n_rows = 16;
+    if (n_win > 0) {
+        n_rows = std::max(8, ((n_win + n_commit + 7)/8)*8);
+    }
+    auto dr = load(path_drafter, t_table, dev, o, n_rows, std::max(4096, n_ctx_fill + 64));
     if (!dr) {
         fprintf(stderr, "cannot load the drafter\n");
         return 2;
+    }
+    if (n_win <= 0) {
+        n_win = (int) dr->window_depths().size();
+        const int32_t need = std::max(8, ((n_win + n_commit + 7)/8)*8);
+        if (need != n_rows) {
+            dr = load(path_drafter, t_table, dev, o, need, std::max(4096, n_ctx_fill + 64));
+        }
     }
     dr->reset(0, 0);
     std::uniform_int_distribution<int> tok(0, (int) n_tab - 1);
@@ -100,7 +146,12 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
         dr->test_commit_bulk(t.data(), p.data(), n_ctx_fill, h.data(), h9.data());
         dr->synchronize();
     }
-    std::vector<float> taps(6*d);
+    // hidden states at every depth
+    std::vector<int32_t> depths(N_TARGET);
+    std::vector<float> taps((size_t) N_TARGET*d);
+    for (int32_t i = 0; i < N_TARGET; i++) {
+        depths[i] = i + 1;
+    }
     for (auto & x : taps) {
         x = 3*nd(rng);
     }
@@ -110,7 +161,7 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
     for (int it = 0; it < n_warm + n_iter; it++) {
         int slot = 0;
         for (int c = 0; c < n_commit; c++) {
-            dr->test_set_taps(slot, tok(rng), pos, taps.data());
+            dr->test_set_taps(slot, tok(rng), pos, taps.data(), depths.data(), N_TARGET);
             dr->commit(tok(rng), pos, slot);
             slot++;
             pos++;
@@ -118,7 +169,7 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
         std::vector<llama_pipe_draft_row> rows;
         for (int w = 0; w < n_win; w++) {
             const llama_token t = tok(rng);
-            dr->test_set_taps(slot, t, pos + w, taps.data());
+            dr->test_set_taps(slot, t, pos + w, taps.data(), depths.data(), N_TARGET);
             rows.push_back({ t, pos + w, slot });
             slot++;
         }
@@ -136,9 +187,13 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
         mean += x;
     }
     mean /= us.size();
-    printf("DRAFTER_BENCH dev=%s window=%d commits=%d ctx=%d n=%d median_us=%.0f p90_us=%.0f mean_us=%.0f table=%s\n",
-            ggml_backend_dev_name(dev), n_win, n_commit, n_ctx_fill, n_iter, us[us.size()/2], us[(size_t) (us.size()*0.9)], mean,
-            host_table ? "host" : "device");
+    std::string sp;
+    for (auto s : o.split) {
+        sp += (sp.empty() ? "" : "/") + std::to_string(s);
+    }
+    printf("DRAFTER_BENCH dev=%s split=%s window=%d commits=%d ctx=%d n=%d median_us=%.0f p90_us=%.0f mean_us=%.0f table=%s\n",
+            ggml_backend_dev_name(dev), sp.c_str(), n_win, n_commit, n_ctx_fill, n_iter, us[us.size()/2],
+            us[(size_t) (us.size()*0.9)], mean, o.host_table ? "host" : "device");
     dr.reset();
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -147,15 +202,16 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s drafter.gguf case.bin [--dev N] [--host-table] [--tol T]\n", argv[0]);
+        fprintf(stderr, "usage: %s drafter.gguf case.bin [--split a,b,..] [--kind stair|pre] [--stair L9,..] [--dev N] [--cpu] "
+                "[--host-table] [--tol T]\n       %s drafter.gguf --bench N [--split ..] [--window W] [--commits C] [--ctx P]\n",
+                argv[0], argv[0]);
         return 2;
     }
     const char * path_drafter = argv[1];
     const char * path_case    = argv[2];
-    int   dev_idx    = 0;
-    bool  host_table = false;
-    float tol        = 0.05f;
-    int   n_bench = 0, n_win = 4, n_commit = 1, n_ctx_fill = 2048;
+    opts  o;
+    float tol = 0.05f;
+    int   n_bench = 0, n_win = 0, n_commit = 1, n_ctx_fill = 2048;
     int   i0 = 3;
     if (std::string(argv[2]) == "--bench") {
         n_bench = atoi(argv[3]);
@@ -169,10 +225,16 @@ int main(int argc, char ** argv) {
             n_commit = atoi(argv[++i]);
         } else if (a == "--ctx" && i + 1 < argc) {
             n_ctx_fill = atoi(argv[++i]);
+        } else if (a == "--split" && i + 1 < argc) {
+            o.split = parse_list(argv[++i]);
+        } else if (a == "--kind" && i + 1 < argc) {
+            o.kind = argv[++i];
+        } else if (a == "--stair" && i + 1 < argc) {
+            o.stair = argv[++i];
         } else if (a == "--dev" && i + 1 < argc) {
-            dev_idx = atoi(argv[++i]);
+            o.dev_idx = atoi(argv[++i]);
         } else if (a == "--host-table") {
-            host_table = true;
+            o.host_table = true;
         } else if (a == "--cpu") {
             g_cpu = true;
         } else if (a == "--tol" && i + 1 < argc) {
@@ -187,7 +249,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     if (n_bench > 0) {
-        const int rc = bench(path_drafter, n_bench, n_win, n_commit, n_ctx_fill, dev_idx, host_table);
+        const int rc = bench(path_drafter, n_bench, n_win, n_commit, n_ctx_fill, o);
         llama_backend_free();
         return rc;
     }
@@ -204,6 +266,15 @@ int main(int argc, char ** argv) {
     }
     const int32_t n_tab = hdr[1], d = hdr[2], n_prompt = hdr[3], n_steps = hdr[4], n_v1 = hdr[5], n_tap = hdr[6];
     const bool fuse = hdr[7] != 0;
+    // the depths of a row's hidden states: the six-card anchors and the final state, or every depth 1..49
+    std::vector<int32_t> tap_depths;
+    if (n_tap == 6) {
+        tap_depths = { 9, 17, 25, 33, 41, N_TARGET };
+    } else {
+        for (int32_t i = 1; i <= n_tap; i++) {
+            tap_depths.push_back(i);
+        }
+    }
     std::vector<float> table((size_t) n_tab*d);
     std::vector<int32_t> ptok(n_prompt);
     std::vector<float> pfull((size_t) n_prompt*d), pl9((size_t) n_prompt*d);
@@ -214,23 +285,19 @@ int main(int argc, char ** argv) {
     }
 
     // the device and the embedding table on it (or in host memory)
-    ggml_backend_dev_t dev = gpu(dev_idx);
+    ggml_backend_dev_t dev = gpu(o.dev_idx);
     if (!dev) {
-        fprintf(stderr, "no GPU %d\n", dev_idx);
+        fprintf(stderr, "no GPU %d\n", o.dev_idx);
         return 2;
     }
     ggml_init_params ip = { ggml_tensor_overhead()*2, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * t_table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_tab);
-    ggml_backend_buffer_type_t buft = host_table ? ggml_backend_cpu_buffer_type() : ggml_backend_dev_buffer_type(dev);
+    ggml_backend_buffer_type_t buft = o.host_table ? ggml_backend_cpu_buffer_type() : ggml_backend_dev_buffer_type(dev);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     ggml_backend_tensor_set(t_table, table.data(), 0, table.size()*4);
 
-    llama_pipe_draft_params params = llama_pipe_draft_default_params();
-    params.path   = path_drafter;
-    params.n_rows = 8;
-    params.n_ctx  = 1024;
-    auto dr = llama_pipe_drafter::load(params, t_table, dev);
+    auto dr = load(path_drafter, t_table, dev, o, 16, 1024);
     if (!dr) {
         fprintf(stderr, "cannot load the drafter\n");
         return 2;
@@ -262,7 +329,7 @@ int main(int argc, char ** argv) {
             }
             // every row is the latest evaluation of its own slot
             const int32_t slot = r;
-            dr->test_set_taps(slot, tp[0], tp[1], taps.data());
+            dr->test_set_taps(slot, tp[0], tp[1], taps.data(), tap_depths.data(), n_tap);
             if (r < nc[0]) {
                 dr->commit(tp[0], tp[1], slot);
             } else {
@@ -308,8 +375,12 @@ int main(int argc, char ** argv) {
                 s, nc[0], nc[1], max_diff, rel, sqrt(sq/n_v1), arg_e, arg_g, p_top, ok ? "ok" : "FAIL");
     }
     fclose(f);
-    printf("DRAFTER_CHECK steps=%d bad=%d worst_rel=%.5f table=%s fuse=%d\n", n_steps, n_bad, worst,
-            host_table ? "host" : "device", (int) fuse);
+    std::string st;
+    for (auto x : dr->window_depths()) {
+        st += (st.empty() ? "" : ",") + std::to_string(x);
+    }
+    printf("DRAFTER_CHECK steps=%d bad=%d worst_rel=%.5f table=%s fuse=%d window=%s older=%d\n", n_steps, n_bad, worst,
+            o.host_table ? "host" : "device", (int) fuse, st.c_str(), dr->overflow_depth());
 
     dr.reset();
     ggml_backend_buffer_free(buf);
