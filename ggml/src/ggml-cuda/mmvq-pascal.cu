@@ -1327,17 +1327,19 @@ static __global__ void mul_mat_vec_f16_pascal(const char * x, const float * y, f
     }
 }
 
+bool ggml_cuda_mmvf_pascal_f16_applies(const void * x, const int64_t ncols, const int64_t stride_row) {
+    const int64_t row_bytes = stride_row * (int64_t) sizeof(half);
+    return ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+        !mmvqp_skip_type(GGML_TYPE_F16) && ncols % 8 == 0 && row_bytes % 16 == 0 && row_bytes <= INT_MAX &&
+        mmvqp_aligned(x, 16);
+}
+
 bool ggml_cuda_mmvf_pascal_f16(const void * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
                                const int64_t stride_row, cudaStream_t stream) {
-    if (!ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
-            mmvqp_skip_type(GGML_TYPE_F16)) {
+    if (!ggml_cuda_mmvf_pascal_f16_applies(x, ncols, stride_row) || nrows > INT_MAX || !mmvqp_aligned(y, 16)) {
         return false;
     }
     const int64_t row_bytes = stride_row * (int64_t) sizeof(half);
-    if (ncols % 8 != 0 || row_bytes % 16 != 0 || row_bytes > INT_MAX || nrows > INT_MAX || !mmvqp_aligned(x, 16) ||
-            !mmvqp_aligned(y, 16)) {
-        return false;
-    }
     constexpr int R = 2;
     const int64_t chunks = ncols / 8;
     int lpr_log2 = 0;
@@ -1374,6 +1376,11 @@ bool ggml_cuda_mmvq_pascal(
 
 bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & args, cudaStream_t stream) {
     GGML_UNUSED_VARS(args, stream);
+    return false;
+}
+
+bool ggml_cuda_mmvf_pascal_f16_applies(const void * x, const int64_t ncols, const int64_t stride_row) {
+    GGML_UNUSED_VARS(x, ncols, stride_row);
     return false;
 }
 
