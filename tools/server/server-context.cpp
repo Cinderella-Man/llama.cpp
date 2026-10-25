@@ -3069,7 +3069,10 @@ private:
         const std::string path = prefix_store.path_of(prefix);
         const std::string tmp  = path + ".tmp";
 
-        const size_t nwrite = llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, prefix.data(), prefix.size());
+        // with the whole sliding-window ring: a restore then occupies exactly the cells processing the prefix does (GPU
+        // attention splits its keys by the cache's extent, so fewer cells round differently)
+        const size_t nwrite = llama_state_seq_save_file_ext(ctx_tgt, tmp.c_str(), slot.id, prefix.data(), prefix.size(),
+                LLAMA_STATE_SEQ_FLAGS_SWA_RING);
         std::error_code ec;
         if (nwrite == 0) {
             SLT_WRN(slot, "prefix cache: failed to write '%s'\n", tmp.c_str());
@@ -3107,11 +3110,16 @@ private:
         if (pos_min < 0) {
             return;
         }
-        create_checkpoint(slot, 0, pos_min, pos_max, true);
+        create_checkpoint(slot, 0, pos_min, pos_max);
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool ring = false) {
+    // a sliding-window model's checkpoints hold the whole ring (ckpt_trim): a restore then occupies the cells that
+    // processing the prompt again does, so attention sums over the same cells, and one cut back to an earlier divergence
+    // still has a complete window
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        const bool ring = ckpt_trim;
+
         const int id_task = slot.task->id;
 
         slot.stats.n_ckpt_created++;
@@ -5255,7 +5263,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, tail1 && slot.state == SLOT_STATE_DONE_PROMPT);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
 
                     if (prefix_break && !has_mtmd) {
