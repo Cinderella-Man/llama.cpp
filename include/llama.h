@@ -1104,7 +1104,8 @@ extern "C" {
     // depth the head was trained on at or below it. Each pipe evaluation of the drafter's sequence copies the inputs of
     // those layers and its final hidden state into host memory as soon as each device is done with the token;
     // llama_decode micro-batches of that sequence (the prompt) hand over their final hidden states. A guess reads, for
-    // every token still in flight, its depth in the window, and for every older token its final state. The executor
+    // every token still in flight, its depth in the window (the final state once the token has passed the last device),
+    // and for every committed token its final state. The executor
     // still samples every token and compares, so the output never depends on it.
     //
     // Usage, one sequence:

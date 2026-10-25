@@ -18,7 +18,8 @@ class llm_graph_result;
 // input embedding plus one projected hidden state of the target, the deepest one that exists when the guess is made,
 // identified by its depth (n = the input of layer n, the target's layer count = the final hidden state after the output
 // norm, 0 = no hidden state). Committed tokens use the final state; the tokens still in flight (the "window") use the
-// depths their evaluations have reached, the newest the shallowest.
+// depths their evaluations have reached, the newest the shallowest, up to the first token that has passed the last
+// device: that one and every older token in flight use the final state too.
 //
 // The window comes from the run's layer split (layers per device): with every device busy a token enters the first
 // device once per cycle, so the token m cycles older has finished every device that ends within m cycles (the stage
@@ -126,7 +127,7 @@ private:
     int32_t top_k = 16;
     std::string profile;
 
-    // the run: layer split, window depths (newest first), the depth of older tokens in flight, committed depth
+    // the run: layer split, window depths (newest first), the depth of older tokens in flight (= committed), committed depth
     std::vector<int32_t> split;
     std::string kind = "stair";
     std::vector<int32_t> stair;

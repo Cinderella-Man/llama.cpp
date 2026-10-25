@@ -357,16 +357,13 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
     if (stair.empty()) {
         stair.push_back(kind == "stair" && !done.empty() ? depth_name(done[0]) : 0);
     }
-    depth_deep = done.size() >= 2 ? depth_name(done[done.size() - 2]) : stair.back();
-    depth_deep = std::max(depth_deep, *std::max_element(stair.begin(), stair.end()));
+    // the window ends at the first token that has passed the last device: older tokens in flight are complete and read
+    // like committed rows
+    depth_deep = committed;
 
-    // taps: every depth a row may read (the window, the devices' boundaries, the fused depths), then the final state
+    // taps: every depth a row may read (the window, the fused depths, the committed depth), then the final state
     {
         std::vector<int32_t> need(stair);
-        need.push_back(depth_deep);
-        for (size_t k = 0; k + 1 < done.size(); k++) {
-            need.push_back(depth_name(done[k]));
-        }
         if (fuse) {
             need.insert(need.end(), fuse_depths.begin(), fuse_depths.end());
         }
@@ -1055,8 +1052,9 @@ void llama_pipe_drafter::run_rows(const std::vector<int64_t> & rows_eval, const 
         }
         if (fuse) {
             for (int32_t k = 0; k < n_fuse; k++) {
-                // window rows: every shallower fused depth; committed rows: the first fused depth next to the final state
-                const bool use = rows_window[i] ? fuse_depths[k] < d : (k == 0 && d == n_target);
+                // window rows: every shallower fused depth; committed rows and complete tokens in flight: the first fused
+                // depth next to the final state
+                const bool use = rows_window[i] && d < n_target ? fuse_depths[k] < d : (k == 0 && d == n_target);
                 fidx[(size_t) k*N + i] = use ? store_row(e, fuse_depths[k]) : 0;
             }
         }
