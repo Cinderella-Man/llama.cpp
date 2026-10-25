@@ -16,7 +16,8 @@
 //       the end of the history among the request's own tokens (prompt and committed output). With a store
 //       (common_pipe_store, Q161): the copy lookup, else the request's continuations of contexts of 2 tokens or more,
 //       else the store's most frequent continuation of the longest context (2 tokens or more) it holds, if that token
-//       has at least 30 % of the context's occurrences, else the request's continuations of any context
+//       has at least 30 % of the context's occurrences, else the request's continuations of any context (unless
+//       cont_any is off: the staircase drafter guesses after the store)
 struct common_pipe_store;
 
 struct common_pipe_guesser {
@@ -30,6 +31,9 @@ struct common_pipe_guesser {
 
     // guesses that came from the store (counted up; the owner clears it)
     int32_t n_store = 0;
+
+    // cont: the request's continuations of any context as the last guess
+    bool cont_any = true;
 
     // starts a request: the prompt's tokens (the counts of the continuation lookup cover its last max_count tokens)
     void reset(const llama_token * tokens, size_t n);
