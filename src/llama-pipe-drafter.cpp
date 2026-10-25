@@ -1146,7 +1146,8 @@ int32_t llama_pipe_drafter::launch(const llama_pipe_draft_row * rows, int32_t n_
     commits.erase(std::remove_if(commits.begin(), commits.end(),
             [&](const pending & c) { return c.eval < n_eval - n_eval_ring + 2; }), commits.end());
     while ((int32_t) commits.size() > N - n_win) {
-        flush_commits((size_t) N, false);
+        // commit-only graphs of up to N rows until the rest fits next to the window
+        flush_commits(std::min(commits.size(), (size_t) N), false);
     }
     launch_has_out = n_win > 0;
     flush_commits(commits.size(), true);
