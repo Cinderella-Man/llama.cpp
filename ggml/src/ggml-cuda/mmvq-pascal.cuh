@@ -46,3 +46,7 @@ bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & args, cuda
 // one off), ncols is a multiple of 8, and x, y and the rows are 16-byte aligned.
 bool ggml_cuda_mmvf_pascal_f16(const void * x, const float * y, float * dst, int64_t ncols, int64_t nrows, int64_t stride_row,
                                cudaStream_t stream);
+
+// Whether ggml_cuda_mmvf_pascal_f16 would take a matrix x (activations 16-byte aligned), so that the persistent MoE kernel
+// can sum its router rows in the same order as the per-op path.
+bool ggml_cuda_mmvf_pascal_f16_applies(const void * x, int64_t ncols, int64_t stride_row);

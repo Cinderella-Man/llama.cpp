@@ -1,4 +1,5 @@
 #include "moe-persistent.cuh"
+#include "mmvq-pascal.cuh"
 #include "mmvq-pascal-impl.cuh"
 #include "unary.cuh"
 
@@ -86,8 +87,10 @@ struct moep_scratch {
     static constexpr size_t size    = moe     + H * sizeof(float);
 };
 
-// F16_HACC: F16 weights accumulated in half2, as mul_mat_vec_f does where FP16 is fast (not on a compute 6.1 build)
-enum moep_router_type { MOEP_ROUTER_F32 = 0, MOEP_ROUTER_F16 = 1, MOEP_ROUTER_BF16 = 2, MOEP_ROUTER_F16_HACC = 3 };
+// F16_HACC: F16 weights accumulated in half2, as mul_mat_vec_f does where FP16 is fast (not on a compute 6.1 build);
+// F16_PASCAL: in the Pascal F16 product's order, where the per-op path runs that kernel (ggml_cuda_mmvf_pascal_f16)
+enum moep_router_type { MOEP_ROUTER_F32 = 0, MOEP_ROUTER_F16 = 1, MOEP_ROUTER_BF16 = 2, MOEP_ROUTER_F16_HACC = 3,
+                        MOEP_ROUTER_F16_PASCAL = 4 };
 
 struct moep_args {
     const float * x;          // layer input (residual stream)
@@ -209,6 +212,31 @@ static __device__ __forceinline__ float moep_router_row(const T * xr, const XN2 
         }
     }
     return warp_reduce_sum(sumf);
+}
+
+// One F16 router row as the Pascal F16 product (mul_mat_vec_f16_pascal, mmvq-pascal.cu) sums it when the per-op path
+// runs it: lane l takes the 16-byte chunks l, l + 32, ... of the row (32 lanes per row at H = 2048), each with
+// mmvqp_f16_dot8, then the xor-shuffle reduction.
+template <typename XN2>
+static __device__ __forceinline__ float moep_router_row_pascal_f16(const half * xr, const XN2 & xn2, const int lane) {
+    static_assert(H % (8 * WARP_SIZE) == 0, "32 lanes per row");
+    const uint4 * x16 = (const uint4 *) xr;
+    float acc = 0.0f;
+#pragma unroll
+    for (int it = 0; it < H / (8 * WARP_SIZE); ++it) {
+        const int    c  = it * WARP_SIZE + lane; // columns 8c .. 8c + 7
+        const uint4  w  = __ldg(x16 + c);
+        const float2 p0 = xn2(4*c + 0);
+        const float2 p1 = xn2(4*c + 1);
+        const float2 p2 = xn2(4*c + 2);
+        const float2 p3 = xn2(4*c + 3);
+        acc = mmvqp_f16_dot8(w, make_float4(p0.x, p0.y, p1.x, p1.y), make_float4(p2.x, p2.y, p3.x, p3.y), acc);
+    }
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, off, WARP_SIZE);
+    }
+    return acc;
 }
 
 // topk_moe_cuda for one token with sigmoid gating and weight normalization: wt[i] holds the logit of expert
@@ -683,7 +711,9 @@ static __global__ void k_moe_layer(const moep_args a) {
             for (int k = 0; k < RT_ROWS; ++k) {
                 const int row = (item - I_RT) * RT_ROWS + k;
                 float sumf;
-                if (a.router_type == MOEP_ROUTER_F16) {
+                if (a.router_type == MOEP_ROUTER_F16_PASCAL) {
+                    sumf = moep_router_row_pascal_f16((const half *) a.router + (int64_t) row * H, xn2, lane);
+                } else if (a.router_type == MOEP_ROUTER_F16) {
                     sumf = moep_router_row<half, false>((const half *) a.router + (int64_t) row * H, xn2, lane);
                 } else if (a.router_type == MOEP_ROUTER_F16_HACC) {
                     sumf = moep_router_row<half, true>((const half *) a.router + (int64_t) row * H, xn2, lane);
@@ -1034,7 +1064,9 @@ void ggml_cuda_op_moe_persistent(ggml_backend_cuda_context & ctx, const ggml_cud
     a.err         = st.err_dev;
     if (L.router->type == GGML_TYPE_F16) {
         const bool hacc = fast_fp16_available(ggml_cuda_info().devices[ctx.device].cc) && L.router_prec == GGML_PREC_DEFAULT;
-        a.router_type = hacc ? MOEP_ROUTER_F16_HACC : MOEP_ROUTER_F16;
+        // the per-op path takes the Pascal F16 product wherever it applies (mmvf.cu), so the router follows it
+        const bool pascal = ggml_cuda_mmvf_pascal_f16_applies(L.router->data, H, L.router->nb[1] / sizeof(half));
+        a.router_type = pascal ? MOEP_ROUTER_F16_PASCAL : hacc ? MOEP_ROUTER_F16_HACC : MOEP_ROUTER_F16;
     } else {
         a.router_type = L.router->type == GGML_TYPE_BF16 ? MOEP_ROUTER_BF16 : MOEP_ROUTER_F32;
     }
