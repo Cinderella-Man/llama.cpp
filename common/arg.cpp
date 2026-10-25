@@ -1774,9 +1774,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--pipe-draft-stair"}, "LIST",
-        "anchors of the tokens in flight for the staircase drafter, newest first, e.g. L9,L17,L33,L41 (default: the file's)",
+        "depths of the tokens in flight for the staircase drafter, newest first, e.g. L9,L17,L33,L41 (default: from the "
+        "layer split)",
         [](common_params & params, const std::string & value) {
             params.pipe_draft_stair = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--pipe-draft-kind"}, "KIND",
+        "stair: the staircase drafter starts after its GPU's stage; pre: with the cycle, on a spare GPU (default: by whether "
+        "its GPU holds layers)",
+        [](common_params & params, const std::string & value) {
+            params.pipe_draft_kind = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
