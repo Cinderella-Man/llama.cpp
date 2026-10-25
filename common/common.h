@@ -655,7 +655,8 @@ struct common_params {
     int32_t     pipe_draft_dev   = -1;   // its GPU (-1: the first layer's)
     int32_t     pipe_draft_ctx   = 4096; // committed positions it attends to
     float       pipe_draft_alpha = 0.0f; // q^alpha for its draw (<= 0: the file's value)
-    std::string pipe_draft_stair;        // anchors of the tokens in flight, newest first (empty: the file's)
+    std::string pipe_draft_stair;        // depths of the tokens in flight, newest first (empty: from the layer split)
+    std::string pipe_draft_kind;         // stair or pre (empty: by whether the drafter's GPU holds layers)
     std::string pipe_store;              // continuation store for cont (common_pipe_store), empty = none
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints

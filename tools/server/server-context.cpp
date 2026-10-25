@@ -1796,6 +1796,7 @@ private:
                 dp.n_rows = std::max(8, ((params_base.pipe_depth + 2 + 7)/8)*8);
                 dp.alpha  = params_base.pipe_draft_alpha;
                 dp.stair  = params_base.pipe_draft_stair.empty() ? nullptr : params_base.pipe_draft_stair.c_str();
+                dp.kind   = params_base.pipe_draft_kind.empty() ? nullptr : params_base.pipe_draft_kind.c_str();
                 if (params_base.pipe_draft.empty() || llama_pipe_draft_init(ctx_tgt, dp) != 0) {
                     SRV_WRN("%s", "--pipe-guess staircase needs a drafter (--pipe-draft): guessing with cont\n");
                     params_base.pipe_guess = "cont";

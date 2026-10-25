@@ -22,6 +22,9 @@ static constexpr float POS_PAD  = 1e9f;
 
 static constexpr int GRAPH_NODES = 1024;
 
+std::vector<int32_t> llama_pipe_split_depths(const std::vector<int32_t> & split, const std::string & kind, const double timing[5],
+                                             int32_t max_w);
+
 llama_pipe_drafter::graph_inst::~graph_inst() {
     if (galloc) {
         ggml_gallocr_free(galloc);
@@ -58,8 +61,8 @@ llama_pipe_drafter::~llama_pipe_drafter() {
         if (c.ev_full) {
             ggml_backend_event_free(c.ev_full);
         }
-        if (c.ev_l9) {
-            ggml_backend_event_free(c.ev_l9);
+        if (c.ev_fz) {
+            ggml_backend_event_free(c.ev_fz);
         }
         if (c.ev_done) {
             ggml_backend_event_free(c.ev_done);
@@ -92,10 +95,11 @@ llama_pipe_drafter::~llama_pipe_drafter() {
 }
 
 std::unique_ptr<llama_pipe_drafter> llama_pipe_drafter::load(const llama_pipe_draft_params & params, ggml_tensor * tok_embd,
-                                                             ggml_backend_dev_t dev) {
+                                                             ggml_backend_dev_t dev, const std::vector<int32_t> & split,
+                                                             int32_t n_layer_target, bool dev_has_layers) {
     std::unique_ptr<llama_pipe_drafter> d(new llama_pipe_drafter());
     try {
-        if (!d->init(params, tok_embd, dev)) {
+        if (!d->init(params, tok_embd, dev, split, n_layer_target, dev_has_layers)) {
             return nullptr;
         }
     } catch (const std::exception & e) {
@@ -113,49 +117,111 @@ static int64_t gguf_key(const gguf_context * g, const char * name, bool required
     return k;
 }
 
-// "emb", "L<layer>" or "full" -> anchor id (0, 1 + index of the layer, n_anchor + 1); -1 if unknown
-static int32_t anchor_id(const std::string & s, const std::vector<int32_t> & layers) {
+static std::vector<int32_t> gguf_i32_array(const gguf_context * g, const char * name) {
+    const int64_t k = gguf_find_key(g, name);
+    if (k < 0) {
+        return {};
+    }
+    if (gguf_get_arr_type(g, k) != GGUF_TYPE_INT32) {
+        throw std::runtime_error(std::string(name) + " must be an int32 array");
+    }
+    const int32_t * a = (const int32_t *) gguf_get_arr_data(g, k);
+    return std::vector<int32_t>(a, a + gguf_get_arr_n(g, k));
+}
+
+// "emb", "full", "L<n>" or "<n>" -> depth (0, n_target, n); -1 if unknown
+static int32_t parse_depth(const std::string & s, int32_t n_target) {
     if (s == "emb") {
         return 0;
     }
     if (s == "full") {
-        return (int32_t) layers.size() + 1;
+        return n_target;
     }
-    if (s.size() > 1 && s[0] == 'L') {
-        const int32_t l = atoi(s.c_str() + 1);
-        for (size_t i = 0; i < layers.size(); i++) {
-            if (layers[i] == l) {
-                return (int32_t) i + 1;
-            }
-        }
+    const char * p = s.c_str() + (!s.empty() && s[0] == 'L' ? 1 : 0);
+    char * end = nullptr;
+    const long v = strtol(p, &end, 10);
+    if (end == p || *end != '\0' || v < 0 || v > n_target) {
+        return -1;
     }
-    return -1;
+    return (int32_t) v;
 }
 
-static std::vector<int32_t> parse_stair(const std::string & s, const std::vector<int32_t> & layers) {
-    std::vector<int32_t> res;
-    size_t p = 0;
-    while (p <= s.size()) {
-        size_t q = s.find(',', p);
-        if (q == std::string::npos) {
-            q = s.size();
-        }
-        const std::string tok = s.substr(p, q - p);
-        if (!tok.empty()) {
-            const int32_t a = anchor_id(tok, layers);
-            if (a < 0 || a == (int32_t) layers.size() + 1) {
-                throw std::runtime_error("bad staircase anchor '" + tok + "' (emb or one of the file's anchor layers)");
-            }
-            res.push_back(a);
-        }
-        p = q + 1;
-    }
-    return res;
+static std::string depth_str(int32_t d, int32_t n_target) {
+    return d == 0 ? "emb" : d >= n_target ? "full" : "L" + std::to_string(d);
 }
 
-bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tensor * tok_embd_, ggml_backend_dev_t dev_) {
+std::vector<int32_t> llama_pipe_split_depths(const std::vector<int32_t> & split, const std::string & kind, const double timing[5],
+                                             int32_t max_w) {
+    const int n = (int) split.size();
+    std::vector<int32_t> out;
+    if (n == 0) {
+        return out;
+    }
+    const double layer_ms = std::max(timing[2], timing[0] + (n - 6)*timing[1]);
+    std::vector<double> stages(n), ends;
+    for (int i = 0; i < n; i++) {
+        stages[i] = layer_ms*split[i];
+    }
+    stages[n - 1] += timing[3];
+    const double cycle = *std::max_element(stages.begin(), stages.end()) + timing[4];
+    double t = 0.0;
+    for (int i = 0; i < n; i++) {
+        t += stages[i];
+        ends.push_back(t);
+        t += timing[4];
+    }
+    std::vector<int32_t> done(n);
+    for (int k = 0, acc = 0; k < n; k++) {
+        acc += split[k];
+        done[k] = acc;
+    }
+    if (kind == "miss") {
+        return { done[0] };
+    }
+    const double t0 = kind == "stair" ? stages[0] : 0.0;
+    for (int m = 0; m < max_w; m++) {
+        int last = -1;
+        for (int j = 0; j < n; j++) {
+            if (ends[j] <= t0 + m*cycle + 1e-9) {
+                last = j;
+            }
+        }
+        if (last == n - 1) {
+            break;
+        }
+        out.push_back(last >= 0 ? done[last] : 0);
+    }
+    return out;
+}
+
+std::vector<int32_t> llama_pipe_split_depths(const std::vector<int32_t> & split, const std::string & kind, const float timing[5],
+                                             int32_t max_w) {
+    // the head file stores the timing in float32: back to the decimals drafter.py uses
+    double t[5];
+    for (int i = 0; i < 5; i++) {
+        t[i] = std::round((double) timing[i]*1e6)/1e6;
+    }
+    return llama_pipe_split_depths(split, kind, t, max_w);
+}
+
+int32_t llama_pipe_drafter::depth_name(int32_t depth) const {
+    if (depth >= n_target) {
+        return n_target;
+    }
+    int32_t best = 0;
+    for (int32_t r : recorded) {
+        if (r <= depth && r > best) {
+            best = r;
+        }
+    }
+    return best;
+}
+
+bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tensor * tok_embd_, ggml_backend_dev_t dev_,
+                              const std::vector<int32_t> & split_, int32_t n_layer_target, bool dev_has_layers) {
     dev = dev_;
     tok_embd = tok_embd_;
+    split = split_;
 
     // file: metadata and tensor shapes, then the data onto dev
     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &ctx_w };
@@ -185,39 +251,68 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
     fuse          = gguf_get_val_bool(g, gguf_key(g, "staircase.fuse"));
     alpha         = gguf_get_val_f32(g, gguf_key(g, "staircase.alpha"));
     {
-        const int64_t k = gguf_key(g, "staircase.anchor_layers");
-        if (gguf_get_arr_type(g, k) != GGUF_TYPE_INT32) {
-            LLAMA_LOG_ERROR("%s: staircase.anchor_layers must be int32\n", __func__);
-            return false;
-        }
-        const size_t n = gguf_get_arr_n(g, k);
-        const int32_t * a = (const int32_t *) gguf_get_arr_data(g, k);
-        anchor_layers.assign(a, a + n);
+        const int64_t k = gguf_key(g, "staircase.general", false);
+        general = k >= 0 && gguf_get_val_bool(g, k);
     }
     {
         const int64_t k = gguf_key(g, "staircase.profile", false);
         profile = k >= 0 ? gguf_get_val_str(g, k) : "";
     }
-    std::string stair_s;
     {
-        const int64_t k = gguf_key(g, "staircase.stair", false);
-        stair_s = k >= 0 ? gguf_get_val_str(g, k) : "L9";
+        const int64_t k = gguf_key(g, "staircase.target_layers", false);
+        n_target = k >= 0 ? (int32_t) gguf_get_val_u32(g, k) : n_layer_target;
+        if (n_target != n_layer_target) {
+            LLAMA_LOG_ERROR("%s: the drafter was trained on a target with %d layers, this model has %d\n", __func__, n_target,
+                    n_layer_target);
+            return false;
+        }
     }
-    if (params.stair && params.stair[0]) {
-        stair_s = params.stair;
+    // depths: projection and depth-embedding row per depth, and the depths the head was trained on
+    depth_proj = gguf_i32_array(g, "staircase.depth_proj");
+    if (!depth_proj.empty()) {
+        depth_emb_row = gguf_i32_array(g, "staircase.depth_emb_row");
+        recorded      = gguf_i32_array(g, "staircase.recorded");
+        fuse_depths   = gguf_i32_array(g, "staircase.fuse_depths");
+        if ((int32_t) depth_proj.size() != n_target + 1 || (int32_t) depth_emb_row.size() != n_target + 1 || recorded.empty()) {
+            LLAMA_LOG_ERROR("%s: staircase.depth_proj / depth_emb_row / recorded do not match %d target layers\n", __func__,
+                    n_target);
+            return false;
+        }
+    } else {
+        // a six-anchor file: one projection and one anchor embedding per anchor layer, then the final state
+        recorded = gguf_i32_array(g, "staircase.anchor_layers");
+        if (recorded.empty()) {
+            LLAMA_LOG_ERROR("%s: no staircase.anchor_layers\n", __func__);
+            return false;
+        }
+        const int32_t na = (int32_t) recorded.size();
+        depth_proj.assign(n_target + 1, -1);
+        depth_emb_row.assign(n_target + 1, -1);
+        depth_emb_row[0] = 0;
+        for (int32_t k = 0; k < na; k++) {
+            depth_proj[recorded[k]]    = k;
+            depth_emb_row[recorded[k]] = k + 1;
+        }
+        depth_proj[n_target]    = na;
+        depth_emb_row[n_target] = na + 1;
     }
-    stair = parse_stair(stair_s, anchor_layers);
+    if (fuse && fuse_depths.empty()) {
+        fuse_depths = recorded;
+    }
+    std::sort(recorded.begin(), recorded.end());
+    {
+        const int64_t k = gguf_find_key(g, "staircase.timing");
+        if (k >= 0 && gguf_get_arr_type(g, k) == GGUF_TYPE_FLOAT32 && gguf_get_arr_n(g, k) == 5) {
+            memcpy(timing, gguf_get_arr_data(g, k), sizeof(timing));
+        }
+    }
     {
         const int64_t k = gguf_key(g, "staircase.committed", false);
-        committed = anchor_id(k >= 0 ? gguf_get_val_str(g, k) : "full", anchor_layers);
+        committed = parse_depth(k >= 0 ? gguf_get_val_str(g, k) : "full", n_target);
         if (committed < 0) {
             LLAMA_LOG_ERROR("%s: bad committed anchor\n", __func__);
             return false;
         }
-    }
-    if (stair.empty()) {
-        LLAMA_LOG_ERROR("%s: empty staircase\n", __func__);
-        return false;
     }
     if (params.alpha > 0.0f) {
         alpha = params.alpha;
@@ -225,7 +320,89 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
     top_k       = std::max(1, params.top_k);
     n_rows_step = std::max(2, params.n_rows);
 
-    // the vocabulary map
+    // the run's window: from the split (or given), each depth the deepest trained one at or below it
+    kind = params.kind && params.kind[0] ? params.kind : (dev_has_layers ? "stair" : "pre");
+    if (kind != "stair" && kind != "pre") {
+        LLAMA_LOG_ERROR("%s: kind must be stair or pre, not %s\n", __func__, kind.c_str());
+        return false;
+    }
+    std::vector<int32_t> done;
+    for (int32_t s : split) {
+        done.push_back((done.empty() ? 0 : done.back()) + s);
+    }
+    if (params.stair && params.stair[0]) {
+        std::string s = params.stair;
+        size_t p = 0;
+        while (p <= s.size()) {
+            size_t q = s.find(',', p);
+            if (q == std::string::npos) {
+                q = s.size();
+            }
+            const std::string tok = s.substr(p, q - p);
+            if (!tok.empty()) {
+                const int32_t d = parse_depth(tok, n_target);
+                if (d < 0 || d >= n_target) {
+                    LLAMA_LOG_ERROR("%s: bad staircase entry '%s' (emb, L<n> or <n> below the final state)\n", __func__, tok.c_str());
+                    return false;
+                }
+                stair.push_back(d);
+            }
+            p = q + 1;
+        }
+    } else {
+        for (int32_t d : llama_pipe_split_depths(split, kind, timing, 12)) {
+            stair.push_back(depth_name(d));
+        }
+    }
+    if (stair.empty()) {
+        stair.push_back(kind == "stair" && !done.empty() ? depth_name(done[0]) : 0);
+    }
+    depth_deep = done.size() >= 2 ? depth_name(done[done.size() - 2]) : stair.back();
+    depth_deep = std::max(depth_deep, *std::max_element(stair.begin(), stair.end()));
+
+    // taps: every depth a row may read (the window, the devices' boundaries, the fused depths), then the final state
+    {
+        std::vector<int32_t> need(stair);
+        need.push_back(depth_deep);
+        for (size_t k = 0; k + 1 < done.size(); k++) {
+            need.push_back(depth_name(done[k]));
+        }
+        if (fuse) {
+            need.insert(need.end(), fuse_depths.begin(), fuse_depths.end());
+        }
+        if (committed > 0 && committed < n_target) {
+            need.push_back(committed);
+        }
+        std::sort(need.begin(), need.end());
+        need.erase(std::unique(need.begin(), need.end()), need.end());
+        for (int32_t d : need) {
+            if (d > 0 && d < n_target) {
+                tap_depth.push_back(d);
+            }
+        }
+        tap_depth.push_back(n_target);
+        tap_of_depth.assign(n_target + 1, -1);
+        for (size_t t = 0; t < tap_depth.size(); t++) {
+            tap_of_depth[tap_depth[t]] = (int32_t) t;
+        }
+    }
+    // every depth a row may have needs its projection and embedding
+    {
+        std::vector<int32_t> used(stair);
+        used.push_back(depth_deep);
+        used.push_back(committed);
+        for (int32_t d : used) {
+            if (d < 0 || d > n_target || depth_emb_row[d] < 0 || (d > 0 && depth_proj[d] < 0)) {
+                LLAMA_LOG_ERROR("%s: the head has no projection for depth %d (trained on", __func__, d);
+                for (int32_t r : recorded) {
+                    LLAMA_LOG_CONT(" %d", r);
+                }
+                LLAMA_LOG_CONT(")\n");
+                return false;
+            }
+        }
+    }
+
     {
         const int64_t it = gguf_find_tensor(g, "sd.vocab");
         if (it < 0) {
@@ -233,8 +410,6 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
             return false;
         }
     }
-
-    const int32_t n_anchor = (int32_t) anchor_layers.size();
 
     if (dev == nullptr) {
         LLAMA_LOG_ERROR("%s: no device\n", __func__);
@@ -251,7 +426,7 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
         buft_host = ggml_backend_cpu_buffer_type();
     }
 
-    // weights: the vocabulary map stays on the host
+    // weights: the vocabulary map stays on the host too
     buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
     if (!buf_w) {
         LLAMA_LOG_ERROR("%s: cannot allocate the weights on %s\n", __func__, ggml_backend_dev_name(dev));
@@ -300,8 +475,10 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
         const std::string p = "sd.blk." + std::to_string(l) + ".";
         blocks[l] = { get(p + "wq"), get(p + "wk"), get(p + "wv"), get(p + "wo"), get(p + "w1"), get(p + "w3"), get(p + "w2") };
     }
-    if ((int32_t) vocab.size() != n_vocab_draft || w_head->ne[1] != n_vocab_draft + 1 || w_anc->ne[2] != n_anchor + 1 ||
-            anchor_emb->ne[1] != n_anchor + 2 || w_emb->ne[0] != n_embd) {
+    const int32_t max_proj = *std::max_element(depth_proj.begin(), depth_proj.end());
+    const int32_t max_row  = *std::max_element(depth_emb_row.begin(), depth_emb_row.end());
+    if ((int32_t) vocab.size() != n_vocab_draft || w_head->ne[1] != n_vocab_draft + 1 || w_anc->ne[2] <= max_proj ||
+            anchor_emb->ne[1] <= max_row || w_emb->ne[0] != n_embd || (fuse && w_fuse->ne[2] != (int64_t) fuse_depths.size())) {
         LLAMA_LOG_ERROR("%s: tensor shapes do not match the metadata\n", __func__);
         return false;
     }
@@ -327,9 +504,13 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
                 "table in host memory (LLAMA_INPUT_ON_GPU=0)\n", __func__, ggml_backend_dev_name(dev));
         return false;
     }
-    n_tap = n_anchor + 1 + (emb_in_graph ? 0 : 1);
+    n_tap = (int32_t) tap_depth.size() + (emb_in_graph ? 0 : 1);
+    if (n_tap > 64) {
+        LLAMA_LOG_ERROR("%s: %d taps per evaluation, at most 64\n", __func__, n_tap);
+        return false;
+    }
 
-    // state: K/V cells, cell positions, the anchor store
+    // state: K/V cells, cell positions, the store of uploaded taps
     {
         n_wcell   = std::max(32, GGML_PAD(n_rows_step, 8));
         n_scratch = std::max(16, GGML_PAD(n_rows_step, 8));
@@ -382,23 +563,32 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
         return false;
     }
 
-    std::string st;
-    for (auto a : stair) {
-        st += (st.empty() ? "" : ",") + (a == 0 ? std::string("emb") : "L" + std::to_string(anchor_layers[a - 1]));
+    std::string sp, st, tp;
+    for (auto s : split) {
+        sp += (sp.empty() ? "" : "/") + std::to_string(s);
     }
-    LLAMA_LOG_INFO("%s: staircase drafter %s (profile %s): %d layers, %d draft ids, anchors", __func__, params.path,
-            profile.c_str(), n_layer, n_vocab_draft);
-    for (auto l : anchor_layers) {
-        LLAMA_LOG_CONT(" L%d", l);
+    for (auto d : stair) {
+        st += (st.empty() ? "" : ",") + depth_str(d, n_target);
     }
-    LLAMA_LOG_CONT(" + final%s; staircase %s, alpha %.2f, top-%d; on %s, %d cells, %d rows per guess, embeddings %s\n",
-            fuse ? " (fused)" : "", st.c_str(), alpha, top_k, ggml_backend_dev_name(dev), n_ring, n_rows_step,
-            emb_in_graph ? "gathered on the device" : "looked up on the host");
+    for (auto d : tap_depth) {
+        tp += (tp.empty() ? "" : ",") + depth_str(d, n_target);
+    }
+    LLAMA_LOG_INFO("%s: staircase drafter %s (profile %s%s): %d layers, %d draft ids%s; split %s, %s window %s, older tokens "
+            "%s, taps %s; alpha %.2f, top-%d; on %s, %d cells, %d rows per guess, embeddings %s\n", __func__, params.path,
+            profile.c_str(), general ? ", depth-general" : "", n_layer, n_vocab_draft, fuse ? ", fused" : "", sp.c_str(),
+            kind.c_str(), st.c_str(), depth_str(depth_deep, n_target).c_str(), tp.c_str(), alpha, top_k,
+            ggml_backend_dev_name(dev), n_ring, n_rows_step, emb_in_graph ? "gathered on the device" : "looked up on the host");
     return true;
 }
 
-int32_t llama_pipe_drafter::tap_index(int32_t a) const {
-    return a - 1;   // anchor ids 1..n_anchor + 1 -> taps 0..n_anchor
+std::vector<int32_t> llama_pipe_drafter::tap_layers() const {
+    std::vector<int32_t> res;
+    for (int32_t d : tap_depth) {
+        if (d < n_target) {
+            res.push_back(d);
+        }
+    }
+    return res;
 }
 
 void llama_pipe_drafter::lookup_emb(llama_token tok, float * dst) const {
@@ -411,14 +601,14 @@ void llama_pipe_drafter::lookup_emb(llama_token tok, float * dst) const {
     }
 }
 
-// one graph: n_rows rows (bulk: committed rows whose anchors come from h_full / h_l9; else rows of any anchor gathered
-// from the store, and the head on out_row)
+// one graph: n_rows rows (bulk: committed rows whose hidden states come from h_full / h_fuse; else rows of any depth
+// gathered from the store, and the head on out_row)
 bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) {
     g.n_rows = n_rows;
     g.bulk   = bulk;
     const int32_t N  = n_rows;
     const int32_t NW = n_wcell + n_scratch;
-    const int32_t n_anchor = (int32_t) anchor_layers.size();
+    const int32_t n_fuse = (int32_t) fuse_depths.size();
 
     // inputs: small ones packed in one blob (one upload per launch), large ones after it
     {
@@ -446,7 +636,7 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
     if (!bulk) {
         g.anc_id   = add_small(GGML_TYPE_I32, 1, N);
         g.anc_idx  = add_small(GGML_TYPE_I32, N);
-        g.fuse_idx = fuse ? add_small(GGML_TYPE_I32, n_anchor*N) : nullptr;
+        g.fuse_idx = fuse ? add_small(GGML_TYPE_I32, n_fuse*N) : nullptr;
         g.out_row  = add_small(GGML_TYPE_I32, 1);
         g.emb_idx  = emb_in_graph ? nullptr : add_small(GGML_TYPE_I32, N);   // store rows of the embeddings
     }
@@ -459,9 +649,10 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         off_large = GGML_PAD(off_large + ggml_nbytes(t), 256);
         return t;
     };
+    const bool fuse_committed = fuse && committed == n_target;
     if (bulk) {
-        g.h_full = add_large(n_embd, N);
-        g.h_l9   = fuse ? add_large(n_embd, N) : nullptr;
+        g.h_full   = add_large(n_embd, N);
+        g.h_fuse   = fuse_committed ? add_large(n_embd, N) : nullptr;
         g.emb_rows = emb_in_graph ? nullptr : add_large(n_embd, N);
     }
     g.buf_in = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), off_large);
@@ -498,7 +689,7 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         mask = ggml_cast(ctx, ggml_scale_bias(ctx, vis, 1e30f, -1e30f), GGML_TYPE_F16);
     }
 
-    // rows: embedding, anchor, fused shallower anchors, anchor embedding
+    // rows: embedding, projected hidden state, fused shallower depths, depth embedding
     ggml_tensor * e;
     if (emb_in_graph) {
         e = ggml_get_rows(ctx, tok_embd, g.tokens);
@@ -508,16 +699,16 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         e = ggml_get_rows(ctx, store, g.emb_idx);
     }
     ggml_tensor * x = ggml_mul_mat(ctx, w_emb, ggml_rms_norm(ctx, e, rms_eps));
-    auto anc_mat = [&](ggml_tensor * w, int32_t k) {   // the k-th matrix of a stacked [d, d, n] tensor
+    auto mat = [&](ggml_tensor * w, int32_t k) {   // the k-th matrix of a stacked [d, d, n] tensor
         return ggml_view_2d(ctx, w, w->ne[0], w->ne[1], w->nb[1], (size_t) k*w->nb[2]);
     };
     if (bulk) {
-        // h_full holds the committed anchor's states (normally the final state)
+        // h_full holds the committed depth's states (normally the final state)
         if (committed > 0) {
-            x = ggml_add(ctx, x, ggml_mul_mat(ctx, anc_mat(w_anc, committed - 1), ggml_rms_norm(ctx, g.h_full, rms_eps)));
+            x = ggml_add(ctx, x, ggml_mul_mat(ctx, mat(w_anc, depth_proj[committed]), ggml_rms_norm(ctx, g.h_full, rms_eps)));
         }
-        if (fuse && committed == n_anchor + 1) {
-            x = ggml_add(ctx, x, ggml_mul_mat(ctx, anc_mat(w_fuse, 0), ggml_rms_norm(ctx, g.h_l9, rms_eps)));
+        if (fuse_committed) {
+            x = ggml_add(ctx, x, ggml_mul_mat(ctx, mat(w_fuse, 0), ggml_rms_norm(ctx, g.h_fuse, rms_eps)));
         }
     } else {
         ggml_tensor * h  = ggml_rms_norm(ctx, ggml_get_rows(ctx, store, g.anc_idx), rms_eps);
@@ -525,9 +716,9 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, ha, n_embd, N));
         if (fuse) {
             ggml_tensor * hf = ggml_rms_norm(ctx, ggml_get_rows(ctx, store, g.fuse_idx), rms_eps);
-            for (int32_t k = 0; k < n_anchor; k++) {
+            for (int32_t k = 0; k < n_fuse; k++) {
                 ggml_tensor * hk = ggml_view_2d(ctx, hf, n_embd, N, hf->nb[1], (size_t) k*N*hf->nb[1]);
-                x = ggml_add(ctx, x, ggml_mul_mat(ctx, anc_mat(w_fuse, k), hk));
+                x = ggml_add(ctx, x, ggml_mul_mat(ctx, mat(w_fuse, k), hk));
             }
         }
     }
@@ -680,9 +871,9 @@ void llama_pipe_drafter::on_submit(int32_t i_slot, llama_token tok, llama_pos po
     eval_of_slot[i_slot] = e;
     uploaded[r] = 0;
 
-    const int32_t n_anchor = (int32_t) anchor_layers.size();
-    for (int32_t t = 0; t <= n_anchor; t++) {
-        ggml_tensor * src = t < n_anchor ? res->get_layer_inp(anchor_layers[t]) : res->get_embd();
+    for (int32_t t = 0; t < (int32_t) tap_depth.size(); t++) {
+        const int32_t d = tap_depth[t];
+        ggml_tensor * src = d < n_target ? res->get_layer_inp(d) : res->get_embd();
         if (src == nullptr || ggml_nelements(src) < n_embd) {
             continue;
         }
@@ -695,13 +886,13 @@ void llama_pipe_drafter::on_submit(int32_t i_slot, llama_token tok, llama_pos po
         const size_t off = (size_t) (src->ne[1] - 1)*src->nb[1];
         ggml_backend_tensor_get_async(be, src, dst, off, (size_t) n_embd*sizeof(float));
         const size_t ie = (size_t) r*n_tap + t;
-        ggml_backend_dev_t d = ggml_backend_get_device(be);
-        if (ev_tap[ie] == nullptr || ev_tap_dev[ie] != d) {
+        ggml_backend_dev_t dv = ggml_backend_get_device(be);
+        if (ev_tap[ie] == nullptr || ev_tap_dev[ie] != dv) {
             if (ev_tap[ie]) {
                 ggml_backend_event_free(ev_tap[ie]);
             }
-            ev_tap[ie]     = ggml_backend_event_new(d);
-            ev_tap_dev[ie] = d;
+            ev_tap[ie]     = ggml_backend_event_new(dv);
+            ev_tap_dev[ie] = dv;
         }
         if (ev_tap[ie]) {
             ggml_backend_event_record(ev_tap[ie], be);
@@ -710,11 +901,12 @@ void llama_pipe_drafter::on_submit(int32_t i_slot, llama_token tok, llama_pos po
         }
     }
     if (!emb_in_graph) {
-        lookup_emb(tok, tap_host + ((size_t) r*n_tap + n_anchor + 1)*n_embd);
+        lookup_emb(tok, tap_host + ((size_t) r*n_tap + tap_depth.size())*n_embd);
     }
 }
 
-int32_t llama_pipe_drafter::test_set_taps(int32_t i_slot, llama_token tok, llama_pos pos, const float * h) {
+void llama_pipe_drafter::test_set_taps(int32_t i_slot, llama_token tok, llama_pos pos, const float * h, const int32_t * depths,
+                                       int32_t n) {
     GGML_UNUSED(pos);
     if ((int32_t) eval_of_slot.size() <= i_slot) {
         eval_of_slot.resize(i_slot + 1, -1);
@@ -723,24 +915,28 @@ int32_t llama_pipe_drafter::test_set_taps(int32_t i_slot, llama_token tok, llama
     const int32_t r = (int32_t) (e % n_eval_ring);
     eval_of_slot[i_slot] = e;
     uploaded[r] = 0;
-    const int32_t n_anchor = (int32_t) anchor_layers.size();
-    for (int32_t t = 0; t <= n_anchor; t++) {
+    for (int32_t t = 0; t < (int32_t) tap_depth.size(); t++) {
         const size_t ie = (size_t) r*n_tap + t;
-        memcpy(tap_host + ie*n_embd, h + (size_t) t*n_embd, n_embd*sizeof(float));
+        float * dst = tap_host + ie*n_embd;
+        memset(dst, 0, n_embd*sizeof(float));
+        for (int32_t i = 0; i < n; i++) {
+            if (depths[i] == tap_depth[t]) {
+                memcpy(dst, h + (size_t) i*n_embd, n_embd*sizeof(float));
+            }
+        }
         if (ev_tap[ie]) {
             ggml_backend_event_free(ev_tap[ie]);
             ev_tap[ie] = nullptr;
         }
     }
     if (!emb_in_graph) {
-        lookup_emb(tok, tap_host + ((size_t) r*n_tap + n_anchor + 1)*n_embd);
+        lookup_emb(tok, tap_host + ((size_t) r*n_tap + tap_depth.size())*n_embd);
     }
-    return i_slot;
 }
 
 void llama_pipe_drafter::upload_tap(int64_t e, int32_t t) {
     const int32_t r = (int32_t) (e % n_eval_ring);
-    if (uploaded[r] & (1u << t)) {
+    if (uploaded[r] & (1ull << t)) {
         return;
     }
     const size_t ie = (size_t) r*n_tap + t;
@@ -749,7 +945,18 @@ void llama_pipe_drafter::upload_tap(int64_t e, int32_t t) {
     }
     const size_t row = 1 + ie;
     ggml_backend_tensor_set_async(backend, store, tap_host + ie*n_embd, row*n_embd*sizeof(float), (size_t) n_embd*sizeof(float));
-    uploaded[r] |= 1u << t;
+    uploaded[r] |= 1ull << t;
+}
+
+// the store row of an evaluation's hidden state at a depth (uploaded on first use); 0 (zeros) for depth 0 or a depth
+// that is not tapped
+int32_t llama_pipe_drafter::store_row(int64_t e, int32_t depth) {
+    const int32_t t = depth > 0 && depth <= n_target ? tap_of_depth[depth] : -1;
+    if (t < 0) {
+        return 0;
+    }
+    upload_tap(e, t);
+    return (int32_t) (1 + (e % n_eval_ring)*n_tap + t);
 }
 
 void llama_pipe_drafter::reset(llama_seq_id seq_id, llama_pos n_keep) {
@@ -810,37 +1017,34 @@ void llama_pipe_drafter::write_blob(graph_inst & g, uint8_t * dst, const std::ve
 }
 
 // one step launch: rows (commits first, then the window), the head on row i_out
-void llama_pipe_drafter::run_rows(const std::vector<int64_t> & rows_eval, const std::vector<int32_t> & rows_anchor,
+void llama_pipe_drafter::run_rows(const std::vector<int64_t> & rows_eval, const std::vector<int32_t> & rows_depth,
                                   const std::vector<llama_token> & rows_tok, const std::vector<llama_pos> & rows_pos,
                                   const std::vector<bool> & rows_window, int32_t i_out) {
     graph_inst & g = *g_step;
     const int32_t N  = g.n_rows;
     const int32_t NW = n_wcell + n_scratch;
-    const int32_t n_anchor = (int32_t) anchor_layers.size();
+    const int32_t n_fuse = (int32_t) fuse_depths.size();
     const int32_t n_real = (int32_t) rows_tok.size();
     GGML_ASSERT(n_real <= N);
 
-    std::vector<int32_t> tok(N, 0), rope(N, 0), aid(N, 0), aeid(N, 0), aidx(N, 0), fidx(fuse ? (size_t) n_anchor*N : 0, 0);
+    std::vector<int32_t> tok(N, 0), rope(N, 0), aid(N, 0), aeid(N, depth_emb_row[0]), aidx(N, 0),
+                         fidx(fuse ? (size_t) n_fuse*N : 0, 0);
     std::vector<int32_t> eidx(emb_in_graph ? 0 : N, 0);
     std::vector<float>   rpos(N, POS_PAD), cval(N, POS_NONE), wpos(NW, POS_NONE);
     std::vector<int64_t> kvi(N);
     for (int32_t i = 0; i < N; i++) {
         kvi[i] = n_ring + n_wcell + (i % n_scratch);
     }
-    auto store_row = [&](int64_t e, int32_t t) {
-        upload_tap(e, t);
-        return (int32_t) (1 + (e % n_eval_ring)*n_tap + t);
-    };
     for (int32_t i = 0; i < n_real; i++) {
         const int64_t e = rows_eval[i];
-        const int32_t a = rows_anchor[i];
+        const int32_t d = rows_depth[i];
         tok[i]  = rows_tok[i];
         rope[i] = rows_pos[i];
         rpos[i] = (float) rows_pos[i];
         cval[i] = (float) rows_pos[i];
-        aeid[i] = a;
-        aid[i]  = a > 0 ? a - 1 : 0;
-        aidx[i] = a > 0 ? store_row(e, tap_index(a)) : 0;
+        aeid[i] = depth_emb_row[d];
+        aid[i]  = d > 0 ? depth_proj[d] : 0;
+        aidx[i] = store_row(e, d);
         if (rows_window[i]) {
             const int32_t c = rows_pos[i] % n_wcell;
             kvi[i] = n_ring + c;
@@ -850,14 +1054,16 @@ void llama_pipe_drafter::run_rows(const std::vector<int64_t> & rows_eval, const 
             cell_pos_host[kvi[i]] = (float) rows_pos[i];
         }
         if (fuse) {
-            for (int32_t k = 0; k < n_anchor; k++) {
-                // window rows: every shallower anchor; committed rows: layer 9's input next to the final state
-                const bool use = rows_window[i] ? (k + 1 < a) : (k == 0 && a == n_anchor + 1);
-                fidx[(size_t) k*N + i] = use ? store_row(e, k) : 0;
+            for (int32_t k = 0; k < n_fuse; k++) {
+                // window rows: every shallower fused depth; committed rows: the first fused depth next to the final state
+                const bool use = rows_window[i] ? fuse_depths[k] < d : (k == 0 && d == n_target);
+                fidx[(size_t) k*N + i] = use ? store_row(e, fuse_depths[k]) : 0;
             }
         }
         if (!emb_in_graph) {
-            eidx[i] = store_row(e, n_anchor + 1);
+            const int32_t t = (int32_t) tap_depth.size();
+            upload_tap(e, t);
+            eidx[i] = (int32_t) (1 + (e % n_eval_ring)*n_tap + t);
         }
     }
 
@@ -897,24 +1103,23 @@ int32_t llama_pipe_drafter::launch(const llama_pipe_draft_row * rows, int32_t n_
         return -1;
     }
     const int32_t N = g_step->n_rows;
-    const int32_t n_anchor = (int32_t) anchor_layers.size();
 
     // the window: the newest N - 1 tokens in flight at most (one row is kept for a commit)
-    int32_t w0 = std::max(0, n_rows - (N - 1));
+    const int32_t w0 = std::max(0, n_rows - (N - 1));
     const int32_t n_win = n_rows - w0;
 
     std::sort(commits.begin(), commits.end(), [](const pending & a, const pending & b) { return a.pos < b.pos; });
 
     std::vector<int64_t> re;
-    std::vector<int32_t> ra;
+    std::vector<int32_t> rd;
     std::vector<llama_token> rt;
     std::vector<llama_pos> rp;
     std::vector<bool> rw;
     auto flush_commits = [&](size_t n_take, bool with_window) {
-        re.clear(); ra.clear(); rt.clear(); rp.clear(); rw.clear();
+        re.clear(); rd.clear(); rt.clear(); rp.clear(); rw.clear();
         for (size_t i = 0; i < n_take; i++) {
             re.push_back(commits[i].eval);
-            ra.push_back(committed);
+            rd.push_back(committed);
             rt.push_back(commits[i].tok);
             rp.push_back(commits[i].pos);
             rw.push_back(false);
@@ -924,20 +1129,20 @@ int32_t llama_pipe_drafter::launch(const llama_pipe_draft_row * rows, int32_t n_
         if (with_window) {
             for (int32_t j = w0; j < n_rows; j++) {
                 const int32_t off = n_rows - 1 - j;   // 0 = the newest
-                const int32_t a = off < (int32_t) stair.size() ? stair[off] : n_anchor;
+                const int32_t d = off < (int32_t) stair.size() ? stair[off] : depth_deep;
                 const int32_t s = rows[j].slot;
                 if (s < 0 || s >= (int32_t) eval_of_slot.size() || eval_of_slot[s] < 0) {
                     continue;
                 }
                 re.push_back(eval_of_slot[s]);
-                ra.push_back(a);
+                rd.push_back(d);
                 rt.push_back(rows[j].token);
                 rp.push_back(rows[j].pos);
                 rw.push_back(true);
             }
             i_out = (int32_t) rt.size() - 1;
         }
-        run_rows(re, ra, rt, rp, rw, std::max(0, i_out));
+        run_rows(re, rd, rt, rp, rw, std::max(0, i_out));
     };
     // a commit whose taps were overwritten by later evaluations is dropped (its row stays missing)
     commits.erase(std::remove_if(commits.begin(), commits.end(),
@@ -996,16 +1201,17 @@ llama_token llama_pipe_drafter::get(float u, float * p_top) {
     return pick >= 0 ? vocab[pick] : -1;
 }
 
-// committed rows from host rows of the final state (and layer 9's input) in capture i_cap, starting at row0
+// committed rows from host rows (the committed depth's states and the first fused depth's) in capture i_cap, from row0
 void llama_pipe_drafter::commit_rows_bulk(const llama_token * toks, const llama_pos * pos, int32_t n, int32_t i_cap, size_t row0) {
     capture & cap = caps[i_cap];
     const int32_t NW = n_wcell + n_scratch;
+    const bool fuse_committed = fuse && committed == n_target;
     int32_t done = 0;
     while (done < n) {
         const int32_t m = std::min(n - done, n - done > 64 ? 256 : 64);
         graph_inst & g = m > 64 ? *g_bulk_large : *g_bulk_small;
         const int32_t N = g.n_rows;
-        std::vector<int32_t> tok(N, 0), rope(N, 0), aeid(N, committed), empty;
+        std::vector<int32_t> tok(N, 0), rope(N, 0), aeid(N, depth_emb_row[committed]), empty;
         std::vector<float>   rpos(N, POS_PAD), cval(N, POS_NONE), wpos(NW, POS_NONE);
         std::vector<int64_t> kvi(N);
         for (int32_t i = 0; i < N; i++) {
@@ -1020,22 +1226,21 @@ void llama_pipe_drafter::commit_rows_bulk(const llama_token * toks, const llama_
                 kvi[i] = n_ring + n_wcell + (i % n_scratch);
             }
         }
-        const bool with_l9 = fuse && committed == (int32_t) anchor_layers.size() + 1;
         if (cap.ev_full && committed > 0) {
             ggml_backend_event_wait(backend, cap.ev_full);
         }
-        if (cap.ev_l9 && with_l9) {
-            ggml_backend_event_wait(backend, cap.ev_l9);
+        if (cap.ev_fz && fuse_committed) {
+            ggml_backend_event_wait(backend, cap.ev_fz);
         }
         const size_t rb = (size_t) n_embd*sizeof(float);
         if (committed > 0) {
             ggml_backend_tensor_set_async(backend, g.h_full, cap.full + (row0 + done)*n_embd, 0, m*rb);
         }
-        if (with_l9 && g.h_l9) {
-            ggml_backend_tensor_set_async(backend, g.h_l9, cap.l9 + (row0 + done)*n_embd, 0, m*rb);
+        if (fuse_committed && g.h_fuse) {
+            ggml_backend_tensor_set_async(backend, g.h_fuse, cap.fz + (row0 + done)*n_embd, 0, m*rb);
         }
         if (!emb_in_graph) {
-            // the embeddings were looked up into the capture's l9 area's tail: see on_ubatch
+            // the embeddings were looked up after the committed rows: see cap_take
             ggml_backend_tensor_set_async(backend, g.emb_rows, cap.full + (cap.n_rows_max + row0 + done)*n_embd, 0, m*rb);
         }
         const int32_t li = launch_next;
@@ -1062,6 +1267,27 @@ void llama_pipe_drafter::commit_rows_bulk(const llama_token * toks, const llama_
     }
 }
 
+// the next capture buffer, large enough for n_rows rows: committed-depth rows, then embedding rows, then fused rows
+llama_pipe_drafter::capture & llama_pipe_drafter::cap_take(int32_t & ic, size_t n_rows) {
+    ic = cap_next;
+    cap_next = (cap_next + 1) % n_cap_ring;
+    capture & cap = caps[ic];
+    if (cap.pending) {
+        ggml_backend_event_synchronize(cap.ev_done);
+        cap.pending = false;
+    }
+    if (cap.n_rows_max < n_rows) {
+        if (cap.buf) {
+            ggml_backend_buffer_free(cap.buf);
+        }
+        cap.n_rows_max = std::max<size_t>(n_rows, 512);
+        cap.buf  = ggml_backend_buft_alloc_buffer(buft_host, cap.n_rows_max*3*n_embd*sizeof(float));
+        cap.full = (float *) ggml_backend_buffer_get_base(cap.buf);
+        cap.fz   = cap.full + 2*cap.n_rows_max*n_embd;
+    }
+    return cap;
+}
+
 void llama_pipe_drafter::on_ubatch(const llama_ubatch & ub, const llm_graph_result * res, ggml_backend_sched_t sched) {
     if (seq < 0 || ub.token == nullptr || ub.n_tokens == 0 || !graphs_valid) {
         return;
@@ -1077,58 +1303,41 @@ void llama_pipe_drafter::on_ubatch(const llama_ubatch & ub, const llm_graph_resu
     if (idx.empty()) {
         return;
     }
-    // the committed anchor of every position: the final state (from the all-positions branch, or the outputs when
-    // every position is one), or a layer input; layer 9's input too for a fused head
-    const int32_t n_anchor = (int32_t) anchor_layers.size();
+    // the committed depth of every position: the final state (from the all-positions branch, or the outputs when every
+    // position is one), or a layer input; the first fused depth too for a fused head
     ggml_tensor * t_full = nullptr;
-    if (committed == n_anchor + 1) {
+    if (committed == n_target) {
         t_full = res->t_embd_all;
         if (t_full == nullptr && res->get_embd() && res->get_embd()->ne[1] == n) {
             t_full = res->get_embd();
         }
     } else if (committed > 0) {
-        t_full = res->get_layer_inp(anchor_layers[committed - 1]);
+        t_full = res->get_layer_inp(committed);
     }
-    const bool with_l9 = fuse && committed == n_anchor + 1;
-    ggml_tensor * t_l9 = with_l9 ? res->get_layer_inp(anchor_layers[0]) : nullptr;
-    if ((committed > 0 && (t_full == nullptr || t_full->ne[1] != n)) || (with_l9 && (t_l9 == nullptr || t_l9->ne[1] != n))) {
+    const bool fuse_committed = fuse && committed == n_target;
+    ggml_tensor * t_fz = fuse_committed ? res->get_layer_inp(fuse_depths[0]) : nullptr;
+    if ((committed > 0 && (t_full == nullptr || t_full->ne[1] != n)) || (fuse_committed && (t_fz == nullptr || t_fz->ne[1] != n))) {
         return;
     }
     // computed in this graph (a tensor outside it has no backend and no data)
     if ((t_full && (!ggml_backend_sched_get_tensor_backend(sched, t_full) || !t_full->data)) ||
-            (t_l9 && (!ggml_backend_sched_get_tensor_backend(sched, t_l9) || !t_l9->data))) {
+            (t_fz && (!ggml_backend_sched_get_tensor_backend(sched, t_fz) || !t_fz->data))) {
         LLAMA_LOG_WARN("%s: the micro-batch's hidden states are not in its graph: its positions stay uncommitted\n", __func__);
         return;
     }
 
-    const int32_t ic = cap_next;
-    cap_next = (cap_next + 1) % n_cap_ring;
-    capture & cap = caps[ic];
-    if (cap.pending) {
-        ggml_backend_event_synchronize(cap.ev_done);
-        cap.pending = false;
-    }
-    // full rows, then (host lookup) embedding rows; layer 9 rows in their own area
-    if (cap.n_rows_max < (size_t) n) {
-        if (cap.buf) {
-            ggml_backend_buffer_free(cap.buf);
-        }
-        cap.n_rows_max = std::max<size_t>(n, 512);
-        const size_t rows = cap.n_rows_max*(2 + (fuse ? 1 : 0));
-        cap.buf  = ggml_backend_buft_alloc_buffer(buft_host, rows*n_embd*sizeof(float));
-        cap.full = (float *) ggml_backend_buffer_get_base(cap.buf);
-        cap.l9   = fuse ? cap.full + 2*cap.n_rows_max*n_embd : nullptr;
-    }
+    int32_t ic = 0;
+    capture & cap = cap_take(ic, n);
     auto grab = [&](ggml_tensor * t, float * dst, ggml_backend_event_t & ev, ggml_backend_dev_t & ev_dev) {
         ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched, t);
         ggml_backend_tensor_get_async(be, t, dst, 0, (size_t) n*n_embd*sizeof(float));
-        ggml_backend_dev_t d = ggml_backend_get_device(be);
-        if (ev == nullptr || ev_dev != d) {
+        ggml_backend_dev_t dv = ggml_backend_get_device(be);
+        if (ev == nullptr || ev_dev != dv) {
             if (ev) {
                 ggml_backend_event_free(ev);
             }
-            ev = ggml_backend_event_new(d);
-            ev_dev = d;
+            ev = ggml_backend_event_new(dv);
+            ev_dev = dv;
         }
         if (ev) {
             ggml_backend_event_record(ev, be);
@@ -1139,8 +1348,8 @@ void llama_pipe_drafter::on_ubatch(const llama_ubatch & ub, const llm_graph_resu
     if (committed > 0) {
         grab(t_full, cap.full, cap.ev_full, cap.dev_full);
     }
-    if (with_l9) {
-        grab(t_l9, cap.l9, cap.ev_l9, cap.dev_l9);
+    if (fuse_committed) {
+        grab(t_fz, cap.fz, cap.ev_fz, cap.dev_fz);
     }
     if (!emb_in_graph) {
         for (int32_t i = 0; i < n; i++) {
@@ -1169,26 +1378,12 @@ void llama_pipe_drafter::on_ubatch(const llama_ubatch & ub, const llm_graph_resu
 }
 
 void llama_pipe_drafter::test_commit_bulk(const llama_token * toks, const llama_pos * pos, int32_t n, const float * h_full,
-                                          const float * h_l9) {
-    const int32_t ic = cap_next;
-    cap_next = (cap_next + 1) % n_cap_ring;
-    capture & cap = caps[ic];
-    if (cap.pending) {
-        ggml_backend_event_synchronize(cap.ev_done);
-        cap.pending = false;
-    }
-    if (cap.n_rows_max < (size_t) n) {
-        if (cap.buf) {
-            ggml_backend_buffer_free(cap.buf);
-        }
-        cap.n_rows_max = std::max<size_t>(n, 512);
-        cap.buf  = ggml_backend_buft_alloc_buffer(buft_host, cap.n_rows_max*(2 + (fuse ? 1 : 0))*n_embd*sizeof(float));
-        cap.full = (float *) ggml_backend_buffer_get_base(cap.buf);
-        cap.l9   = fuse ? cap.full + 2*cap.n_rows_max*n_embd : nullptr;
-    }
+                                          const float * h_fuse) {
+    int32_t ic = 0;
+    capture & cap = cap_take(ic, n);
     memcpy(cap.full, h_full, (size_t) n*n_embd*sizeof(float));
-    if (fuse) {
-        memcpy(cap.l9, h_l9, (size_t) n*n_embd*sizeof(float));
+    if (fuse && h_fuse) {
+        memcpy(cap.fz, h_fuse, (size_t) n*n_embd*sizeof(float));
     }
     if (!emb_in_graph) {
         for (int32_t i = 0; i < n; i++) {
@@ -1199,9 +1394,9 @@ void llama_pipe_drafter::test_commit_bulk(const llama_token * toks, const llama_
         ggml_backend_event_free(cap.ev_full);
         cap.ev_full = nullptr;
     }
-    if (cap.ev_l9) {
-        ggml_backend_event_free(cap.ev_l9);
-        cap.ev_l9 = nullptr;
+    if (cap.ev_fz) {
+        ggml_backend_event_free(cap.ev_fz);
+        cap.ev_fz = nullptr;
     }
     commit_rows_bulk(toks, pos, n, ic, 0);
 }

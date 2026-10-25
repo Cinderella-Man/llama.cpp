@@ -1961,10 +1961,23 @@ int32_t llama_context::pipe_draft_init(const llama_pipe_draft_params & params) {
         return -1;
     }
 
+    // the layer split as the devices run it: layers per device in order (the output head goes with the last)
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    std::vector<int32_t> split;
+    bool dev_has_layers = false;
+    for (int32_t il = 0; il < n_layer; il++) {
+        ggml_backend_dev_t dl = model.dev_layer(il);
+        if (il == 0 || dl != model.dev_layer(il - 1)) {
+            split.push_back(0);
+        }
+        split.back()++;
+        dev_has_layers = dev_has_layers || dl == dev;
+    }
+
     synchronize();
     pipe_drain();
 
-    auto d = llama_pipe_drafter::load(params, model.tok_embd, dev);
+    auto d = llama_pipe_drafter::load(params, model.tok_embd, dev, split, n_layer, dev_has_layers);
     if (!d) {
         return -1;
     }
@@ -5461,6 +5474,7 @@ llama_pipe_draft_params llama_pipe_draft_default_params(void) {
         /*.alpha  =*/ 0.0f,
         /*.top_k  =*/ 16,
         /*.stair  =*/ nullptr,
+        /*.kind   =*/ nullptr,
     };
     return p;
 }

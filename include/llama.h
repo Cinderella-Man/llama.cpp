@@ -1099,11 +1099,13 @@ extern "C" {
     LLAMA_API void llama_pipe_drain(struct llama_context * ctx);
 
     // Staircase drafter for pipelined speculation (experimental): a small head on one device that guesses the next token
-    // from the hidden states the pipe slots compute anyway. Each pipe evaluation of the drafter's sequence copies the
-    // inputs of the drafter's anchor layers and its final hidden state into host memory as soon as each device is done
-    // with the token; llama_decode micro-batches of that sequence (the prompt) hand over their final hidden states. A
-    // guess reads, for every token still in flight, the deepest anchor of the drafter's staircase, and for every older
-    // token its final state. The executor still samples every token and compares, so the output never depends on it.
+    // from the hidden states the pipe slots compute anyway. The window comes from the layer split: with every device busy
+    // the token m cycles older has passed every device that ends within m cycles, and each such depth becomes the deepest
+    // depth the head was trained on at or below it. Each pipe evaluation of the drafter's sequence copies the inputs of
+    // those layers and its final hidden state into host memory as soon as each device is done with the token;
+    // llama_decode micro-batches of that sequence (the prompt) hand over their final hidden states. A guess reads, for
+    // every token still in flight, its depth in the window, and for every older token its final state. The executor
+    // still samples every token and compares, so the output never depends on it.
     //
     // Usage, one sequence:
     //   llama_pipe_draft_init before llama_pipe_init (and before the prompt is decoded)
@@ -1118,7 +1120,9 @@ extern "C" {
         int32_t n_rows;      // rows per guess: committed tokens since the last guess plus the tokens in flight
         float   alpha;       // the head's distribution q^alpha for the draw (<= 0: the file's value)
         int32_t top_k;       // candidates the draw chooses from
-        const char * stair;  // anchors of the tokens in flight, newest first, e.g. "L9,L17,L33,L41" (NULL: the file's)
+        const char * stair;  // depths of the tokens in flight, newest first, e.g. "L9,L17,L33,L41" (NULL: from the split)
+        const char * kind;   // "stair": the head starts after its device's stage, "pre": with the cycle (a spare device);
+                             // NULL: stair on a device that holds layers, else pre
     };
 
     struct llama_pipe_draft_row {
