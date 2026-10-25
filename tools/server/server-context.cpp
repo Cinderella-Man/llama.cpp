@@ -4907,7 +4907,11 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                        // a sliding-window checkpoint holds every position up to pos_max with its window:
+                                        // the prompt resumes right after it, as the batch after the checkpoint did when
+                                        // it was taken (so a GPU rounds that batch the same way); stock resumes at
+                                        // pos_max, which a recurrent state needs
+                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max + (ckpt_trim ? 1 : 0)));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, %.1f ms)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024, (ggml_time_us() - t_ckpt_start) / 1000.0);
 
