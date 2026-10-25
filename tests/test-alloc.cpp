@@ -642,6 +642,59 @@ static void test_reallocation() {
     }
 }
 
+// x1 = x0 * 2, plus two copies of an input as leaves that no node reads (as the scheduler adds the input copies of its
+// other pipeline copies); copy `packed_copy` gets its memory from `packed` before allocation (a packed input upload)
+static void build_unread_leaf_graph(ggml_context * ctx, ggml_cgraph * graph, ggml_backend_buffer_t packed, int packed_copy,
+        ggml_tensor ** copies) {
+    ggml_tensor * x0 = make_input_with_size(ctx, 16);
+    ggml_tensor * x1 = ggml_scale(ctx, x0, 2.0f);
+    for (int c = 0; c < 2; c++) {
+        copies[c] = make_input_with_size(ctx, 16);
+        ggml_set_output(copies[c]);
+    }
+    assign_names(ctx);
+    GGML_ASSERT(ggml_backend_tensor_alloc(packed, copies[packed_copy], ggml_backend_buffer_get_base(packed)) == GGML_STATUS_SUCCESS);
+
+    ggml_set_output(x1);
+    ggml_build_forward_expand(graph, x1);
+    for (int c = 0; c < 2; c++) {
+        graph->leafs[graph->n_leafs++] = copies[c];
+    }
+}
+
+// A plan made while an unread leaf had memory of its own must not be applied to the next graph of the same shape, whose
+// leaf at that index needs memory from the allocator
+static void test_unread_leaf_needs_memory(bool multi_buffer) {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[2] = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_gallocr_ptr        galloc(multi_buffer ? ggml_gallocr_new_n(bufts, 2) : ggml_gallocr_new(bufts[0]));
+    ggml_backend_buffer_ptr packed(ggml_backend_buft_alloc_buffer(&backend_a.buffer_type, 64));
+
+    int leaf_buffer_ids[3] = { 0, 0, 0 };
+    int node_buffer_ids[1] = { 0 };
+    ggml_tensor * copies[2];
+
+    auto [ctx0, graph0, ctx0_ptr] = make_context();
+    build_unread_leaf_graph(ctx0, graph0, packed.get(), 0, copies);
+    GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph0, node_buffer_ids, leaf_buffer_ids));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph0));
+    GGML_ASSERT(copies[1]->data != nullptr);
+
+    auto [ctx1, graph1, ctx1_ptr] = make_context();
+    build_unread_leaf_graph(ctx1, graph1, packed.get(), 1, copies);
+    bool ok = ggml_gallocr_alloc_graph(galloc.get(), graph1);
+    if (multi_buffer) {
+        // a multi-buffer allocator cannot plan again by itself: the scheduler reserves with the new graph
+        GGML_ASSERT(!ok);
+        GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph1, node_buffer_ids, leaf_buffer_ids));
+        ok = ggml_gallocr_alloc_graph(galloc.get(), graph1);
+    }
+    GGML_ASSERT(ok);
+    GGML_ASSERT(copies[0]->data != nullptr && copies[0]->buffer != packed.get());
+    check_all_allocated(graph1);
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1120,6 +1173,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_unread_leaf_needs_memory(single buffer)", []() { test_unread_leaf_needs_memory(false); });
+    run("test_unread_leaf_needs_memory(multi buffer)", []() { test_unread_leaf_needs_memory(true); });
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
