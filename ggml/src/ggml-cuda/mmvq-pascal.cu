@@ -988,6 +988,93 @@ bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & a, cudaStr
     return false;
 }
 
+// One token of an F16 matrix with FP32 activations, as mul_mat_vec_f computes it (FP32 accumulation on compute 6.1).
+// The stock kernel gives each row a block of up to 256 threads that read 4 bytes each per iteration (~50 GB/s for a
+// 2048-wide MoE router on a P106); here a lane group sized to the row owns R rows, and per iteration each lane reads 16
+// bytes of each row and the 32 bytes of activations they need, which the R rows share; all loads are coalesced 128-bit
+// loads. Partial sums are reduced with shuffles.
+template <int R>
+__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_f16_pascal(const char * x, const float * y, float * dst, const int nrows, const int row_bytes,
+                                              const int lpr_log2, const int niter) {
+    constexpr int NW = MMVQ_PASCAL_NWARPS;
+    const int lane = threadIdx.x;
+    const int lpr  = 1 << lpr_log2;
+    const int sl   = lane & (lpr - 1);
+    const int row0 = (((blockIdx.x * NW + threadIdx.y) << (5 - lpr_log2)) + (lane >> lpr_log2)) * R;
+
+    ggml_cuda_pdl_sync();
+    const uint4 * xr[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        xr[i] = (const uint4 *) (x + (int64_t) min(row0 + i, nrows - 1) * row_bytes) + sl;
+    }
+    const float4 * yp = (const float4 *) y + 2 * sl;
+
+    float acc[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        acc[i] = 0.0f;
+    }
+    for (int it = 0; it < niter; ++it) {
+        uint4 w[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            w[i] = __ldg(xr[i]);
+            xr[i] += lpr;
+        }
+        const float4 y0 = __ldg(yp);
+        const float4 y1 = __ldg(yp + 1);
+        yp += 2 * lpr;
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            acc[i] = mmvqp_f16_dot8(w[i], y0, y1, acc[i]);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            if (off < lpr) {
+                acc[i] += __shfl_xor_sync(0xFFFFFFFF, acc[i], off, WARP_SIZE);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        if ((i & (lpr - 1)) == sl && row0 + i < nrows) {
+            dst[row0 + i] = acc[i];
+        }
+    }
+}
+
+bool ggml_cuda_mmvf_pascal_f16(const void * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
+                               const int64_t stride_row, cudaStream_t stream) {
+    if (!ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
+            mmvqp_skip_type(GGML_TYPE_F16)) {
+        return false;
+    }
+    const int64_t row_bytes = stride_row * (int64_t) sizeof(half);
+    if (ncols % 8 != 0 || row_bytes % 16 != 0 || row_bytes > INT_MAX || nrows > INT_MAX || !mmvqp_aligned(x, 16) ||
+            !mmvqp_aligned(y, 16)) {
+        return false;
+    }
+    constexpr int R = 2;
+    const int64_t chunks = ncols / 8;
+    int lpr_log2 = 0;
+    while (lpr_log2 < 5 && chunks % (2 << lpr_log2) == 0) {
+        lpr_log2++;
+    }
+    const int  niter          = (int) (chunks >> lpr_log2);
+    const int  rows_per_block = MMVQ_PASCAL_NWARPS * (WARP_SIZE >> lpr_log2) * R;
+    const dim3 grid((unsigned) ((nrows + rows_per_block - 1) / rows_per_block), 1, 1);
+    const dim3 block(WARP_SIZE, MMVQ_PASCAL_NWARPS, 1);
+    mul_mat_vec_f16_pascal<R><<<grid, block, 0, stream>>>((const char *) x, y, dst, (int) nrows, (int) row_bytes, lpr_log2,
+                                                          niter);
+    return true;
+}
+
 #else
 
 bool ggml_cuda_mmvq_pascal_active(const int cc) {
@@ -1009,6 +1096,12 @@ bool ggml_cuda_mmvq_pascal(
 
 bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & args, cudaStream_t stream) {
     GGML_UNUSED_VARS(args, stream);
+    return false;
+}
+
+bool ggml_cuda_mmvf_pascal_f16(const void * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
+                               const int64_t stride_row, cudaStream_t stream) {
+    GGML_UNUSED_VARS(x, y, dst, ncols, nrows, stride_row, stream);
     return false;
 }
 
