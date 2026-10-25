@@ -801,4 +801,23 @@ static constexpr mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate)
     }
 }
 
+// F16 weights times FP32 activations, one lane's 16-byte chunk: 8 weights (w, as 4 half2 words) and the 8 matching
+// activations (y0, y1), added to acc in FP32 one weight after the other. The Pascal F16 product (mul_mat_vec_f16_pascal)
+// sums each row this way per lane, then over the lane group with xor shuffles.
+static __device__ __forceinline__ float mmvqp_f16_dot8(const uint4 w, const float4 y0, const float4 y1, float acc) {
+    const float2 a0 = __half22float2(*reinterpret_cast<const half2 *>(&w.x));
+    const float2 a1 = __half22float2(*reinterpret_cast<const half2 *>(&w.y));
+    const float2 a2 = __half22float2(*reinterpret_cast<const half2 *>(&w.z));
+    const float2 a3 = __half22float2(*reinterpret_cast<const half2 *>(&w.w));
+    acc = fmaf(a0.x, y0.x, acc);
+    acc = fmaf(a0.y, y0.y, acc);
+    acc = fmaf(a1.x, y0.z, acc);
+    acc = fmaf(a1.y, y0.w, acc);
+    acc = fmaf(a2.x, y1.x, acc);
+    acc = fmaf(a2.y, y1.y, acc);
+    acc = fmaf(a3.x, y1.z, acc);
+    acc = fmaf(a3.y, y1.w, acc);
+    return acc;
+}
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

@@ -13743,6 +13743,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 6, true,  512, 512, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 6, false, 2048, 512, 512));
 
+    // F16 products at a MoE router's shape (2048 -> 256; Flint's K2h-r16 and G3 keep the router in F16), an odd row count,
+    // a 4096-row matrix and a row width that isn't a multiple of 8 (left to mul_mat_vec_f): one token runs the Pascal F16
+    // kernel (mmvq-pascal.cu), two tokens are the control
+    for (int64_t n : { 1, 2 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 257, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4096, n, 2048, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 2052, { 1, 1 }, { 1, 1 }));
+    }
+
     // the K-quants of Q4_K_M files at the shapes of Qwen3.6-35B-A3B (8 of 256 experts of width 512, a 512-wide shared
     // expert, an 8192-row gated query projection) and of Qwen3-30B-A3B's 768-wide experts, whose 3 super-blocks per row
     // give one lane per row
