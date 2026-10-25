@@ -1064,8 +1064,9 @@ extern "C" {
     // A token that is the device-sampled output of slot_src's evaluation, which may still be in flight: the id is copied
     // between the devices into the token input of this evaluation and never reaches the host, so the host can submit a
     // sequence's next token before its current one is sampled (llama_pipe_get_sampled(ctx, slot_src) still returns it).
-    // Needs the token embeddings on a device (LLAMA_INPUT_ON_GPU=1, the token ids then read on that device only) and a
-    // sampler that does not read the host's token history. Returns as llama_pipe_submit.
+    // Needs the token embeddings on a device (LLAMA_INPUT_ON_GPU=1, the token ids then read on that device only), a
+    // sampler that does not read the host's token history, and a model whose KV cells keep no token (not M-RoPE or PLE).
+    // Returns as llama_pipe_submit.
     LLAMA_API int32_t llama_pipe_submit_fed(
             struct llama_context * ctx,
                          int32_t   slot,

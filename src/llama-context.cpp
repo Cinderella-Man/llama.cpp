@@ -2017,6 +2017,13 @@ int32_t llama_context::pipe_submit(int32_t i_slot, const llama_token * tokens, i
 }
 
 int32_t llama_context::pipe_submit_fed(int32_t i_slot, int32_t i_slot_src, llama_pos pos, llama_seq_id seq_id) {
+    // the KV cells of M-RoPE and PLE models record their token (llama_kv_cache::has_cell_ext: saved with the state, and
+    // read back by the PLE n-gram inputs of later tokens), but a fed token's id is still on the device when its cell is
+    // written, so the cell would record the placeholder below
+    if (model.hparams.n_pos_per_embd() > 1 || model.hparams.ple_n_heads > 0) {
+        LLAMA_LOG_ERROR("%s: fed tokens need a model whose KV cells keep no token (not M-RoPE or PLE)\n", __func__);
+        return -1;
+    }
     if (i_slot_src < 0 || i_slot_src >= (int32_t) pipe_slots.size() || i_slot_src == i_slot) {
         LLAMA_LOG_ERROR("%s: invalid source slot %d\n", __func__, i_slot_src);
         return -1;
