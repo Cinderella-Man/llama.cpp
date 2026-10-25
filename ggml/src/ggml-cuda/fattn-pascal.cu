@@ -240,7 +240,7 @@ static __global__ void flash_attn_ext_pascal_f16(const fap_args a) {
 static int fap_mode() {
     static const int mode = [] {
         const char * env = getenv("GGML_CUDA_FATTN_PASCAL");
-        return env ? atoi(env) : 1;
+        return env ? atoi(env) : 0;
     }();
     return mode;
 }

@@ -778,8 +778,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     // 2: an evaluation submitted with nothing in flight stages each split's host inputs and uploads them with one
     // asynchronous copy, instead of an event wait and a synchronous copy per input (process_ubatch); 0: as stock
     // llama.cpp. Not 1 (an asynchronous copy from the inputs themselves): the next micro-batch of a llama_decode call
-    // may overwrite them before the copy has run.
-    plain_upload = !model.devices.empty() && llama_backend_dev_has_feature(model.devices[0].dev, "COMPUTE_6_1") ? 2 : 0;
+    // may overwrite them before the copy has run. Off unless LLAMA_INPUT_UPLOAD is set: on nine P106-090 cards it gave
+    // nothing measurable (release measurements 2026-10-25), and the stock path is the one every check covers.
+    plain_upload = 0;
     if (const char * env = getenv("LLAMA_INPUT_UPLOAD")) {
         plain_upload = atoi(env) != 0 ? 2 : 0;
     }

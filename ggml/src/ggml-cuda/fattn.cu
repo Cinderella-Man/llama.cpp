@@ -762,7 +762,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    // one-token decode on compute 6.1 (GGML_CUDA_FATTN_PASCAL)
+    // one-token decode on compute 6.1, only with GGML_CUDA_FATTN_PASCAL=1 (off by default: slower on the P106)
     if (ggml_cuda_flash_attn_ext_pascal(ctx, dst)) {
         return;
     }

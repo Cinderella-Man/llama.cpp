@@ -15,6 +15,8 @@
 //   - every block writes its partial output, maximum and sum; the last one to finish (a counter) merges them, adds the
 //     sinks and writes the result.
 // Results match the stock kernels to rounding (FP32 throughout, a different summation order), not bit for bit.
-// GGML_CUDA_FATTN_PASCAL: 0 off, 1 compute capability 6.1 only (default), 2 any NVIDIA GPU (for testing).
+// GGML_CUDA_FATTN_PASCAL: 0 off (default), 1 compute capability 6.1 only, 2 any NVIDIA GPU (for testing). Off by default:
+// on nine P106-090 it decoded slower than the stock kernels (Flint K2h-r16, tg128 36.8 against 40.3 tok/s; after a
+// 32k-token context 15.0 against 25.4).
 // Returns true if it ran the call; false leaves it to the stock kernels.
 bool ggml_cuda_flash_attn_ext_pascal(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
