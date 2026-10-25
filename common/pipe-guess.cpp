@@ -136,7 +136,7 @@ llama_token common_pipe_guesser::guess(const llama_token * inflight, size_t n_in
             n_store += g >= 0;
         }
     }
-    if (g < 0 && kind == CONT) {
+    if (g < 0 && kind == CONT && cont_any) {
         g = cont_guess();
     }
 

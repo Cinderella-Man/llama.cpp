@@ -1719,7 +1719,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--pipe-guess"}, "TYPE",
         string_format("guesses for --pipe-depth: none, copy (the token after the longest earlier match of the text's end), "
             "cont (copy, else the most frequent continuation of the last 1-8 tokens in the request) or staircase "
-            "(copy, else the staircase drafter of --pipe-draft) (default: %s)",
+            "(copy, with --pipe-store also the request's continuations of 2-token or longer contexts and the store, else "
+            "the staircase drafter of --pipe-draft) (default: %s)",
             params.pipe_guess.c_str()),
         [](common_params & params, const std::string & value) {
             if (value != "none" && value != "copy" && value != "cont" && value != "staircase") {
@@ -1790,7 +1791,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--pipe-store"}, "FNAME",
-        "continuation store for --pipe-guess cont: the generated tokens of other answers of the same model, memory-mapped "
+        "continuation store for --pipe-guess cont and staircase: the generated tokens of other answers of the same model, memory-mapped "
         "(built by bench/ngram_replay/datastore.cpp, 8 bytes per token); asked after the request's own continuations of "
         "2-token or longer contexts (default: none)",
         [](common_params & params, const std::string & value) {

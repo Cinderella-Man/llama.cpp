@@ -1828,11 +1828,14 @@ private:
                 for (auto & slot : slots) {
                     slot.pipe_guesser.store = pipe_store.get();
                     slot.pipe_draws = true;
-                    // staircase: the copy lookup first, the drafter for the rest
+                    // staircase: the copy lookup first (with a store also the request's continuations of 2-token or
+                    // longer contexts and the store), the drafter for the rest
+                    const bool stair = params_base.pipe_guess == "staircase";
                     slot.pipe_guesser.kind = params_base.pipe_guess == "none" ? common_pipe_guesser::NONE :
                                              params_base.pipe_guess == "copy" ? common_pipe_guesser::COPY :
-                                             params_base.pipe_guess == "staircase" ? common_pipe_guesser::COPY :
-                                                                                common_pipe_guesser::CONT;
+                                             stair && !pipe_store ? common_pipe_guesser::COPY :
+                                                                    common_pipe_guesser::CONT;
+                    slot.pipe_guesser.cont_any = !stair;
                     slot.pipe_guesser.min_match = params_base.pipe_copy_min;
                 }
             }
@@ -3980,7 +3983,11 @@ private:
         if (!pipe_drafts(slot) || slot.pipe_win.empty() || slot.pipe_win.back().pos + 2 >= slot.n_ctx) {
             return;
         }
-        if (pipe_copy_guess(slot) < 0) {
+        // a look ahead: a store guess found here is counted when it is made
+        const int32_t n_store = slot.pipe_guesser.n_store;
+        const bool none = pipe_copy_guess(slot) < 0;
+        slot.pipe_guesser.n_store = n_store;
+        if (none) {
             pipe_draft_launch(slot);
         }
     }
