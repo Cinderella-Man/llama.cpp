@@ -18,6 +18,52 @@ template <> struct mmvqp_traits<GGML_TYPE_Q4_K>   { static constexpr int bs = si
 template <> struct mmvqp_traits<GGML_TYPE_Q5_K>   { static constexpr int bs = sizeof(block_q5_K);   static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_IQ4_XS> { static constexpr int bs = sizeof(block_iq4_xs); static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_Q6_K>   { static constexpr int bs = sizeof(block_q6_K);   static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_IQ2_S>   { static constexpr int bs = sizeof(block_iq2_s);   static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = sizeof(block_iq3_xxs); static constexpr int na = QK_K / QK8_1; };
+
+// Lookup tables of the grid types, copied into each block's shared memory by mmvqp_init_tabs (32-bit words): the grid
+// (IQ2_S: 1024 entries of 8 bytes, IQ3_XXS: 256 entries of 4 bytes), then for every sign pattern two words of byte
+// masks, 0xFF where a weight is negative, for its first and its last four weights (IQ2_S: the 256 sign bytes; IQ3_XXS:
+// the 128 7-bit patterns, whose eighth sign is their parity).
+template <ggml_type type> constexpr __host__ __device__ int mmvqp_tab_grid_words() {
+    return type == GGML_TYPE_IQ2_S ? 2*1024 : type == GGML_TYPE_IQ3_XXS ? 256 : 0;
+}
+template <ggml_type type> constexpr __host__ __device__ int mmvqp_tab_words() {
+    return type == GGML_TYPE_IQ2_S ? 2*1024 + 2*256 : type == GGML_TYPE_IQ3_XXS ? 256 + 2*128 : 0;
+}
+
+// 4 sign bits -> 4 byte masks (bit j -> 0xFF in byte j)
+static __device__ __forceinline__ uint32_t mmvqp_sign_bytes(const uint32_t s4) {
+    return ((s4 * 0x00204081u) & 0x01010101u) * 0xFFu;
+}
+
+// Fills the tables of a grid type in shared memory, with all threads of the block; the caller synchronizes the block.
+template <ggml_type type>
+static __device__ __forceinline__ void mmvqp_init_tabs(uint32_t * tab) {
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int nth = blockDim.x * blockDim.y;
+    constexpr int G = mmvqp_tab_grid_words<type>();
+    if constexpr (type == GGML_TYPE_IQ2_S) {
+        const uint32_t * grid = (const uint32_t *) iq2s_grid;
+        for (int i = tid; i < G; i += nth) {
+            tab[i] = grid[i];
+        }
+        for (int s = tid; s < 256; s += nth) {
+            tab[G + 2*s + 0] = mmvqp_sign_bytes(s & 0xF);
+            tab[G + 2*s + 1] = mmvqp_sign_bytes(s >> 4);
+        }
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        for (int i = tid; i < G; i += nth) {
+            tab[i] = iq3xxs_grid[i];
+        }
+        for (int s = tid; s < 128; s += nth) {
+            const uint32_t s8 = s | ((__popc(s) & 1) << 7); // ksigns_iq2xs[s]
+            tab[G + 2*s + 0] = mmvqp_sign_bytes(s8 & 0xF);
+            tab[G + 2*s + 1] = mmvqp_sign_bytes(s8 >> 4);
+        }
+    }
+    GGML_UNUSED_VARS(tab, tid, nth);
+}
 
 constexpr __host__ __device__ int mmvqp_gcd(const int a, const int b) {
     return b == 0 ? a : mmvqp_gcd(b, a % b);
@@ -181,7 +227,7 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             }
             S = d8 * (float) sum;
         }
-        if constexpr (type == GGML_TYPE_Q8_0) {
+        if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
             a.d[b] = d8;
             a.s[b] = 0.0f;
         } else if constexpr (type == GGML_TYPE_Q4_0) {
@@ -365,14 +411,93 @@ static __device__ __forceinline__ float mmvqp_dot_q6_K(const uint32_t * w, const
     return fmaf(mmvqp_h2f_lo(w[52]), sumf, acc);
 }
 
-// C weight blocks (raw words) times the matching activation blocks, added to acc.
+// The grid types: the grid entries are unsigned (IQ2_S 8/25/43, IQ3_XXS 4..62), and a weight's sign is applied as
+// sum(s * g * u) = sum(g * u) - 2 * sum((g & m) * u) with m the byte mask of the negative weights, two dp4a and one AND
+// per 4 weights. Each 16- or 32-weight scale multiplies its integer sum once, in FP32: no integer division.
+
+// One IQ2_S super-block as 21 words (bytes: d 0-1; qs 2-65: 32 index bytes, then 32 sign bytes; qh 66-73: the 2 high
+// index bits of each group of 8 weights; scales 74-81: a 4-bit scale per 16 weights); activation blocks a0..a0+7.
+// Weights = d * (0.5 + scale) / 4 * grid * sign.
+template <int NA>
+static __device__ __forceinline__ float mmvqp_dot_iq2_s(const uint32_t * w, const mmvqp_act<NA> & a, const int a0,
+                                                        const uint32_t * tab, float acc) {
+    const uint2 * grid  = (const uint2 *) tab;
+    const uint2 * masks = (const uint2 *) (tab + mmvqp_tab_grid_words<GGML_TYPE_IQ2_S>());
+    float sumf = 0.0f;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        const uint32_t qs = mmvqp_word_at(w, 2 + 4*ib);
+        const uint32_t sg = mmvqp_word_at(w, 34 + 4*ib);
+        const uint32_t qh = (mmvqp_word_at(w, 66 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+        const uint32_t sc = (mmvqp_word_at(w, 74 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+        int p[2] = {0, 0};
+        int n[2] = {0, 0};
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = grid[((qs >> (8*l)) & 0xff) | (((qh >> (2*l)) & 3) << 8)];
+            const uint2 m = masks[(sg >> (8*l)) & 0xff];
+            const int  u0 = a.u[a0 + ib][2*l + 0];
+            const int  u1 = a.u[a0 + ib][2*l + 1];
+            p[l/2] = ggml_cuda_dp4a((int) g.x, u0, p[l/2]);
+            p[l/2] = ggml_cuda_dp4a((int) g.y, u1, p[l/2]);
+            n[l/2] = ggml_cuda_dp4a((int) (g.x & m.x), u0, n[l/2]);
+            n[l/2] = ggml_cuda_dp4a((int) (g.y & m.y), u1, n[l/2]);
+        }
+        const int isum = (2*(int) (sc & 0xF) + 1) * (p[0] - 2*n[0]) + (2*(int) (sc >> 4) + 1) * (p[1] - 2*n[1]);
+        sumf = fmaf(a.d[a0 + ib], (float) isum, sumf);
+    }
+    return fmaf(0.125f * mmvqp_h2f_lo(w[0]), sumf, acc);
+}
+
+// One IQ3_XXS super-block as 25 words (bytes: d 0-1; 64 index bytes 2-65, one per 4 weights; 66-97: per 32 weights a
+// word of four 7-bit sign patterns and a 4-bit scale on top); activation blocks a0..a0+7.
+// Weights = d * (0.5 + scale) / 2 * grid * sign.
+template <int NA>
+static __device__ __forceinline__ float mmvqp_dot_iq3_xxs(const uint32_t * w, const mmvqp_act<NA> & a, const int a0,
+                                                          const uint32_t * tab, float acc) {
+    const uint2 * masks = (const uint2 *) (tab + mmvqp_tab_grid_words<GGML_TYPE_IQ3_XXS>());
+    float sumf = 0.0f;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        const uint32_t q0  = mmvqp_word_at(w, 2 + 8*ib);
+        const uint32_t q1  = mmvqp_word_at(w, 6 + 8*ib);
+        const uint32_t aux = mmvqp_word_at(w, 66 + 4*ib);
+        int p = 0;
+        int n = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t q  = l < 2 ? q0 : q1;
+            const uint32_t g0 = tab[(q >> (16*(l & 1)))     & 0xff];
+            const uint32_t g1 = tab[(q >> (16*(l & 1) + 8)) & 0xff];
+            const uint2    m  = masks[(aux >> (7*l)) & 0x7f];
+            const int      u0 = a.u[a0 + ib][2*l + 0];
+            const int      u1 = a.u[a0 + ib][2*l + 1];
+            p = ggml_cuda_dp4a((int) g0, u0, p);
+            p = ggml_cuda_dp4a((int) g1, u1, p);
+            n = ggml_cuda_dp4a((int) (g0 & m.x), u0, n);
+            n = ggml_cuda_dp4a((int) (g1 & m.y), u1, n);
+        }
+        sumf = fmaf(a.d[a0 + ib], (float) ((2*(int) (aux >> 28) + 1) * (p - 2*n)), sumf);
+    }
+    return fmaf(0.25f * mmvqp_h2f_lo(w[0]), sumf, acc);
+}
+
+// C weight blocks (raw words) times the matching activation blocks, added to acc. tab: the shared-memory tables of the
+// grid types (mmvqp_init_tabs).
 template <ggml_type type, int C>
-static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvqp_act<C * mmvqp_traits<type>::na> & a, float acc) {
+static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvqp_act<C * mmvqp_traits<type>::na> & a, float acc,
+                                                  const uint32_t * tab = nullptr) {
     constexpr int BS = mmvqp_traits<type>::bs;
 #pragma unroll
     for (int b = 0; b < C; ++b) {
         const int o = b * BS;
-        if constexpr (type == GGML_TYPE_Q4_K) {
+        if constexpr (type == GGML_TYPE_IQ2_S) {
+            static_assert(C == 1, "IQ2_S: one super-block per lane");
+            acc = mmvqp_dot_iq2_s(w, a, 8*b, tab, acc);
+        } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+            static_assert(C == 1, "IQ3_XXS: one super-block per lane");
+            acc = mmvqp_dot_iq3_xxs(w, a, 8*b, tab, acc);
+        } else if constexpr (type == GGML_TYPE_Q4_K) {
             acc = mmvqp_dot_q4_K(w + o/4, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_Q5_K) {
             acc = mmvqp_dot_q5_K(w + o/4, a, 8*b, acc);
@@ -443,6 +568,8 @@ static constexpr mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate)
         case GGML_TYPE_IQ4_XS:
             return gate ? mmvqp_shape{ 1, 1, false } : mmvqp_shape{ 1, 1, true };
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
             return { 1, 1, true };
         default:
             GGML_ABORT("fatal error");
