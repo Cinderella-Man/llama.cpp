@@ -14274,6 +14274,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // Ornith-1.5-122B's products (hidden 3072, experts of width 1024, 8 used of a 64-expert tensor: 25-50 M weights per
+    // expert call, far beyond a P106's 1.5 MB L2; a dense 3072 -> 8192) at 1, 2 and 4 tokens, the shapes of the IQ
+    // kernels' rig runs (fork branch pascal-p106-v3-iqmmvq): N2P and N3P against the formats of today's files (IQ2_S,
+    // IQ3_XXS, Q2_K, Q3_K) and the fast formats (Q4_0, Q8_0)
+    for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                            GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (int64_t n : { 1, 2, 4 }) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n, 3072, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 1024, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, true,  1024, n, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
+        }
+    }
+
     // the grid types at 5 to 8 tokens and IQ1_M at 1 to 8 (Q713: the k-column and multi-token kernels), the shapes below:
     // compare with GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP=<type> (dense) and GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP=<type> (experts);
     // bench/mmvq_pascal/iq_kcol_perf.sh runs both
