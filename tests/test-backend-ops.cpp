@@ -13064,17 +13064,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // Ornith-1.5-122B's expert products (hidden 3072, experts of width 1024, 8 used of a 32-expert tensor: 8-13 MB of
-    // weights per call at 2-3 bits, beyond a P106's 1.5 MB L2) at 1, 2 and 4 tokens: N2P and N3P against the formats of
-    // today's files (IQ2_S, IQ3_XXS, Q2_K, Q3_K) and the fast formats (Q4_0, Q8_0)
+    // Ornith-1.5-122B's products (hidden 3072, experts of width 1024, 8 used of a 64-expert tensor: 25-50 M weights per
+    // expert call, far beyond a P106's 1.5 MB L2; a dense 8192 -> 3072) at 1, 2 and 4 tokens, the shapes of the IQ
+    // kernels' rig runs (fork branch pascal-p106-v3-iqmmvq): N2P and N3P against the formats of today's files (IQ2_S,
+    // IQ3_XXS, Q2_K, Q3_K) and the fast formats (Q4_0, Q8_0)
     for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
                             GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 4 }) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n, 3072, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 1024, { 1, 1 }, { 1, 1 }));
-            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, true,  1024, n, 3072));
-            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 3072, n, 1024));
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 32, 8, true));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 8192, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, true,  1024, n, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
         }
     }
 
