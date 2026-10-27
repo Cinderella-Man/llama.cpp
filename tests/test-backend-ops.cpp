@@ -57,6 +57,21 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 
     size_t nels = ggml_nelements(tensor);
+
+    // GGML_TEST_RAW_QUANT=1: quantized tensors get random bytes instead of quantized random floats, for perf runs on
+    // hosts whose CPU quantizes large IQ tensors slowly; the values are meaningless, so don't use it to compare results
+    static const bool raw_quant = getenv("GGML_TEST_RAW_QUANT") != nullptr;
+    if (raw_quant && ggml_is_quantized(tensor->type)) {
+        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        std::mt19937_64 gen(std::random_device{}());
+        for (size_t i = 0; i + sizeof(uint64_t) <= dataq.size(); i += sizeof(uint64_t)) {
+            const uint64_t r = gen();
+            memcpy(dataq.data() + i, &r, sizeof(r));
+        }
+        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+        return;
+    }
+
     std::vector<float> data(nels);
     {
         // parallel initialization
