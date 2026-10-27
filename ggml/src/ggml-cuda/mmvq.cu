@@ -345,8 +345,21 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// GGML_CUDA_MMVQ_MAX_COLS=N: products of more than N tokens leave mul_mat_vec_q (for MMQ), e.g. to compare the two on
+// 5-8-token products; unset, the limits below apply
+static int ggml_cuda_mmvq_max_cols_env() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_MAX_COLS");
+        return env ? atoi(env) : 0;
+    }();
+    return n;
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
+        return false;
+    }
+    if (ggml_cuda_mmvq_max_cols_env() > 0 && ne11 > ggml_cuda_mmvq_max_cols_env()) {
         return false;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.

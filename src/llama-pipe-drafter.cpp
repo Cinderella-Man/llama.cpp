@@ -426,7 +426,8 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
     // cost options from the environment: the output head's draft ids (LLAMA_DRAFT_VOCAB=K keeps the K most frequent,
     // the vocabulary's first K, and the other class) and type (LLAMA_DRAFT_HEAD=q8_0 or f16, converted at load), the
     // last block for the output row only (LLAMA_DRAFT_PRUNE, on unless 0), one product for all depth projections
-    // (LLAMA_DRAFT_ANC=dense)
+    // (LLAMA_DRAFT_ANC=dense), the step graph's products in groups of rows (LLAMA_DRAFT_SPLIT=4: the Pascal
+    // multi-token kernels take up to 4)
     auto env_str = [](const char * name) {
         const char * v = getenv(name);
         return std::string(v ? v : "");
@@ -438,6 +439,7 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
     }
     prune_last = env_str("LLAMA_DRAFT_PRUNE") != "0";
     anc_dense  = env_str("LLAMA_DRAFT_ANC") == "dense";
+    split_cols = std::max(0, atoi(env_str("LLAMA_DRAFT_SPLIT").c_str()));
     ggml_tensor * th = ggml_get_tensor(ctx_w, "sd.head.weight");
     ggml_tensor * tb = ggml_get_tensor(ctx_w, "sd.head.bias");
     if (th == nullptr || tb == nullptr || th->ne[1] != n_vocab_draft + 1 || tb->ne[0] != n_vocab_draft + 1) {
@@ -645,12 +647,12 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
     }
     LLAMA_LOG_INFO("%s: staircase drafter %s (profile %s%s): %d layers, %d draft ids%s; split %s, %s window %s, older tokens "
             "%s, taps %s; alpha %.2f, top-%d; on %s, %d cells, %d rows per guess, embeddings %s; output head %d ids + other "
-            "(%s), last block %s, projections %s\n", __func__, params.path,
+            "(%s), last block %s, projections %s, products in groups of %d rows\n", __func__, params.path,
             profile.c_str(), general ? ", depth-general" : "", n_layer, n_vocab_draft, fuse ? ", fused" : "", sp.c_str(),
             kind.c_str(), st.c_str(), depth_str(depth_deep, n_target).c_str(), tp.c_str(), alpha, top_k,
             ggml_backend_dev_name(dev), n_ring, n_rows_step, emb_in_graph ? "gathered on the device" : "looked up on the host",
             n_short, ggml_type_name(w_head->type), prune_last ? "on the output row" : "on every row",
-            anc_dense ? "dense" : "per row");
+            anc_dense ? "dense" : "per row", split_cols > 0 ? split_cols : n_rows_step);
     return true;
 }
 
@@ -779,7 +781,21 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
     } else {
         e = ggml_get_rows(ctx, store, g.emb_idx);
     }
-    ggml_tensor * x = ggml_mul_mat(ctx, w_emb, ggml_rms_norm(ctx, e, rms_eps));
+    // a matrix product of the step graph, in groups of split_cols rows if set
+    auto mm = [&](ggml_tensor * w, ggml_tensor * a) {
+        const int64_t nc = a->ne[1];
+        if (bulk || split_cols <= 0 || nc <= split_cols) {
+            return ggml_mul_mat(ctx, w, a);
+        }
+        ggml_tensor * out = nullptr;
+        for (int64_t c0 = 0; c0 < nc; c0 += split_cols) {
+            const int64_t m = std::min<int64_t>(split_cols, nc - c0);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, ggml_view_2d(ctx, a, a->ne[0], m, a->nb[1], (size_t) c0*a->nb[1]));
+            out = out ? ggml_concat(ctx, out, y, 1) : y;
+        }
+        return out;
+    };
+    ggml_tensor * x = mm(w_emb, ggml_rms_norm(ctx, e, rms_eps));
     auto mat = [&](ggml_tensor * w, int32_t k) {   // the k-th matrix of a stacked [d, d, n] tensor
         return ggml_view_2d(ctx, w, w->ne[0], w->ne[1], w->nb[1], (size_t) k*w->nb[2]);
     };
@@ -818,9 +834,9 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         const bool last = l == n_layer - 1;
 
         ggml_tensor * hn = ggml_rms_norm(ctx, x, rms_eps);
-        ggml_tensor * k = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, b.wk, hn), head_dim, n_head_kv, N);
+        ggml_tensor * k = ggml_reshape_3d(ctx, mm(b.wk, hn), head_dim, n_head_kv, N);
         k = ggml_rope_ext(ctx, k, g.rope_pos, nullptr, head_dim, 0, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        ggml_tensor * v = ggml_mul_mat(ctx, b.wv, hn);
+        ggml_tensor * v = mm(b.wv, hn);
         ggml_tensor * kc = ggml_set_rows(ctx, k_cache[l], ggml_reshape_2d(ctx, k, head_dim*n_head_kv, N), g.kv_idx);
         ggml_tensor * vc = ggml_set_rows(ctx, v_cache[l], v, g.kv_idx);
         if (bulk && last) {
@@ -836,7 +852,7 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
             x  = ggml_get_rows(ctx, x, g.out_row);
             hn = ggml_get_rows(ctx, hn, g.out_row);
         }
-        ggml_tensor * q = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, b.wq, hn), head_dim, n_head, nq);
+        ggml_tensor * q = ggml_reshape_3d(ctx, mm(b.wq, hn), head_dim, n_head, nq);
         q = ggml_rope_ext(ctx, q, one ? g.out_pos : g.rope_pos, nullptr, head_dim, 0, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         const size_t es  = ggml_element_size(kc);
@@ -848,11 +864,11 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         ggml_tensor * att = ggml_flash_attn_ext(ctx, qp, kv, vv, one ? mask_out : mask, kq_scale, 0.0f, 0.0f);
         ggml_prec_set_acc(att, GGML_PREC_F32);
         att = ggml_reshape_2d(ctx, att, head_dim*n_head, nq);
-        x = ggml_add(ctx, x, ggml_mul_mat(ctx, b.wo, att));
+        x = ggml_add(ctx, x, mm(b.wo, att));
 
         ggml_tensor * hm = ggml_rms_norm(ctx, x, rms_eps);
-        ggml_tensor * gu = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, b.w1, hm), ggml_mul_mat(ctx, b.w3, hm));
-        x = ggml_add(ctx, x, ggml_mul_mat(ctx, b.w2, gu));
+        ggml_tensor * gu = ggml_swiglu_split(ctx, mm(b.w1, hm), mm(b.w3, hm));
+        x = ggml_add(ctx, x, mm(b.w2, gu));
     }
 
     if (!bulk) {
