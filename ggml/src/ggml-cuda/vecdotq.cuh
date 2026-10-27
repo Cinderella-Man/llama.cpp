@@ -1468,6 +1468,8 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
 
 #define VDR_N2P_Q8_1_MMVQ 2
 #define VDR_N3P_Q8_1_MMVQ 2
+#define VDR_N2P_Q8_1_MMQ  4 // MMQ loads both into the Q8_0 tile layout
+#define VDR_N3P_Q8_1_MMQ  4
 
 // N2P: 32 weights per call (Q8_1 block iqs/2), four 8-weight sub-blocks. A code word shifted by 0, 2, 16 or 18 bits is
 // the __byte_perm selector of 4 consecutive weights; the table register is chosen per sub-block by its shift bit.
