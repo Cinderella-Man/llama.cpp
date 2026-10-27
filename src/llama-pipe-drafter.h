@@ -119,6 +119,8 @@ private:
     // one matrix product instead of one per row; both exact
     bool    prune_last = true;
     bool    anc_dense  = false;
+    // the step graph's matrix products in groups of split_cols rows (0: all rows at once), for kernels that take few
+    int32_t split_cols = 0;
     float   rms_eps = 1e-6f, rope_theta = 1e5f;
     bool    fuse = false;
     bool    general = false;
