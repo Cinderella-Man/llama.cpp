@@ -1828,13 +1828,13 @@ private:
                 for (auto & slot : slots) {
                     slot.pipe_guesser.store = pipe_store.get();
                     slot.pipe_draws = true;
-                    // staircase: the copy lookup first (with a store also the request's continuations of 2-token or
-                    // longer contexts and the store), the drafter for the rest
+                    // staircase: the copy lookup, the request's continuations of 2-token or longer contexts (on agent
+                    // text they are right more often than the drafter), the store if there is one, then the drafter
+                    // instead of the continuations of a 1-token context
                     const bool stair = params_base.pipe_guess == "staircase";
                     slot.pipe_guesser.kind = params_base.pipe_guess == "none" ? common_pipe_guesser::NONE :
                                              params_base.pipe_guess == "copy" ? common_pipe_guesser::COPY :
-                                             stair && !pipe_store ? common_pipe_guesser::COPY :
-                                                                    common_pipe_guesser::CONT;
+                                                                                common_pipe_guesser::CONT;
                     slot.pipe_guesser.cont_any = !stair;
                     slot.pipe_guesser.min_match = params_base.pipe_copy_min;
                 }

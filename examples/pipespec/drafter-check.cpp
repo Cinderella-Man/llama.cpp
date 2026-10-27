@@ -156,7 +156,7 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
         x = 3*nd(rng);
     }
     llama_pos pos = n_ctx_fill;
-    std::vector<double> us;
+    std::vector<double> us, us_launch;   // launch to guess; the launch call alone (host work and enqueueing)
     const int n_warm = 20;
     for (int it = 0; it < n_warm + n_iter; it++) {
         int slot = 0;
@@ -175,13 +175,16 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
         }
         const int64_t t0 = ggml_time_us();
         dr->launch(rows.data(), (int32_t) rows.size());
+        const int64_t tl = ggml_time_us();
         dr->get(0.5f, nullptr);
         const int64_t t1 = ggml_time_us();
         if (it >= n_warm) {
             us.push_back((double) (t1 - t0));
+            us_launch.push_back((double) (tl - t0));
         }
     }
     std::sort(us.begin(), us.end());
+    std::sort(us_launch.begin(), us_launch.end());
     double mean = 0.0;
     for (double x : us) {
         mean += x;
@@ -191,9 +194,9 @@ static int bench(const char * path_drafter, int n_iter, int n_win, int n_commit,
     for (auto s : o.split) {
         sp += (sp.empty() ? "" : "/") + std::to_string(s);
     }
-    printf("DRAFTER_BENCH dev=%s split=%s window=%d commits=%d ctx=%d n=%d median_us=%.0f p90_us=%.0f mean_us=%.0f table=%s\n",
-            ggml_backend_dev_name(dev), sp.c_str(), n_win, n_commit, n_ctx_fill, n_iter, us[us.size()/2],
-            us[(size_t) (us.size()*0.9)], mean, o.host_table ? "host" : "device");
+    printf("DRAFTER_BENCH dev=%s split=%s window=%d commits=%d ctx=%d n=%d median_us=%.0f p90_us=%.0f mean_us=%.0f "
+            "launch_us=%.0f table=%s\n", ggml_backend_dev_name(dev), sp.c_str(), n_win, n_commit, n_ctx_fill, n_iter,
+            us[us.size()/2], us[(size_t) (us.size()*0.9)], mean, us_launch[us_launch.size()/2], o.host_table ? "host" : "device");
     dr.reset();
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
