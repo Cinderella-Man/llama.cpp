@@ -100,9 +100,9 @@ static bool mmvqp_halfword_type(const ggml_type type) {
     return type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
 }
 
-// Staged weights: matrices staged at a time (Q6_K's gate and up one after the other), and bytes of padding behind each
-// warp's buffer (mmvqp_lds_h reads 2 bytes past a block).
-template <ggml_type type, int M> constexpr __host__ __device__ int mmvqp_staged_mats() { return type == GGML_TYPE_Q6_K ? 1 : M; }
+// Staged weights: matrices staged at a time (the half-word types' gate and up one after the other: half the staging
+// memory and registers), and bytes of padding behind each warp's buffer (mmvqp_lds_h reads 2 bytes past a block).
+template <ggml_type type, int M> constexpr __host__ __device__ int mmvqp_staged_mats() { return mmvqp_halfword<type>() ? 1 : M; }
 template <ggml_type type> constexpr __host__ __device__ int mmvqp_staged_pad() { return mmvqp_halfword<type>() ? 16 : 0; }
 
 template <ggml_type type, int R, int C, bool staged, bool gate>
