@@ -13058,6 +13058,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // the 2- and 3-bit grid types at Ornith-1.5-122B's shapes (hidden 3072, experts of width 1024, 8 used): the fused
+    // expert gate/up as llama.cpp runs it, the expert down projection, and an 8192-row dense product, at 1, 2 and 4
+    // tokens. Every call reads at least 8 MB of weights (8 experts of 64), beyond a P106's 1.5 MB L2, so repeated runs
+    // time memory reads rather than cache hits.
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+        for (int64_t n : { 1, 2, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

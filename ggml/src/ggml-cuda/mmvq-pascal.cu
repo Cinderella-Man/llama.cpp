@@ -332,7 +332,7 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
 }
 
 template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
-__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
+__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, mmvqp_min_blocks<type>())
 static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_mm_fusion_args_device fusion) {
     mmvqp_rows_1t<type, R, C, staged, fk, SU>(p, fusion, blockIdx.x);
 }
@@ -360,7 +360,7 @@ static __global__ void mul_mat_vec_q_pascal_qkv(const mmvqp_args pq, const mmvqp
 // sa: each token's activation segment is copied into shared memory by the whole warp with coalesced 128-bit loads, and
 // every lane reads its blocks from there, instead of loading its own blocks from global memory at a stride of YB bytes.
 template <ggml_type type, int R, int C, bool staged, int fk, bool sa, int SU = 16>
-__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
+__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, mmvqp_min_blocks<type>())
 static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml_cuda_mm_fusion_args_device fusion) {
     using unit_t = typename mmvqp_stage_unit<SU>::t;
     constexpr int NW = MMVQ_PASCAL_NWARPS;
@@ -699,6 +699,15 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
                 case 16: mmvqp_launch<type, 1, 1, true, 16>(p, fusion, fk, grid, stream); return;
                 case 8:  mmvqp_launch<type, 1, 1, true, 8>(p, fusion, fk, grid, stream);  return;
                 default: mmvqp_launch<type, 1, 1, true, 4>(p, fusion, fk, grid, stream);  return;
+            }
+        }
+        if constexpr (mmvqp_grid_type<type>() && MMVQP_IQ_R == 2) {
+            if (s.R == 2 && s.C == 1 && s.staged) {
+                switch (su) {
+                    case 16: mmvqp_launch<type, 2, 1, true, 16>(p, fusion, fk, grid, stream); return;
+                    case 8:  mmvqp_launch<type, 2, 1, true, 8>(p, fusion, fk, grid, stream);  return;
+                    default: mmvqp_launch<type, 2, 1, true, 4>(p, fusion, fk, grid, stream);  return;
+                }
             }
         }
     } else if constexpr (type == GGML_TYPE_Q4_1) {
