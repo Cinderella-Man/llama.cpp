@@ -11873,6 +11873,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the 2- and 3-bit grid types of Ornith-1.5-122B's files (Qwen3.5-122B shapes: hidden 3072, 8 of 256 experts of
+    // width 1024, a 1024-wide shared expert) on the Pascal matrix-vector kernels, 1 to 4 tokens: K = 3072 and 1024 stage
+    // with 8-byte loads, K = 512 (2 super-blocks per row) with 4-byte loads, K = 2048 with 16-byte loads; an odd row
+    // count; activations whose blocks sum past FP16's range
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 1024, 3072 }, { 3072, 1024 }, { 2048, 512 }, { 1024, 2048 }, { 4097, 3072 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, true,  1024, n, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 32, 8, true));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 3072, n, 1024, 32, 8));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 1024, n, 3072));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1024, 3072, false, 1, 1, false,
+                                                            false, true, false, { 1, 1 }));
+        for (int64_t n : { 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 1024));
+        }
+    }
+
     // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
     // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
     // leave partial tiles. One case at Flint's own expert shapes.
