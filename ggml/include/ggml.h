@@ -431,7 +431,11 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_Q4_1_64 = 43, // Q4_1 with one scale and offset per 64 weights
-        GGML_TYPE_COUNT   = 44,
+        // 2- and 3-bit types decoded from level tables held in registers (compute 6.1 first); their ids sit far from
+        // mainline's (numbered in sequence) and ik_llama.cpp's (133-161, 202-399)
+        GGML_TYPE_N2P     = 500, // 2.6875 bpw: 4 levels and a shifted copy, 4-bit scale and shift bit per 8 weights
+        GGML_TYPE_N3P     = 501, // 3.25 bpw: 8 levels and a shifted copy, 5-bit scale and shift bit per 32 weights
+        GGML_TYPE_COUNT   = 502,
     };
 
     // [TAG_GGML_PREC]

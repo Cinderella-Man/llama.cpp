@@ -475,6 +475,32 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// N2P and N3P: levels from a small int8 table (kvalues_n2p, kvalues_n3p) that also has a copy shifted up by a few steps,
+// as in ik_llama.cpp's IQ2_K and IQ3_K; a bit per sub-block picks the copy. Weight = d * scale * level.
+// 2-bit codes are packed so that each 32-bit word holds 16 consecutive weights c = 0..15 at bit
+// 16*(h/2) + 4*i + 2*(h%2) with h = c/4, i = c%4: (word >> {0, 2, 16, 18}[h]) puts the codes of weights 4h..4h+3 into
+// bits 0-1 of the four low nibbles, the selector layout of __byte_perm.
+typedef struct {
+    ggml_half d;
+    uint8_t   scales[QK_K/16]; // 4-bit scale + 8 per 8 weights, low nibble first
+    uint8_t   extra[QK_K/64];  // shift bit per 8 weights
+    uint8_t   qs[QK_K/4];      // 2-bit codes
+} block_n2p;
+static_assert(sizeof(block_n2p) == sizeof(ggml_half) + QK_K/16 + QK_K/64 + QK_K/4, "wrong n2p block size/padding");
+
+// N3P: the low 2 bits of the 3-bit codes as N2P's qs; the third bits in a word per 32 weights, weight 4g + i at bit
+// 16*(g/4) + 4*i + g%4 (g = 0..7), so that (word >> (16*(g/4) + g%4 - 2)) & 0x4444 lands them on bit 2 of the selector
+// nibbles. 104 bytes, so every block starts 8-byte aligned.
+typedef struct {
+    ggml_half d;
+    uint8_t   extra;           // shift bit per 32 weights
+    uint8_t   scales_h;        // bit 4 of each 5-bit scale
+    uint8_t   scales_l[QK_K/64]; // low 4 bits of the 5-bit scales (scale + 16), low nibble first
+    uint8_t   qs[QK_K/4];      // low 2 bits of the codes
+    uint8_t   qh[QK_K/8];      // third bits
+} block_n3p;
+static_assert(sizeof(block_n3p) == sizeof(ggml_half) + 2 + QK_K/64 + QK_K/4 + QK_K/8, "wrong n3p block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
@@ -1135,6 +1161,16 @@ GGML_TABLE_END()
 // TODO: fix name to kvalues_iq4_nl
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+GGML_TABLE_END()
+
+// N2P and N3P levels: ik_llama.cpp's iq2nl_values and iq3nl_values (MIT, github.com/ikawrakow/ik_llama.cpp) times 4
+// and 2, each followed by its copy shifted up by 5*4 and 4*2
+GGML_TABLE_BEGIN(int8_t, kvalues_n2p, 8)
+    -124, -52, 4, 68, -104, -32, 24, 88,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, kvalues_n3p, 16)
+    -126, -80, -46, -20, 2, 26, 56, 94, -118, -72, -38, -12, 10, 34, 64, 102,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4
