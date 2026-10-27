@@ -10353,6 +10353,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_N2P, GGML_TYPE_N3P,
 };
 
 static const ggml_type base_types[] = {
@@ -10381,6 +10382,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_N2P, GGML_TYPE_N3P,
     GGML_TYPE_BF16,
 };
 
@@ -11870,6 +11872,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
             test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
             test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 256));
+        }
+    }
+
+    // N2P and N3P at Ornith-1.5-122B's shapes (hidden 3072, 8 of 256 experts of width 1024, a 1024-wide shared expert),
+    // 1 to 4 tokens: plain products (K = 3072, 1024, 512, 2048, an odd row count), expert products, the fused gate/up,
+    // activations whose blocks sum past FP16's range, the shared expert in the routed launch, repeated experts; and
+    // prompt-sized batches, which take the dequantize-and-GEMM path
+    for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 1024, 3072 }, { 3072, 1024 }, { 2048, 512 }, { 1024, 2048 }, { 4097, 3072 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, true,  1024, n, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 32, 8, true));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 3072, n, 1024, 32, 8));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 1024, n, 3072));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1024, 3072, false, 1, 1, false,
+                                                            false, true, false, { 1, 1 }));
+        for (int64_t n : { 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 1024));
+        }
+        for (int64_t n : { 9, 33, 128 }) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n, 3072, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 1024, n, 3072));
         }
     }
 

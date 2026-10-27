@@ -171,6 +171,12 @@ typedef sycl::half2 ggml_half2;
 #define QI3_S (QK_K / (4*QR3_S))
 #define QR3_S 4
 
+#define QI_N2P (QK_K / (4*QR_N2P))
+#define QR_N2P 4
+
+#define QI_N3P (QK_K / (4*QR_N3P))
+#define QR_N3P 4
+
 #endif // GGML_COMMON_DECL_CUDA || GGML_COMMON_DECL_HIP
 
 #ifdef _MSC_VER
@@ -479,12 +485,13 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 // as in ik_llama.cpp's IQ2_K and IQ3_K; a bit per sub-block picks the copy. Weight = d * scale * level.
 // 2-bit codes are packed so that each 32-bit word holds 16 consecutive weights c = 0..15 at bit
 // 16*(h/2) + 4*i + 2*(h%2) with h = c/4, i = c%4: (word >> {0, 2, 16, 18}[h]) puts the codes of weights 4h..4h+3 into
-// bits 0-1 of the four low nibbles, the selector layout of __byte_perm.
+// bits 0-1 of the four low nibbles, the selector layout of __byte_perm. N2P puts the codes first, so that every 32-bit
+// field is word-aligned relative to the block (blocks of 86 bytes start at 2-byte boundaries).
 typedef struct {
-    ggml_half d;
+    uint8_t   qs[QK_K/4];      // 2-bit codes
     uint8_t   scales[QK_K/16]; // 4-bit scale + 8 per 8 weights, low nibble first
     uint8_t   extra[QK_K/64];  // shift bit per 8 weights
-    uint8_t   qs[QK_K/4];      // 2-bit codes
+    ggml_half d;
 } block_n2p;
 static_assert(sizeof(block_n2p) == sizeof(ggml_half) + QK_K/16 + QK_K/64 + QK_K/4, "wrong n2p block size/padding");
 

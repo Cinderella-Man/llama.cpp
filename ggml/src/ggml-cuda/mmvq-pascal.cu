@@ -91,10 +91,19 @@ struct mmvqp_args_mc : mmvqp_args {
 
 enum mmvqp_fusion { MMVQP_PLAIN = 0, MMVQP_BIAS = 1, MMVQP_GATE = 2 };
 
-// Staged weights: matrices staged at a time (Q6_K's gate and up one after the other), and bytes of padding behind each
-// warp's buffer (mmvqp_lds_q6_K reads 2 bytes past a block).
-template <ggml_type type, int M> constexpr __host__ __device__ int mmvqp_staged_mats() { return type == GGML_TYPE_Q6_K ? 1 : M; }
-template <ggml_type type> constexpr __host__ __device__ int mmvqp_staged_pad() { return type == GGML_TYPE_Q6_K ? 16 : 0; }
+// Types whose blocks start at 2-byte boundaries (Q6_K 210 bytes, N2P 86): staged only, one super-block per lane, read
+// from shared memory with mmvqp_lds_h.
+template <ggml_type type> constexpr __host__ __device__ bool mmvqp_halfword() {
+    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_N2P;
+}
+static bool mmvqp_halfword_type(const ggml_type type) {
+    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_N2P;
+}
+
+// Staged weights: matrices staged at a time (the half-word types' gate and up one after the other: half the staging
+// memory and registers), and bytes of padding behind each warp's buffer (mmvqp_lds_h reads 2 bytes past a block).
+template <ggml_type type, int M> constexpr __host__ __device__ int mmvqp_staged_mats() { return mmvqp_halfword<type>() ? 1 : M; }
+template <ggml_type type> constexpr __host__ __device__ int mmvqp_staged_pad() { return mmvqp_halfword<type>() ? 16 : 0; }
 
 template <ggml_type type, int R, int C, bool staged, bool gate>
 constexpr bool mmvqp_fits() {
@@ -111,34 +120,36 @@ constexpr bool mmvqp_fits_mc() {
     return MMVQ_PASCAL_NWARPS * (wb + yb) <= 48 * 1024;
 }
 
-// Loads that stage weight segments: 16 bytes, or 8 and 4 where Q6_K's rows are only 8- or 4-byte aligned.
+// Loads that stage weight segments: 16 bytes, or 8 and 4 where a half-word type's rows are only 8- or 4-byte aligned.
 template <int SU> struct mmvqp_stage_unit;
 template <> struct mmvqp_stage_unit<16> { using t = uint4; };
 template <> struct mmvqp_stage_unit<8>  { using t = uint2; };
 template <> struct mmvqp_stage_unit<4>  { using t = unsigned int; };
 
-// One lane's Q6_K super-block (210 bytes at a 2-byte boundary in shared memory) as 53 4-byte-aligned words: the words
-// around it, shifted by 2 bytes where it starts at an odd half-word.
-static __device__ __forceinline__ void mmvqp_lds_q6_K(uint32_t * w, const char * p) {
+// One lane's super-block of NB bytes (NB % 4 == 2) at a 2-byte boundary in shared memory as NB/4 + 1 4-byte-aligned
+// words: the words around it, shifted by 2 bytes where it starts at an odd half-word.
+template <int NB>
+static __device__ __forceinline__ void mmvqp_lds_h(uint32_t * w, const char * p) {
+    static_assert(NB % 4 == 2, "a block of an odd number of half-words");
     const int        mis = (int) ((uintptr_t) p & 2);
     const uint32_t * aw  = (const uint32_t *) (p - mis); // pointer arithmetic keeps the shared address space
     const uint32_t   sel = mis ? 0x5432 : 0x3210;
     uint32_t cur = aw[0];
 #pragma unroll
-    for (int i = 0; i < 52; ++i) {
+    for (int i = 0; i < NB/4; ++i) {
         const uint32_t nxt = aw[i + 1];
         w[i] = __byte_perm(cur, nxt, sel);
         cur = nxt;
     }
-    w[52] = __byte_perm(cur, 0, sel);
+    w[NB/4] = __byte_perm(cur, 0, sel);
 }
 
 // A lane's staged weight chunk of WB bytes from shared memory.
 template <ggml_type type, int WB>
 static __device__ __forceinline__ void mmvqp_lds_chunk(uint32_t * w, const char * p) {
-    if constexpr (type == GGML_TYPE_Q6_K) {
-        static_assert(WB == sizeof(block_q6_K), "Q6_K: one super-block per lane");
-        mmvqp_lds_q6_K(w, p);
+    if constexpr (mmvqp_halfword<type>()) {
+        static_assert(WB == mmvqp_traits<type>::bs, "half-word types: one super-block per lane");
+        mmvqp_lds_h<WB>(w, p);
     } else {
         mmvqp_lds_words<WB, mmvqp_gcd(WB, 16)>(w, p);
     }
@@ -656,7 +667,7 @@ static void mmvqp_launch(const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args
     }
 }
 
-// su: bytes per staging load (16; Q6_K also 8 and 4)
+// su: bytes per staging load (16; the half-word types also 8 and 4)
 template <ggml_type type>
 static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args_device & fusion,
                                const int fk, const dim3 grid, cudaStream_t stream, const int su) {
@@ -665,7 +676,7 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
         mmvqp_launch<type, R_, C_, S_>(p, fusion, fk, grid, stream);        \
         return;                                                             \
     }
-    if constexpr (type == GGML_TYPE_Q6_K) {
+    if constexpr (mmvqp_halfword<type>()) {
         if (s.R == 1 && s.C == 1 && s.staged) {
             switch (su) {
                 case 16: mmvqp_launch<type, 1, 1, true, 16>(p, fusion, fk, grid, stream); return;
@@ -686,7 +697,7 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
         MMVQP_CASE(1, 2, false)
         MMVQP_CASE(2, 2, true)
         MMVQP_CASE(2, 2, false)
-    } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS) {
+    } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_N3P) {
         MMVQP_CASE(1, 1, true)
         MMVQP_CASE(1, 1, false)
     } else {
@@ -777,7 +788,8 @@ bool ggml_cuda_mmvq_pascal(
         return false;
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
-            type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K) {
+            type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K &&
+            type != GGML_TYPE_N2P && type != GGML_TYPE_N3P) {
         return false;
     }
     if (mmvqp_skip_type(type)) {
@@ -813,7 +825,7 @@ bool ggml_cuda_mmvq_pascal(
             (stride_sample_x * bs) % al == 0;
     };
     int su = 16;
-    if (type == GGML_TYPE_Q6_K) {
+    if (mmvqp_halfword_type(type)) {
         // staged only (2-byte-aligned blocks), with the widest loads the rows and the segment allow
         su = 0;
         for (const int u : { 16, 8, 4 }) {
@@ -898,6 +910,8 @@ bool ggml_cuda_mmvq_pascal(
         case GGML_TYPE_IQ4_XS: mmvqp_launch_shape<GGML_TYPE_IQ4_XS>(s, p, fusion, fk, grid, stream, su); break;
         case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream, su); break;
         case GGML_TYPE_Q6_K: mmvqp_launch_shape<GGML_TYPE_Q6_K>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_N2P:  mmvqp_launch_shape<GGML_TYPE_N2P>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_N3P:  mmvqp_launch_shape<GGML_TYPE_N3P>(s, p, fusion, fk, grid, stream, su); break;
         default:             GGML_ABORT("fatal error");
     }
     return true;

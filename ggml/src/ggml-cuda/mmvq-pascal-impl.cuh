@@ -18,6 +18,8 @@ template <> struct mmvqp_traits<GGML_TYPE_Q4_K>   { static constexpr int bs = si
 template <> struct mmvqp_traits<GGML_TYPE_Q5_K>   { static constexpr int bs = sizeof(block_q5_K);   static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_IQ4_XS> { static constexpr int bs = sizeof(block_iq4_xs); static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_Q6_K>   { static constexpr int bs = sizeof(block_q6_K);   static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_N2P>    { static constexpr int bs = sizeof(block_n2p);    static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_N3P>    { static constexpr int bs = sizeof(block_n3p);    static constexpr int na = QK_K / QK8_1; };
 
 constexpr __host__ __device__ int mmvqp_gcd(const int a, const int b) {
     return b == 0 ? a : mmvqp_gcd(b, a % b);
@@ -181,7 +183,7 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             }
             S = d8 * (float) sum;
         }
-        if constexpr (type == GGML_TYPE_Q8_0) {
+        if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_N2P || type == GGML_TYPE_N3P) {
             a.d[b] = d8;
             a.s[b] = 0.0f;
         } else if constexpr (type == GGML_TYPE_Q4_0) {
@@ -365,6 +367,68 @@ static __device__ __forceinline__ float mmvqp_dot_q6_K(const uint32_t * w, const
     return fmaf(mmvqp_h2f_lo(w[52]), sumf, acc);
 }
 
+// N2P and N3P decode their codes with __byte_perm from level tables held in registers (common.cuh: N2P_TAB*, N3P_TAB*);
+// each sub-block's shift bit selects the table registers once, so the inner loops are a shift, a permute and a dp4a per
+// 4 weights (N3P: a second shift and a LOP3 to merge its third bits). Their levels carry their own offset: no activation
+// sums.
+
+// One N2P super-block as 22 words (4-byte aligned here): qs words 0..15 (word k: weights 16k..16k+15), scale words
+// 16..19 (a nibble per 8 weights), shift bits word 20, d in the low half of word 21; activation blocks a0..a0+7.
+template <int NA>
+static __device__ __forceinline__ float mmvqp_dot_n2p(const uint32_t * w, const mmvqp_act<NA> & a, const int a0, float acc) {
+    const uint32_t ex = w[20];
+    float sumf = 0.0f;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        const uint32_t sc = w[16 + ib/2] >> 16*(ib%2); // scales of sub-blocks 4ib..4ib+3
+        int isum = 0;
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const uint32_t q = w[2*ib + k];
+#pragma unroll
+            for (int sb = 0; sb < 2; ++sb) {
+                const uint32_t T = (ex >> (4*ib + 2*k + sb)) & 1 ? N2P_TAB1 : N2P_TAB0;
+                int sumb = ggml_cuda_dp4a((int) __byte_perm(T, T, q >> (16*sb)),     a.u[a0 + ib][4*k + 2*sb],     0);
+                sumb     = ggml_cuda_dp4a((int) __byte_perm(T, T, q >> (16*sb + 2)), a.u[a0 + ib][4*k + 2*sb + 1], sumb);
+                isum += sumb * ((int) ((sc >> 4*(2*k + sb)) & 0xF) - 8);
+            }
+        }
+        sumf = fmaf(a.d[a0 + ib], (float) isum, sumf);
+    }
+    return fmaf(mmvqp_h2f_lo(w[21]), sumf, acc);
+}
+
+// One N3P super-block as 26 words: d | extra << 16 | scales_h << 24, scales_l, qs words 2..17 (two per 32 weights), qh
+// words 18..25 (one per 32 weights); activation blocks a0..a0+7. The selector of weights 4g..4g+3 of a sub-block takes
+// the low code bits from qs shifted by {0, 2, 16, 18}[g%4] and the third bits from qh shifted by 16*(g/4) + g%4 - 2;
+// bit 3 of each selector nibble, which the merge fills with a neighbour's third bit, is ignored by __byte_perm.
+template <int NA>
+static __device__ __forceinline__ float mmvqp_dot_n3p(const uint32_t * w, const mmvqp_act<NA> & a, const int a0, float acc) {
+    const uint32_t w0 = w[0];
+    const uint32_t sl = w[1];
+    float sumf = 0.0f;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        const bool     sh = (w0 >> (16 + ib)) & 1;
+        const uint32_t ta = sh ? N3P_TAB1A : N3P_TAB0A;
+        const uint32_t tb = sh ? N3P_TAB1B : N3P_TAB0B;
+        const uint32_t hi = w[18 + ib];
+        int isum = 0;
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const uint32_t lo  = w[2 + 2*ib + g/4];
+            const int      t   = 16*((g%4)/2) + 2*(g%2);
+            const int      s   = 16*(g/4) + g%4 - 2;
+            const uint32_t hs  = s >= 0 ? hi >> s : hi << -s;
+            const uint32_t sel = ((lo >> t) & 0x3333) | (hs & 0xCCCC);
+            isum = ggml_cuda_dp4a((int) __byte_perm(ta, tb, sel), a.u[a0 + ib][g], isum);
+        }
+        const int ls = (int) (((sl >> 4*ib) & 0xF) | (((w0 >> (24 + ib)) & 1) << 4)) - 16;
+        sumf = fmaf(a.d[a0 + ib], (float) (isum * ls), sumf);
+    }
+    return fmaf(mmvqp_h2f_lo(w0), sumf, acc);
+}
+
 // C weight blocks (raw words) times the matching activation blocks, added to acc.
 template <ggml_type type, int C>
 static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvqp_act<C * mmvqp_traits<type>::na> & a, float acc) {
@@ -380,6 +444,11 @@ static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvq
             acc = mmvqp_dot_iq4_xs(w + o/4, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_Q6_K) {
             acc = mmvqp_dot_q6_K(w, a, 8*b, acc);
+        } else if constexpr (type == GGML_TYPE_N2P) {
+            static_assert(C == 1, "N2P: one super-block per lane");
+            acc = mmvqp_dot_n2p(w, a, 8*b, acc);
+        } else if constexpr (type == GGML_TYPE_N3P) {
+            acc = mmvqp_dot_n3p(w + o/4, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_Q4_1) {
             const uint32_t dm = mmvqp_word_at(w, o);
             const int isum = mmvqp_q4_isum16(mmvqp_word_at(w, o + 4), mmvqp_word_at(w, o + 8), mmvqp_word_at(w, o + 12),
@@ -443,6 +512,8 @@ static constexpr mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate)
         case GGML_TYPE_IQ4_XS:
             return gate ? mmvqp_shape{ 1, 1, false } : mmvqp_shape{ 1, 1, true };
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_N2P:
+        case GGML_TYPE_N3P:
             return { 1, 1, true };
         default:
             GGML_ABORT("fatal error");

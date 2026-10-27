@@ -5295,7 +5295,7 @@ static void n2p_n3p_weights(const float * GGML_RESTRICT x, const float * GGML_RE
 static float n2p_n3p_sigma2(const float * GGML_RESTRICT x, int64_t n) {
     double sumx2 = 0;
     for (int64_t j = 0; j < n; ++j) {
-        sumx2 += (double) x[j]*x[j];
+        sumx2 += (double) x[j]*(double) x[j];
     }
     return (float) (sumx2/n);
 }

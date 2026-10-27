@@ -1165,6 +1165,33 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
     static constexpr int bs = sizeof(block_iq4_xs);
 };
 
+// N2P and N3P levels (kvalues_n2p, kvalues_n3p) as words for __byte_perm: each table, then its shifted copy
+static constexpr __host__ __device__ uint32_t ggml_cuda_pack_i8x4(const int a, const int b, const int c, const int d) {
+    return (uint32_t) (uint8_t) a | ((uint32_t) (uint8_t) b << 8) | ((uint32_t) (uint8_t) c << 16) | ((uint32_t) (uint8_t) d << 24);
+}
+#define N2P_TAB0  ggml_cuda_pack_i8x4(-124, -52,   4,  68)
+#define N2P_TAB1  ggml_cuda_pack_i8x4(-104, -32,  24,  88)
+#define N3P_TAB0A ggml_cuda_pack_i8x4(-126, -80, -46, -20)
+#define N3P_TAB0B ggml_cuda_pack_i8x4(   2,  26,  56,  94)
+#define N3P_TAB1A ggml_cuda_pack_i8x4(-118, -72, -38, -12)
+#define N3P_TAB1B ggml_cuda_pack_i8x4(  10,  34,  64, 102)
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_N2P> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR_N2P;
+    static constexpr int qi = QI_N2P;
+    static constexpr int bs = sizeof(block_n2p);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_N3P> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR_N3P;
+    static constexpr int qi = QI_N3P;
+    static constexpr int bs = sizeof(block_n3p);
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qk = QK_K;
