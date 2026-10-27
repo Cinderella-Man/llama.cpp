@@ -423,6 +423,55 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
         buft_host = ggml_backend_cpu_buffer_type();
     }
 
+    // cost options from the environment: the output head's draft ids (LLAMA_DRAFT_VOCAB=K keeps the K most frequent,
+    // the vocabulary's first K, and the other class) and type (LLAMA_DRAFT_HEAD=q8_0 or f16, converted at load), the
+    // last block for the output row only (LLAMA_DRAFT_PRUNE, on unless 0), one product for all depth projections
+    // (LLAMA_DRAFT_ANC=dense)
+    auto env_str = [](const char * name) {
+        const char * v = getenv(name);
+        return std::string(v ? v : "");
+    };
+    {
+        const std::string v = env_str("LLAMA_DRAFT_VOCAB");
+        const int32_t k = v.empty() ? 0 : atoi(v.c_str());
+        n_short = k > 0 && k < n_vocab_draft ? k : n_vocab_draft;
+    }
+    prune_last = env_str("LLAMA_DRAFT_PRUNE") != "0";
+    anc_dense  = env_str("LLAMA_DRAFT_ANC") == "dense";
+    ggml_tensor * th = ggml_get_tensor(ctx_w, "sd.head.weight");
+    ggml_tensor * tb = ggml_get_tensor(ctx_w, "sd.head.bias");
+    if (th == nullptr || tb == nullptr || th->ne[1] != n_vocab_draft + 1 || tb->ne[0] != n_vocab_draft + 1) {
+        LLAMA_LOG_ERROR("%s: the output head does not match %d draft ids\n", __func__, n_vocab_draft);
+        return false;
+    }
+    const ggml_type head_file_type = th->type;
+    ggml_type head_type = head_file_type;
+    {
+        const std::string v = env_str("LLAMA_DRAFT_HEAD");
+        if (v == "q8_0") {
+            head_type = GGML_TYPE_Q8_0;
+        } else if (v == "f16") {
+            head_type = GGML_TYPE_F16;
+        } else if (!v.empty()) {
+            LLAMA_LOG_ERROR("%s: LLAMA_DRAFT_HEAD must be q8_0 or f16, not %s\n", __func__, v.c_str());
+            return false;
+        }
+    }
+    const bool head_converted = n_short < n_vocab_draft || head_type != head_file_type;
+    if (head_converted) {
+        // the tensors take the run's shape and type before the allocation; the file's rows are converted on reading
+        th->type  = head_type;
+        th->ne[1] = n_short + 1;
+        th->nb[0] = ggml_type_size(head_type);
+        th->nb[1] = ggml_row_size(head_type, th->ne[0]);
+        th->nb[2] = th->nb[1]*th->ne[1];
+        th->nb[3] = th->nb[2]*th->ne[2];
+        tb->ne[0] = n_short + 1;
+        tb->nb[1] = tb->nb[0]*tb->ne[0];
+        tb->nb[2] = tb->nb[1]*tb->ne[1];
+        tb->nb[3] = tb->nb[2]*tb->ne[2];
+    }
+
     // weights: the vocabulary map stays on the host too
     buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
     if (!buf_w) {
@@ -440,7 +489,7 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
         for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
             const char * name = gguf_get_tensor_name(g, i);
             ggml_tensor * t = ggml_get_tensor(ctx_w, name);
-            const size_t nb = ggml_nbytes(t);
+            const size_t nb = gguf_get_tensor_size(g, i);
             tmp.resize(nb);
             if (fseek(f, (long) (data_off + gguf_get_tensor_offset(g, i)), SEEK_SET) != 0 || fread(tmp.data(), 1, nb, f) != nb) {
                 fclose(f);
@@ -449,6 +498,30 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
             }
             if (strcmp(name, "sd.vocab") == 0) {
                 vocab.assign((const int32_t *) tmp.data(), (const int32_t *) tmp.data() + ggml_nelements(t));
+            }
+            if (head_converted && (t == th || t == tb)) {
+                // rows 0..n_short-1 and the other class (the file's last row)
+                std::vector<float> rows((size_t) (n_short + 1)*t->ne[0]);
+                const ggml_type ft = t == th ? head_file_type : GGML_TYPE_F32;
+                const size_t rs = ggml_row_size(ft, t->ne[0]);
+                for (int32_t r = 0; r <= n_short; r++) {
+                    const int32_t src = r < n_short ? r : n_vocab_draft;
+                    if (t == th) {
+                        ggml_get_type_traits(ft)->to_float(tmp.data() + (size_t) src*rs, rows.data() + (size_t) r*t->ne[0], t->ne[0]);
+                    } else {
+                        rows[r] = ((const float *) tmp.data())[src];
+                    }
+                }
+                std::vector<uint8_t> out(ggml_nbytes(t));
+                if (t == tb) {
+                    memcpy(out.data(), rows.data(), out.size());
+                } else if (head_type == GGML_TYPE_F16) {
+                    ggml_fp32_to_fp16_row(rows.data(), (ggml_fp16_t *) out.data(), (int64_t) rows.size());
+                } else {
+                    ggml_quantize_chunk(head_type, rows.data(), out.data(), 0, n_short + 1, t->ne[0], nullptr);
+                }
+                ggml_backend_tensor_set(t, out.data(), 0, out.size());
+                continue;
             }
             ggml_backend_tensor_set(t, tmp.data(), 0, nb);
         }
@@ -474,7 +547,7 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
     }
     const int32_t max_proj = *std::max_element(depth_proj.begin(), depth_proj.end());
     const int32_t max_row  = *std::max_element(depth_emb_row.begin(), depth_emb_row.end());
-    if ((int32_t) vocab.size() != n_vocab_draft || w_head->ne[1] != n_vocab_draft + 1 || w_anc->ne[2] <= max_proj ||
+    if ((int32_t) vocab.size() != n_vocab_draft || w_head->ne[1] != n_short + 1 || w_anc->ne[2] <= max_proj ||
             anchor_emb->ne[1] <= max_row || w_emb->ne[0] != n_embd || (fuse && w_fuse->ne[2] != (int64_t) fuse_depths.size())) {
         LLAMA_LOG_ERROR("%s: tensor shapes do not match the metadata\n", __func__);
         return false;
@@ -571,10 +644,13 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
         tp += (tp.empty() ? "" : ",") + depth_str(d, n_target);
     }
     LLAMA_LOG_INFO("%s: staircase drafter %s (profile %s%s): %d layers, %d draft ids%s; split %s, %s window %s, older tokens "
-            "%s, taps %s; alpha %.2f, top-%d; on %s, %d cells, %d rows per guess, embeddings %s\n", __func__, params.path,
+            "%s, taps %s; alpha %.2f, top-%d; on %s, %d cells, %d rows per guess, embeddings %s; output head %d ids + other "
+            "(%s), last block %s, projections %s\n", __func__, params.path,
             profile.c_str(), general ? ", depth-general" : "", n_layer, n_vocab_draft, fuse ? ", fused" : "", sp.c_str(),
             kind.c_str(), st.c_str(), depth_str(depth_deep, n_target).c_str(), tp.c_str(), alpha, top_k,
-            ggml_backend_dev_name(dev), n_ring, n_rows_step, emb_in_graph ? "gathered on the device" : "looked up on the host");
+            ggml_backend_dev_name(dev), n_ring, n_rows_step, emb_in_graph ? "gathered on the device" : "looked up on the host",
+            n_short, ggml_type_name(w_head->type), prune_last ? "on the output row" : "on every row",
+            anc_dense ? "dense" : "per row");
     return true;
 }
 
@@ -636,6 +712,8 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         g.fuse_idx = fuse ? add_small(GGML_TYPE_I32, n_fuse*N) : nullptr;
         g.out_row  = add_small(GGML_TYPE_I32, 1);
         g.emb_idx  = emb_in_graph ? nullptr : add_small(GGML_TYPE_I32, N);   // store rows of the embeddings
+        g.out_pos  = add_small(GGML_TYPE_I32, 1);
+        g.anc_sel  = anc_dense ? add_small(GGML_TYPE_I32, N) : nullptr;
     }
     g.blob_size = off;
     size_t off_large = off;
@@ -678,12 +756,18 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
     cp = ggml_set_rows(ctx, cp, g.wcell_pos, g.wcell_idx);
     // mask[c, r] = 0 where cell c's position <= row r's position, else -inf
     ggml_tensor * mask = nullptr;
+    ggml_tensor * mask_out = nullptr;   // the output row's (pruned last block)
+    const bool prune = !bulk && prune_last;
     {
         ggml_tensor * cpc  = ggml_reshape_2d(ctx, cp, n_cells, 1);
         ggml_tensor * rp   = ggml_repeat_4d(ctx, g.row_pos, n_cells, N, 1, 1);
         ggml_tensor * diff = ggml_sub(ctx, rp, cpc);
         ggml_tensor * vis  = ggml_step(ctx, ggml_scale_bias(ctx, diff, 1.0f, 0.5f));
-        mask = ggml_cast(ctx, ggml_scale_bias(ctx, vis, 1e30f, -1e30f), GGML_TYPE_F16);
+        ggml_tensor * m32  = ggml_scale_bias(ctx, vis, 1e30f, -1e30f);
+        mask = ggml_cast(ctx, m32, GGML_TYPE_F16);
+        if (prune) {
+            mask_out = ggml_cast(ctx, ggml_get_rows(ctx, m32, g.out_row), GGML_TYPE_F16);
+        }
     }
 
     // rows: embedding, projected hidden state, fused shallower depths, depth embedding
@@ -709,8 +793,15 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         }
     } else {
         ggml_tensor * h  = ggml_rms_norm(ctx, ggml_get_rows(ctx, store, g.anc_idx), rms_eps);
-        ggml_tensor * ha = ggml_mul_mat_id(ctx, w_anc, ggml_reshape_3d(ctx, h, n_embd, 1, N), g.anc_id);
-        x = ggml_add(ctx, x, ggml_reshape_2d(ctx, ha, n_embd, N));
+        if (anc_dense) {
+            // every projection of every row in one product, then each row's own (row i, projection k: i*n_proj + k)
+            const int64_t n_proj = w_anc->ne[2];
+            ggml_tensor * hall = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, w_anc, n_embd, n_embd*n_proj), h);
+            x = ggml_add(ctx, x, ggml_get_rows(ctx, ggml_reshape_2d(ctx, hall, n_embd, n_proj*N), g.anc_sel));
+        } else {
+            ggml_tensor * ha = ggml_mul_mat_id(ctx, w_anc, ggml_reshape_3d(ctx, h, n_embd, 1, N), g.anc_id);
+            x = ggml_add(ctx, x, ggml_reshape_2d(ctx, ha, n_embd, N));
+        }
         if (fuse) {
             ggml_tensor * hf = ggml_rms_norm(ctx, ggml_get_rows(ctx, store, g.fuse_idx), rms_eps);
             for (int32_t k = 0; k < n_fuse; k++) {
@@ -738,8 +829,15 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
             ggml_build_forward_expand(gf, vc);
             break;
         }
-        ggml_tensor * q = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, b.wq, hn), head_dim, n_head, N);
-        q = ggml_rope_ext(ctx, q, g.rope_pos, nullptr, head_dim, 0, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        // the last block of a guess: every row leaves its keys and values, only the output row goes on
+        const bool one = prune && last;
+        const int32_t nq = one ? 1 : N;
+        if (one) {
+            x  = ggml_get_rows(ctx, x, g.out_row);
+            hn = ggml_get_rows(ctx, hn, g.out_row);
+        }
+        ggml_tensor * q = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, b.wq, hn), head_dim, n_head, nq);
+        q = ggml_rope_ext(ctx, q, one ? g.out_pos : g.rope_pos, nullptr, head_dim, 0, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         const size_t es  = ggml_element_size(kc);
         const size_t row = (size_t) head_dim*n_head_kv*es;
@@ -747,9 +845,9 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
         ggml_tensor * vv = ggml_permute(ctx, ggml_view_3d(ctx, vc, head_dim, n_head_kv, n_cells, head_dim*es, row, 0), 0, 2, 1, 3);
         ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
 
-        ggml_tensor * att = ggml_flash_attn_ext(ctx, qp, kv, vv, mask, kq_scale, 0.0f, 0.0f);
+        ggml_tensor * att = ggml_flash_attn_ext(ctx, qp, kv, vv, one ? mask_out : mask, kq_scale, 0.0f, 0.0f);
         ggml_prec_set_acc(att, GGML_PREC_F32);
-        att = ggml_reshape_2d(ctx, att, head_dim*n_head, N);
+        att = ggml_reshape_2d(ctx, att, head_dim*n_head, nq);
         x = ggml_add(ctx, x, ggml_mul_mat(ctx, b.wo, att));
 
         ggml_tensor * hm = ggml_rms_norm(ctx, x, rms_eps);
@@ -758,12 +856,12 @@ bool llama_pipe_drafter::build_graph(graph_inst & g, int32_t n_rows, bool bulk) 
     }
 
     if (!bulk) {
-        ggml_tensor * f = ggml_rms_norm(ctx, ggml_get_rows(ctx, x, g.out_row), rms_eps);
+        ggml_tensor * f = ggml_rms_norm(ctx, prune && n_layer > 0 ? x : ggml_get_rows(ctx, x, g.out_row), rms_eps);
         ggml_tensor * logits = ggml_add(ctx, ggml_mul_mat(ctx, w_head, f), b_head);
         ggml_tensor * probs  = ggml_soft_max_ext(ctx, logits, nullptr, alpha, 0.0f);
-        const int32_t K = std::min(top_k, n_vocab_draft + 1);
+        const int32_t K = std::min(top_k, n_short + 1);
         g.top_ids = ggml_top_k(ctx, probs, K);
-        g.top_p   = ggml_get_rows(ctx, ggml_reshape_2d(ctx, probs, 1, n_vocab_draft + 1), g.top_ids);
+        g.top_p   = ggml_get_rows(ctx, ggml_reshape_2d(ctx, probs, 1, n_short + 1), g.top_ids);
         ggml_set_output(g.top_ids);
         ggml_set_output(g.top_p);
         ggml_build_forward_expand(gf, g.top_ids);
@@ -811,7 +909,7 @@ void llama_pipe_drafter::ensure_graphs() {
     off_ids = off_cp  + GGML_PAD((size_t) n_cells*sizeof(float), 256);
     off_p   = off_ids + GGML_PAD((size_t) top_k*4, 256);
     off_lg  = off_p   + GGML_PAD((size_t) top_k*4, 256);
-    stage_stride = off_lg + (keep_logits ? GGML_PAD((size_t) (n_vocab_draft + 1)*sizeof(float), 256) : 0);
+    stage_stride = off_lg + (keep_logits ? GGML_PAD((size_t) (n_short + 1)*sizeof(float), 256) : 0);
     if (buf_stage) {
         ggml_backend_buffer_free(buf_stage);
     }
@@ -1010,6 +1108,15 @@ void llama_pipe_drafter::write_blob(graph_inst & g, uint8_t * dst, const std::ve
             put(g.fuse_idx, fidx.data(), fidx.size()*4);
         }
         put(g.out_row, &out_row, 4);
+        put(g.out_pos, &rope[out_row], 4);
+        if (g.anc_sel) {
+            const int32_t n_proj = (int32_t) w_anc->ne[2];
+            std::vector<int32_t> sel(aid.size());
+            for (size_t i = 0; i < aid.size(); i++) {
+                sel[i] = (int32_t) i*n_proj + aid[i];
+            }
+            put(g.anc_sel, sel.data(), sel.size()*4);
+        }
     }
 }
 
@@ -1165,14 +1272,15 @@ llama_token llama_pipe_drafter::get(float u, float * p_top) {
     const float *   ps  = (const float *) (st + off_p);
     const int32_t K = (int32_t) ggml_nelements(g_step->top_ids);
 
+    // the head's rows: the first n_short draft ids, then the other class
     std::vector<std::pair<float, int32_t>> c;
     for (int32_t i = 0; i < K; i++) {
-        c.push_back({ ps[i], ids[i] });
+        c.push_back({ ps[i], ids[i] < n_short ? ids[i] : n_vocab_draft });
     }
     std::sort(c.begin(), c.end(), [](const auto & a, const auto & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
     if (keep_logits) {
         const float * lg = (const float *) (st + off_lg);
-        logits_host.assign(lg, lg + n_vocab_draft + 1);
+        logits_host.assign(lg, lg + n_short + 1);
     }
     if (p_top) {
         *p_top = c.empty() ? 0.0f : c[0].first;

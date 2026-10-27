@@ -129,9 +129,9 @@ llama_token common_pipe_guesser::guess(const llama_token * inflight, size_t n_in
     }
 
     llama_token g = copy_guess();
-    if (g < 0 && kind == CONT && store) {
+    if (g < 0 && kind == CONT && (store || !cont_any)) {
         g = cont_guess(2);
-        if (g < 0) {
+        if (g < 0 && store) {
             g = common_pipe_store_guess(store, hist.data(), (int) hist.size());
             n_store += g >= 0;
         }

@@ -113,6 +113,12 @@ private:
     // hyperparameters (from the file)
     int32_t n_embd = 0, n_layer = 0, n_head = 0, n_head_kv = 0, head_dim = 0, n_ff = 0;
     int32_t n_vocab_draft = 0;
+    // the output head as run: its first n_short draft ids (the most frequent) and the other class, n_short + 1 rows
+    int32_t n_short = 0;
+    // cost options (LLAMA_DRAFT_* environment): the last block for the output row only, and all depth projections as
+    // one matrix product instead of one per row; both exact
+    bool    prune_last = true;
+    bool    anc_dense  = false;
     float   rms_eps = 1e-6f, rope_theta = 1e5f;
     bool    fuse = false;
     bool    general = false;
@@ -201,6 +207,8 @@ private:
         ggml_tensor * kv_idx = nullptr, * wcell_idx = nullptr, * wcell_pos = nullptr, * out_row = nullptr;
         ggml_tensor * h_full = nullptr, * h_fuse = nullptr, * emb_rows = nullptr;   // bulk (emb_rows: host lookup)
         ggml_tensor * emb_idx = nullptr;                                          // step, host lookup: store rows
+        ggml_tensor * out_pos = nullptr;                                          // step: the output row's position
+        ggml_tensor * anc_sel = nullptr;                                          // step, dense: each row's projection
         // outputs
         ggml_tensor * top_ids = nullptr, * top_p = nullptr, * logits = nullptr;
         ~graph_inst();
