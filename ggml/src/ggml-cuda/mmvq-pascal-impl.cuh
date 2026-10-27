@@ -25,6 +25,11 @@ template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = s
 //   MMVQP_IQ_SIGN_LUT    1: a weight group's sign masks come from a shared-memory table; 0: from its sign bits, in registers
 //   MMVQP_IQ_MIN_BLOCKS  blocks per SM the compiler keeps registers for (__launch_bounds__), 1: no limit
 //   MMVQP_IQ_R           rows per lane group
+//   MMVQP_IQ_PERSIST     one token: blocks per SM, each looping over row blocks, so a block fills its tables once for
+//                        many rows; 0: one block per row block
+#ifndef MMVQP_IQ_PERSIST
+#define MMVQP_IQ_PERSIST 0
+#endif
 #ifndef MMVQP_IQ_SIGN_LUT
 #define MMVQP_IQ_SIGN_LUT 1
 #endif

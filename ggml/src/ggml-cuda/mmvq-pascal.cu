@@ -68,6 +68,7 @@ struct mmvqp_args {
     int             row_bytes;
     int             lpr_log2;  // lanes per row = 1 << lpr_log2
     int             niter;     // iterations per lane
+    int             nrowblocks; // row blocks (MMVQP_IQ_PERSIST: fewer blocks than row blocks, each looping over them)
     uint3           nchannels_y;
     uint3           channel_ratio;
     uint3           sample_ratio;
@@ -182,7 +183,9 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     constexpr int TW = mmvqp_tab_words<type>();    // grid types: table words
     __shared__ uint4 sm[staged ? NW : 1][staged ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
     __shared__ uint2 tab[TW > 0 ? TW / 2 : 1];
-    mmvqp_tabs_ready<type>((uint32_t *) tab);
+    if (bx == blockIdx.x) { // a block's first row block (MMVQP_IQ_PERSIST: its later ones keep the tables)
+        mmvqp_tabs_ready<type>((uint32_t *) tab);
+    }
 
     const int lane     = threadIdx.x;
     const int lpr_log2 = p.lpr_log2;
@@ -334,7 +337,13 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
 template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
 __launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, mmvqp_min_blocks<type>())
 static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_mm_fusion_args_device fusion) {
-    mmvqp_rows_1t<type, R, C, staged, fk, SU>(p, fusion, blockIdx.x);
+    if constexpr (mmvqp_grid_type<type>() && MMVQP_IQ_PERSIST > 0) {
+        for (uint32_t bx = blockIdx.x; bx < (uint32_t) p.nrowblocks; bx += gridDim.x) {
+            mmvqp_rows_1t<type, R, C, staged, fk, SU>(p, fusion, bx);
+        }
+    } else {
+        mmvqp_rows_1t<type, R, C, staged, fk, SU>(p, fusion, blockIdx.x);
+    }
 }
 
 // One token, three products of the same activations in one launch (an attention block's Q, K and V): row blocks
@@ -924,8 +933,15 @@ bool ggml_cuda_mmvq_pascal(
 
     const int  fk             = gate ? MMVQP_GATE : (fusion.x_bias ? MMVQP_BIAS : MMVQP_PLAIN);
     const int  rows_per_block = MMVQ_PASCAL_NWARPS * (WARP_SIZE >> lpr_log2) * s.R;
-    const dim3 grid((unsigned) ((nrows_x + rows_per_block - 1) / rows_per_block),
-                    (unsigned) (nblocks_y + (fusion.shared_up ? 1 : 0)), (unsigned) nsamples_dst);
+    dim3 grid((unsigned) ((nrows_x + rows_per_block - 1) / rows_per_block),
+              (unsigned) (nblocks_y + (fusion.shared_up ? 1 : 0)), (unsigned) nsamples_dst);
+    p.nrowblocks = (int) grid.x;
+    if (MMVQP_IQ_PERSIST > 0 && ncols_dst == 1 && (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS)) {
+        // MMVQP_IQ_PERSIST blocks per SM in all, over the experts (grid.y) and samples (grid.z)
+        const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        const int per = (int) (grid.y * grid.z);
+        grid.x = std::min(grid.x, (unsigned) std::max(1, (MMVQP_IQ_PERSIST * nsm + per - 1) / per));
+    }
 
     switch (type) {
         case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream, su); break;
