@@ -21,7 +21,8 @@ template <> struct mmvqp_traits<GGML_TYPE_Q6_K>   { static constexpr int bs = si
 template <> struct mmvqp_traits<GGML_TYPE_IQ2_S>   { static constexpr int bs = sizeof(block_iq2_s);   static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = sizeof(block_iq3_xxs); static constexpr int na = QK_K / QK8_1; };
 
-// Tuning switches of the grid types' kernels, set at compile time (-D) and measured on a P106 with test-backend-ops perf:
+// Tuning switches of the grid types' kernels, set at compile time (-D); the defaults are the fastest of 11 variants on a
+// P106 (one-token expert products at Ornith-1.5-122B's shapes, 2026-10-27):
 //   MMVQP_IQ_SIGN_LUT    1: a weight group's sign masks come from a shared-memory table; 0: from its sign bits, in registers
 //   MMVQP_IQ_MIN_BLOCKS  blocks per SM the compiler keeps registers for (__launch_bounds__), 1: no limit
 //   MMVQP_IQ_R           rows per lane group
@@ -31,10 +32,10 @@ template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = s
 #define MMVQP_IQ_PERSIST 0
 #endif
 #ifndef MMVQP_IQ_SIGN_LUT
-#define MMVQP_IQ_SIGN_LUT 1
+#define MMVQP_IQ_SIGN_LUT 0
 #endif
 #ifndef MMVQP_IQ_MIN_BLOCKS
-#define MMVQP_IQ_MIN_BLOCKS 1
+#define MMVQP_IQ_MIN_BLOCKS 3
 #endif
 #ifndef MMVQP_IQ_R
 #define MMVQP_IQ_R 1
