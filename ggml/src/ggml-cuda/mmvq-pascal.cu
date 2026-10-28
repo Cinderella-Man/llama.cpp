@@ -708,31 +708,26 @@ template <ggml_type type, int C> constexpr __host__ __device__ int mmvqp_mt_ds()
 // the file). Grid: (row blocks / rb, channels, samples) for MUL_MAT, every block serving all tokens; (row blocks / rb,
 // tokens * slots + shared expert, samples) for MUL_MAT_ID, block y serving group y of the entries. Dynamic shared memory:
 // the staged activations of up to MMVQP_MAX_COLS tokens, act_tok bytes each.
+template <ggml_type type, int R, int C, bool staged, int fk, int SU, int NT>
+static __device__ __forceinline__ void mmvqp_mt_rows(const mmvqp_args_mt & p, const ggml_cuda_mm_fusion_args_device & fusion,
+                                                     const char * const * xm, char * smw, char * act, const uint32_t * tab,
+                                                     const int * yc, const int * dc, float * dst, int64_t bias_off);
+
 template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
 __launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, MMVQP_MT_MIN_BLOCKS)
 static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml_cuda_mm_fusion_args_device fusion) {
-    using unit_t = typename mmvqp_stage_unit<SU>::t;
-    constexpr int  NW  = MMVQ_PASCAL_NWARPS;
-    constexpr int  NC  = MMVQP_MAX_COLS;
-    constexpr int  BS  = mmvqp_traits<type>::bs;
-    constexpr int  NAB = mmvqp_traits<type>::na;      // 32-weight sub-blocks (activation blocks) per weight block
-    constexpr int  CNA = C * NAB;                     // ... per lane chunk
-    constexpr int  WB  = C * BS;                      // weight bytes per lane and iteration
-    constexpr int  M   = fk == MMVQP_GATE ? 2 : 1;    // matrices: up (or plain), gate
-    constexpr int  MS  = mmvqp_mt_staged_mats<type, R, C, staged, M>(); // matrices staged at a time
-    constexpr int  NU  = (WB + SU - 1) / SU;          // staged: units per lane and row, the last one predicated
-    constexpr int  TW  = mmvqp_mt_tab_words<type>();  // grid types: table words
-    constexpr int  US  = mmvqp_mt_us<type, C>();      // staged activations: int8 words per lane chunk
-    constexpr int  DS  = mmvqp_mt_ds<type, C>();      // ... FP32 scales per lane chunk
-    constexpr bool Q5  = type == GGML_TYPE_Q5_0;
+    constexpr int NW = MMVQ_PASCAL_NWARPS;
+    constexpr int NC = MMVQP_MAX_COLS;
+    constexpr int WB = C * mmvqp_traits<type>::bs;       // weight bytes per lane and iteration
+    constexpr int M  = fk == MMVQP_GATE ? 2 : 1;         // matrices: up (or plain), gate
+    constexpr int MS = mmvqp_mt_staged_mats<type, R, C, staged, M>(); // matrices staged at a time
+    constexpr int TW = mmvqp_mt_tab_words<type>();       // grid types: table words
     __shared__ uint4 sm[staged ? NW : 1][staged ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
     __shared__ uint2 tab[TW > 0 ? TW / 2 : 1];
     extern __shared__ uint4 sm_act[];
 
     const int lane     = threadIdx.x;
     const int lpr_log2 = p.lpr_log2;
-    const int lpr      = 1 << lpr_log2;
-    const int sl       = lane & (lpr - 1);
     const int grp      = lane >> lpr_log2;
 
     const bool     shared_expert = fk == MMVQP_GATE && fusion.shared_up && blockIdx.y == gridDim.y - 1;
@@ -835,16 +830,49 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
     if constexpr (M == 2) {
         xm[1] = (const char *) (shared_expert ? fusion.shared_gate : fusion.gate) + xoff;
     }
-    const int wstep = WB << lpr_log2;
-    [[maybe_unused]] char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * MS * WB << lpr_log2 : 0);
-    [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> (SU == 16 ? 4 : SU == 8 ? 3 : 2);
+    char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * MS * WB << lpr_log2 : 0);
+    float * dst = shared_expert ? fusion.shared_dst : p.dst;
+    const int64_t bias_off = sample_dst*p.stride_sample_dst + channel_bias*p.stride_channel_dst;
 
-    char *     act   = (char *) sm_act;
+    // the token count as a constant, so that no token's loads and products wait behind a test of the count
+    switch (nt) {
+        case 1:  mmvqp_mt_rows<type, R, C, staged, fk, SU, 1>(p, fusion, xm, smw, (char *) sm_act, (const uint32_t *) tab, yc, dc, dst, bias_off); break;
+        case 2:  mmvqp_mt_rows<type, R, C, staged, fk, SU, 2>(p, fusion, xm, smw, (char *) sm_act, (const uint32_t *) tab, yc, dc, dst, bias_off); break;
+        case 3:  mmvqp_mt_rows<type, R, C, staged, fk, SU, 3>(p, fusion, xm, smw, (char *) sm_act, (const uint32_t *) tab, yc, dc, dst, bias_off); break;
+        default: mmvqp_mt_rows<type, R, C, staged, fk, SU, 4>(p, fusion, xm, smw, (char *) sm_act, (const uint32_t *) tab, yc, dc, dst, bias_off); break;
+    }
+}
+
+// The rows of mul_mat_vec_q_pascal_mt for its NT tokens: xm the matrices of the block's expert, smw the warp's
+// weight staging, act the staged activations (act_tok bytes per token), yc/dc the tokens' activation and output
+// offsets.
+template <ggml_type type, int R, int C, bool staged, int fk, int SU, int NT>
+static __device__ __forceinline__ void mmvqp_mt_rows(const mmvqp_args_mt & p, const ggml_cuda_mm_fusion_args_device & fusion,
+                                                     const char * const * xm, char * smw, char * act, const uint32_t * tab,
+                                                     const int * yc, const int * dc, float * dst, const int64_t bias_off) {
+    using unit_t = typename mmvqp_stage_unit<SU>::t;
+    constexpr int  NW  = MMVQ_PASCAL_NWARPS;
+    constexpr int  BS  = mmvqp_traits<type>::bs;
+    constexpr int  NAB = mmvqp_traits<type>::na;
+    constexpr int  CNA = C * NAB;
+    constexpr int  WB  = C * BS;
+    constexpr int  M   = fk == MMVQP_GATE ? 2 : 1;
+    constexpr int  MS  = mmvqp_mt_staged_mats<type, R, C, staged, M>();
+    constexpr int  NU  = (WB + SU - 1) / SU;
+    constexpr int  US  = mmvqp_mt_us<type, C>();
+    constexpr int  DS  = mmvqp_mt_ds<type, C>();
+    constexpr bool Q5  = type == GGML_TYPE_Q5_0;
+
+    const int lane     = threadIdx.x;
+    const int lpr_log2 = p.lpr_log2;
+    const int lpr      = 1 << lpr_log2;
+    const int sl       = lane & (lpr - 1);
+    const int grp      = lane >> lpr_log2;
+    const int wstep    = WB << lpr_log2;
+    [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> (SU == 16 ? 4 : SU == 8 ? 3 : 2);
     const int  tid   = threadIdx.y * WARP_SIZE + lane;
     const bool whole = p.it_tile >= p.niter;
-
-    float * dst = shared_expert ? fusion.shared_dst : p.dst;
-    [[maybe_unused]] const int64_t bias_off = sample_dst*p.stride_sample_dst + channel_bias*p.stride_channel_dst;
+    GGML_UNUSED(bias_off);
 
     for (int rbi = 0; rbi < p.rb; ++rbi) {
         const int rblk = blockIdx.x * p.rb + rbi;
@@ -862,9 +890,9 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
             }
         }
 
-        float acc[NC][M][R];
+        float acc[NT][M][R];
 #pragma unroll
-        for (int j = 0; j < NC; ++j) {
+        for (int j = 0; j < NT; ++j) {
 #pragma unroll
             for (int m = 0; m < M; ++m) {
 #pragma unroll
@@ -885,10 +913,7 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
                 const int nb = (itn << lpr_log2) * CNA;
                 const int b0 = (it0 << lpr_log2) * CNA;
 #pragma unroll
-                for (int j = 0; j < NC; ++j) {
-                    if (j >= nt) {
-                        break;
-                    }
+                for (int j = 0; j < NT; ++j) {
                     const char * yj = p.vy + yc[j] + (int64_t) b0 * (int64_t) sizeof(block_q8_1);
                     char       * aj = act + j * p.act_tok;
                     for (int r = tid; r < nb; r += NW * WARP_SIZE) {
@@ -961,9 +986,9 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
                     }
 #pragma unroll
                     for (int b = 0; b < C; ++b) {
-                        float sumf[NC][MS][R];
+                        float sumf[NT][MS][R];
 #pragma unroll
-                        for (int j = 0; j < NC; ++j) {
+                        for (int j = 0; j < NT; ++j) {
 #pragma unroll
                             for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
@@ -984,10 +1009,7 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
                                 }
                             }
 #pragma unroll
-                            for (int j = 0; j < NC; ++j) {
-                                if (j >= nt) {
-                                    break;
-                                }
+                            for (int j = 0; j < NT; ++j) {
                                 const char  * aj = act + j * p.act_tok;
                                 const uint4 * pu = (const uint4 *) (aj + (c*US + sbx*8) * 4);
                                 const uint4   u0 = pu[0];
@@ -1012,10 +1034,7 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
                         }
                         if constexpr (NAB > 1) {
 #pragma unroll
-                            for (int j = 0; j < NC; ++j) {
-                                if (j >= nt) {
-                                    break;
-                                }
+                            for (int j = 0; j < NT; ++j) {
 #pragma unroll
                                 for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
@@ -1039,10 +1058,7 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
         }
 
 #pragma unroll
-        for (int j = 0; j < NC; ++j) {
-            if (j >= nt) {
-                break;
-            }
+        for (int j = 0; j < NT; ++j) {
 #pragma unroll
             for (int i = 0; i < R; ++i) {
 #pragma unroll
@@ -1058,10 +1074,7 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
         }
 
 #pragma unroll
-        for (int j = 0; j < NC; ++j) {
-            if (j >= nt) {
-                break;
-            }
+        for (int j = 0; j < NT; ++j) {
 #pragma unroll
             for (int i = 0; i < R; ++i) {
                 const int row = row0 + i;
