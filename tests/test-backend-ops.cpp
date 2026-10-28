@@ -10368,6 +10368,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_N2P, GGML_TYPE_N3P,
 };
 
 static const ggml_type base_types[] = {
@@ -10396,6 +10397,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_N2P, GGML_TYPE_N3P,
     GGML_TYPE_BF16,
 };
 
@@ -11888,11 +11890,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the 2- and 3-bit grid types of Ornith-1.5-122B's files (Qwen3.5-122B shapes: hidden 3072, 8 of 256 experts of
-    // width 1024, a 1024-wide shared expert) on the Pascal matrix-vector kernels, 1 to 4 tokens: K = 3072 and 1024 stage
-    // with 8-byte loads, K = 512 (2 super-blocks per row) with 4-byte loads, K = 2048 with 16-byte loads; an odd row
-    // count; activations whose blocks sum past FP16's range
-    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+    // the 2- and 3-bit types of Ornith-1.5-122B's files, the grid types IQ2_S and IQ3_XXS and Miner Llama's N2P and N3P
+    // (Qwen3.5-122B shapes: hidden 3072, 8 of 256 experts of width 1024, a 1024-wide shared expert), on the Pascal
+    // matrix-vector kernels, 1 to 4 tokens: plain products at K = 3072 and 1024 (the half-word types stage with 8-byte
+    // loads), K = 512 (2 super-blocks per row, 4-byte loads), K = 2048 (16-byte loads) and an odd row count; expert
+    // products, the fused gate/up, activations whose blocks sum past FP16's range, the shared expert in the routed
+    // launch, repeated experts; for N2P and N3P also prompt-sized batches, which take the dequantize-and-GEMM path
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_N2P, GGML_TYPE_N3P }) {
         for (int64_t n : { 1, 2, 3, 4 }) {
             for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                     { 1024, 3072 }, { 3072, 1024 }, { 2048, 512 }, { 1024, 2048 }, { 4097, 3072 } }) {
@@ -11910,6 +11914,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
             test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 1024));
             test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 1024));
+        }
+        if (type == GGML_TYPE_N2P || type == GGML_TYPE_N3P) {
+            for (int64_t n : { 9, 33, 128 }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n, 3072, { 1, 1 }, { 1, 1 }));
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 1024, n, 3072));
+            }
         }
     }
 
@@ -13073,15 +13083,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // the 2- and 3-bit grid types at Ornith-1.5-122B's shapes (hidden 3072, experts of width 1024, 8 used): the fused
-    // expert gate/up as llama.cpp runs it, the expert down projection, and an 8192-row dense product, at 1, 2 and 4
-    // tokens. Every call reads at least 8 MB of weights (8 experts of 64), beyond a P106's 1.5 MB L2, so repeated runs
-    // time memory reads rather than cache hits.
-    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+    // Ornith-1.5-122B's products (hidden 3072, experts of width 1024, 8 used of a 64-expert tensor: 25-50 M weights per
+    // expert call, far beyond a P106's 1.5 MB L2; a dense 3072 -> 8192) at 1, 2 and 4 tokens, the shapes of the IQ
+    // kernels' rig runs (fork branch pascal-p106-v3-iqmmvq): N2P and N3P against the formats of today's files (IQ2_S,
+    // IQ3_XXS, Q2_K, Q3_K) and the fast formats (Q4_0, Q8_0)
+    for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                            GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 4 }) {
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
-            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n, 3072, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 1024, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, true,  1024, n, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
         }
     }
 

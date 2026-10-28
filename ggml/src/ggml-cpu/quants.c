@@ -64,6 +64,69 @@ void ggml_vec_dot_q4_1_64_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const 
     *s = sumf;
 }
 
+void quantize_row_n2p(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_n2p_ref(x, y, k);
+}
+
+void quantize_row_n3p(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_n3p_ref(x, y, k);
+}
+
+// Scalar products for the N2P/N3P types (reference speed only; the GPU kernels are the fast path). Integer sums stay
+// below 2^26 per super-block: levels |v| <= 126, activations <= 127, scales |s| <= 16.
+void ggml_vec_dot_n2p_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(bs);
+
+    const block_n2p  * GGML_RESTRICT x = vx;
+    const block_q8_K * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    float sumf = 0;
+    for (int i = 0; i < nb; i++) {
+        int sumi = 0;
+        for (int ib = 0; ib < QK_K/8; ++ib) {
+            const int ls = ((x[i].scales[ib/2] >> 4*(ib%2)) & 0xf) - 8;
+            const int8_t * L = kvalues_n2p + 4*((x[i].extra[ib/8] >> (ib%8)) & 1);
+            int sumb = 0;
+            for (int j = 0; j < 8; ++j) {
+                sumb += y[i].qs[8*ib + j] * L[ggml_n2p_code(x[i].qs, 8*ib + j)];
+            }
+            sumi += ls * sumb;
+        }
+        sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d * sumi;
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_n3p_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(bs);
+
+    const block_n3p  * GGML_RESTRICT x = vx;
+    const block_q8_K * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    float sumf = 0;
+    for (int i = 0; i < nb; i++) {
+        int sumi = 0;
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            const int ls = (((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> ib) & 1) << 4)) - 16;
+            const int8_t * L = kvalues_n3p + 8*((x[i].extra >> ib) & 1);
+            int sumb = 0;
+            for (int j = 0; j < 32; ++j) {
+                const int jj = 32*ib + j;
+                sumb += y[i].qs[jj] * L[ggml_n2p_code(x[i].qs, jj) | (ggml_n3p_hbit(x[i].qh, jj) << 2)];
+            }
+            sumi += ls * sumb;
+        }
+        sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d * sumi;
+    }
+    *s = sumf;
+}
+
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_1_ref(x, y, k);
 }

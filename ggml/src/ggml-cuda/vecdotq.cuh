@@ -1465,3 +1465,67 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+#define VDR_N2P_Q8_1_MMVQ 2
+#define VDR_N3P_Q8_1_MMVQ 2
+#define VDR_N2P_Q8_1_MMQ  4 // MMQ loads both into the Q8_0 tile layout
+#define VDR_N3P_Q8_1_MMQ  4
+
+// N2P: 32 weights per call (Q8_1 block iqs/2), four 8-weight sub-blocks. A code word shifted by 0, 2, 16 or 18 bits is
+// the __byte_perm selector of 4 consecutive weights; the table register is chosen per sub-block by its shift bit.
+static __device__ __forceinline__ float vec_dot_n2p_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_n2p * bq = (const block_n2p *) vbq + kbx;
+    const int ib32 = iqs/2;
+
+    const int sc = bq->scales[2*ib32] | (bq->scales[2*ib32 + 1] << 8); // scales of the four sub-blocks
+    const int ex = bq->extra[ib32/2] >> 4*(ib32%2);                    // their shift bits
+
+    int sumi = 0;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const uint32_t q = get_int_b2(bq->qs, 2*ib32 + k);
+#pragma unroll
+        for (int sb = 0; sb < 2; ++sb) {
+            const int      s = 2*k + sb;
+            const uint32_t T = (ex >> s) & 1 ? N2P_TAB1 : N2P_TAB0;
+            int sumb = ggml_cuda_dp4a(__byte_perm(T, T, q >> (16*sb)),     get_int_b4(bq8_1[ib32].qs, 4*k + 2*sb),     0);
+            sumb     = ggml_cuda_dp4a(__byte_perm(T, T, q >> (16*sb + 2)), get_int_b4(bq8_1[ib32].qs, 4*k + 2*sb + 1), sumb);
+            sumi += sumb * (((sc >> 4*s) & 0xf) - 8);
+        }
+    }
+
+    const float d = __half2float(bq->d) * __low2float(bq8_1[ib32].ds);
+    return d * sumi;
+}
+
+// N3P: one 32-weight sub-block per call. The selector of weights 4g..4g+3 takes the low code bits from the 2-bit plane
+// shifted by {0, 2, 16, 18}[g%4] and the third bits from the 1-bit plane shifted by 16*(g/4) + g%4 - 2 (bit 3 of each
+// selector nibble is ignored by __byte_perm).
+static __device__ __forceinline__ float vec_dot_n3p_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_n3p * bq = (const block_n3p *) vbq + kbx;
+    const int ib = iqs/2;
+
+    const int  ls = (((bq->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((bq->scales_h >> ib) & 1) << 4)) - 16;
+    const bool sh = (bq->extra >> ib) & 1;
+    const uint32_t ta = sh ? N3P_TAB1A : N3P_TAB0A;
+    const uint32_t tb = sh ? N3P_TAB1B : N3P_TAB0B;
+    const uint32_t hi = get_int_b4(bq->qh, ib);
+
+    int sumi = 0;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const uint32_t lo  = get_int_b4(bq->qs, 2*ib + g/4);
+        const int      t   = 16*((g%4)/2) + 2*(g%2);
+        const int      s   = 16*(g/4) + g%4 - 2;
+        const uint32_t hs  = s >= 0 ? hi >> s : hi << -s;
+        const uint32_t sel = ((lo >> t) & 0x3333) | (hs & 0x4444);
+        sumi = ggml_cuda_dp4a(__byte_perm(ta, tb, sel), get_int_b4(bq8_1[ib].qs, g), sumi);
+    }
+
+    const float d = __half2float(bq->d) * __low2float(bq8_1[ib].ds);
+    return d * (ls * sumi);
+}

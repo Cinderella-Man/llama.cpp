@@ -447,6 +447,49 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
     }
 }
 
+// N2P/N3P code positions (block_n2p, block_n3p in ggml-common.h): the 2-bit code of weight j of a super-block in qs, the
+// third bit of an N3P code in qh.
+static __device__ __forceinline__ int n2p_code(const uint8_t * qs, const int j) {
+    const int c = j & 15, h = c >> 2;
+    const int p = 16*(h >> 1) + 4*(c & 3) + 2*(h & 1);
+    return (qs[4*(j >> 4) + (p >> 3)] >> (p & 7)) & 3;
+}
+
+static __device__ __forceinline__ int n3p_hbit(const uint8_t * qh, const int j) {
+    const int c = j & 31, g = c >> 2;
+    const int p = 16*(g >> 2) + 4*(c & 3) + (g & 3);
+    return (qh[4*(j >> 5) + (p >> 3)] >> (p & 7)) & 1;
+}
+
+// 32 threads per super-block, 8 weights each (one N2P sub-block, a quarter of an N3P sub-block)
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_n2p(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    const block_n2p * x = (const block_n2p *) vx + ibs;
+
+    const int ib = tid;
+    const float d = (float)x->d * (((x->scales[ib/2] >> 4*(ib%2)) & 0xf) - 8);
+    const int8_t * L = kvalues_n2p + 4*((x->extra[ib/8] >> (ib%8)) & 1);
+    dst_t * y = yy + 8*ib;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = ggml_cuda_cast<dst_t>(d * L[n2p_code(x->qs, 8*ib + j)]);
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_n3p(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    const block_n3p * x = (const block_n3p *) vx + ibs;
+
+    const int ib = tid/4;
+    const int ls = (((x->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x->scales_h >> ib) & 1) << 4)) - 16;
+    const float d = (float)x->d * ls;
+    const int8_t * L = kvalues_n3p + 8*((x->extra >> ib) & 1);
+    dst_t * y = yy + 8*tid;
+    for (int j = 0; j < 8; ++j) {
+        const int jj = 8*tid + j;
+        y[j] = ggml_cuda_cast<dst_t>(d * L[n2p_code(x->qs, jj) | (n3p_hbit(x->qh, jj) << 2)]);
+    }
+}
+
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
 
