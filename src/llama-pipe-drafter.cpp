@@ -486,48 +486,80 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
             LLAMA_LOG_ERROR("%s: cannot open %s\n", __func__, params.path);
             return false;
         }
+        // the file is read and uploaded in pieces of at most CHUNK bytes, so that loading takes a few MB of host memory
+        // (the rig's host has 4 GB, most of it taken by the target's load)
+        constexpr size_t CHUNK = 8u << 20;
         const size_t data_off = gguf_get_data_offset(g);
-        std::vector<uint8_t> tmp;
-        for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+        std::vector<uint8_t> tmp, out;
+        std::vector<float> rows;
+        auto read_at = [&](size_t off, size_t n) {
+            tmp.resize(n);
+            return fseek(f, (long) off, SEEK_SET) == 0 && fread(tmp.data(), 1, n, f) == n;
+        };
+        bool ok = true;
+        for (int64_t i = 0; ok && i < gguf_get_n_tensors(g); i++) {
             const char * name = gguf_get_tensor_name(g, i);
             ggml_tensor * t = ggml_get_tensor(ctx_w, name);
             const size_t nb = gguf_get_tensor_size(g, i);
-            tmp.resize(nb);
-            if (fseek(f, (long) (data_off + gguf_get_tensor_offset(g, i)), SEEK_SET) != 0 || fread(tmp.data(), 1, nb, f) != nb) {
-                fclose(f);
-                LLAMA_LOG_ERROR("%s: short read of %s\n", __func__, name);
-                return false;
-            }
-            if (strcmp(name, "sd.vocab") == 0) {
-                vocab.assign((const int32_t *) tmp.data(), (const int32_t *) tmp.data() + ggml_nelements(t));
-            }
-            if (head_converted && (t == th || t == tb)) {
-                // rows 0..n_short-1 and the other class (the file's last row)
-                std::vector<float> rows((size_t) (n_short + 1)*t->ne[0]);
-                const ggml_type ft = t == th ? head_file_type : GGML_TYPE_F32;
-                const size_t rs = ggml_row_size(ft, t->ne[0]);
-                for (int32_t r = 0; r <= n_short; r++) {
-                    const int32_t src = r < n_short ? r : n_vocab_draft;
-                    if (t == th) {
-                        ggml_get_type_traits(ft)->to_float(tmp.data() + (size_t) src*rs, rows.data() + (size_t) r*t->ne[0], t->ne[0]);
-                    } else {
-                        rows[r] = ((const float *) tmp.data())[src];
+            const size_t off = data_off + gguf_get_tensor_offset(g, i);
+            if (head_converted && t == th) {
+                // rows 0..n_short-1, then the other class (the file's last row), converted a piece of rows at a time
+                const size_t rs_in  = ggml_row_size(head_file_type, n_embd);
+                const size_t rs_out = ggml_row_size(head_type, n_embd);
+                const int64_t per = std::max<int64_t>(1, (int64_t) (CHUNK/rs_in));
+                auto convert = [&](int64_t src, int64_t n, int64_t dst) {
+                    if (!read_at(off + (size_t) src*rs_in, (size_t) n*rs_in)) {
+                        return false;
                     }
+                    rows.resize((size_t) n*n_embd);
+                    out.resize((size_t) n*rs_out);
+                    for (int64_t r = 0; r < n; r++) {
+                        ggml_get_type_traits(head_file_type)->to_float(tmp.data() + (size_t) r*rs_in, rows.data() + (size_t) r*n_embd, n_embd);
+                    }
+                    if (head_type == GGML_TYPE_F16) {
+                        ggml_fp32_to_fp16_row(rows.data(), (ggml_fp16_t *) out.data(), (int64_t) rows.size());
+                    } else {
+                        ggml_quantize_chunk(head_type, rows.data(), out.data(), 0, n, n_embd, nullptr);
+                    }
+                    ggml_backend_tensor_set(t, out.data(), (size_t) dst*rs_out, out.size());
+                    return true;
+                };
+                for (int64_t r0 = 0; ok && r0 < n_short; r0 += per) {
+                    ok = convert(r0, std::min<int64_t>(per, n_short - r0), r0);
                 }
-                std::vector<uint8_t> out(ggml_nbytes(t));
-                if (t == tb) {
-                    memcpy(out.data(), rows.data(), out.size());
-                } else if (head_type == GGML_TYPE_F16) {
-                    ggml_fp32_to_fp16_row(rows.data(), (ggml_fp16_t *) out.data(), (int64_t) rows.size());
-                } else {
-                    ggml_quantize_chunk(head_type, rows.data(), out.data(), 0, n_short + 1, t->ne[0], nullptr);
-                }
-                ggml_backend_tensor_set(t, out.data(), 0, out.size());
+                ok = ok && convert(n_vocab_draft, 1, n_short);
                 continue;
             }
-            ggml_backend_tensor_set(t, tmp.data(), 0, nb);
+            if (head_converted && t == tb) {
+                ok = read_at(off, nb);
+                if (ok) {
+                    std::vector<float> b(n_short + 1);
+                    for (int32_t r = 0; r <= n_short; r++) {
+                        b[r] = ((const float *) tmp.data())[r < n_short ? r : n_vocab_draft];
+                    }
+                    ggml_backend_tensor_set(t, b.data(), 0, b.size()*sizeof(float));
+                }
+                continue;
+            }
+            for (size_t o = 0; ok && o < nb; o += CHUNK) {
+                const size_t n = std::min(CHUNK, nb - o);
+                ok = read_at(off + o, n);
+                if (ok && strcmp(name, "sd.vocab") == 0) {
+                    vocab.insert(vocab.end(), (const int32_t *) tmp.data(), (const int32_t *) (tmp.data() + n));
+                }
+                if (ok) {
+                    ggml_backend_tensor_set(t, tmp.data(), o, n);
+                }
+            }
+            if (!ok) {
+                LLAMA_LOG_ERROR("%s: short read of %s\n", __func__, name);
+            }
         }
         fclose(f);
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: cannot read the weights of %s\n", __func__, params.path);
+            return false;
+        }
     }
     auto get = [&](const std::string & name, bool required = true) {
         ggml_tensor * t = ggml_get_tensor(ctx_w, name.c_str());
