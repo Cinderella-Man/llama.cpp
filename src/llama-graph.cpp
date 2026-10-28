@@ -60,6 +60,18 @@ static uint32_t llama_kq_mask_dev_min_tokens() {
     return n_min;
 }
 
+// LLAMA_GPU_KQ_MASK_MAX=<m>: only micro-batches of at most m tokens build their masks on the device (default: no
+// limit). LLAMA_GPU_KQ_MASK=1 LLAMA_GPU_KQ_MASK_MAX=16 keeps it for decode steps and short verify batches, where it
+// saves the per-step mask copy (Flint at 64k context: 16.0 against 17.9 tok/s), and leaves prompt micro-batches on the
+// host mask. After a host-mask step the device copies are stale, and the next device-mask step uploads all cells.
+static uint32_t llama_kq_mask_dev_max_tokens() {
+    static const uint32_t n_max = [] {
+        const char * env = getenv("LLAMA_GPU_KQ_MASK_MAX");
+        return env && atoi(env) > 0 ? (uint32_t) atoi(env) : UINT32_MAX;
+    }();
+    return n_max;
+}
+
 // LLAMA_GPU_KQ_MASK_CHECK=1: every device-mask step compares, per cache and device copy, the mask its inputs and the
 // copy expand to with the host mask (llama_kv_cache::check_kq_cells); llama_context synchronizes before the inputs
 static bool llama_kq_mask_check_enabled() {
@@ -74,7 +86,8 @@ static bool llama_kq_mask_check_enabled() {
 // everything else
 static bool llama_kq_mask_on_device(const llama_hparams & hparams, const llama_cparams & cparams, const llama_ubatch & ubatch) {
     const uint32_t n_min = llama_kq_mask_dev_min_tokens();
-    return n_min > 0 && ubatch.n_tokens >= n_min && cparams.causal_attn && !hparams.use_alibi && !ubatch.is_pos_2d();
+    return n_min > 0 && ubatch.n_tokens >= n_min && ubatch.n_tokens <= llama_kq_mask_dev_max_tokens() &&
+           cparams.causal_attn && !hparams.use_alibi && !ubatch.is_pos_2d();
 }
 
 void llm_graph_kq_dev::build_inputs(ggml_context * ctx, const llama_ubatch & ubatch, const llama_cparams & cparams,
