@@ -652,6 +652,207 @@ static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvq
     return acc;
 }
 
+// Several tokens (mul_mat_vec_q_pascal_mt): one 32-weight sub-block of a lane's chunk is decoded once into signed int8
+// words in activation order, with its integer scales, then multiplied by each token's activations. The integer sums and
+// the FP32 operations on them are those of mmvqp_dot, so every token's result is bit-identical to the one-token
+// kernel's. The grid types' signs go into the words: (g ^ m) + (m & 0x01010101) negates the bytes under the mask m
+// without carries, since every grid byte is at least 1, so a token costs one dp4a per 4 weights instead of two. Q5_0's
+// fifth bits are spread into one byte per weight in natural order, which the plain activations multiply (the one-token
+// kernel transposes the activations instead).
+template <ggml_type type> constexpr __host__ __device__ bool mmvqp_mt_type() {
+    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_N2P || type == GGML_TYPE_N3P ||
+        type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0;
+}
+
+struct mmvqp_sub {
+    int   q[8];  // weight bytes, activation word k = weights 4k..4k+3 (Q5_0: low nibbles in 0-3, high nibbles in place in 4-7)
+    int   h[8];  // Q5_0: the fifth bits, a 0/1 byte per weight
+    int   sc[4]; // integer scales: N2P one per 8 weights, IQ2_S one per 16, IQ3_XXS and N3P one per 32
+    float d;     // Q8_0, Q5_0: the block's scale
+};
+
+// 4 bits -> 4 bytes of 0 or 1 (bit j -> byte j)
+static __device__ __forceinline__ uint32_t mmvqp_bit_bytes(const uint32_t s4) {
+    return (s4 * 0x00204081u) & 0x01010101u;
+}
+
+// grid bytes g with the negative ones (byte mask m) negated
+static __device__ __forceinline__ int mmvqp_signed_grid(const uint32_t g, const uint32_t m) {
+    return (int) ((g ^ m) + (m & 0x01010101u));
+}
+
+// Sub-block ib of weight block b of a lane's chunk (raw words w, as mmvqp_dot reads them).
+template <ggml_type type>
+static __device__ __forceinline__ void mmvqp_sub_decode(const uint32_t * w, const int b, const int ib, const uint32_t * tab,
+                                                        mmvqp_sub & s) {
+    constexpr int BS = mmvqp_traits<type>::bs;
+    const int o = b * BS;
+    if constexpr (type == GGML_TYPE_IQ2_S) {
+        const uint2 * grid  = (const uint2 *) tab;
+        const uint2 * masks = (const uint2 *) (tab + mmvqp_tab_grid_words<GGML_TYPE_IQ2_S>());
+        const uint32_t qs = mmvqp_word_at(w, 2 + 4*ib);
+        const uint32_t sg = mmvqp_word_at(w, 34 + 4*ib);
+        const uint32_t qh = (mmvqp_word_at(w, 66 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+        const uint32_t sc = (mmvqp_word_at(w, 74 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = grid[((qs >> (8*l)) & 0xff) | (((qh >> (2*l)) & 3) << 8)];
+            const uint2 m = mmvqp_iq_masks<GGML_TYPE_IQ2_S>(masks, (sg >> (8*l)) & 0xff);
+            s.q[2*l + 0] = mmvqp_signed_grid(g.x, m.x);
+            s.q[2*l + 1] = mmvqp_signed_grid(g.y, m.y);
+        }
+        s.sc[0] = 2*(int) (sc & 0xF) + 1;
+        s.sc[1] = 2*(int) (sc >> 4) + 1;
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        const uint2 * masks = (const uint2 *) (tab + mmvqp_tab_grid_words<GGML_TYPE_IQ3_XXS>());
+        const uint32_t q0  = mmvqp_word_at(w, 2 + 8*ib);
+        const uint32_t q1  = mmvqp_word_at(w, 6 + 8*ib);
+        const uint32_t aux = mmvqp_word_at(w, 66 + 4*ib);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t q  = l < 2 ? q0 : q1;
+            const uint32_t g0 = tab[(q >> (16*(l & 1)))     & 0xff];
+            const uint32_t g1 = tab[(q >> (16*(l & 1) + 8)) & 0xff];
+            const uint2    m  = mmvqp_iq_masks<GGML_TYPE_IQ3_XXS>(masks, (aux >> (7*l)) & 0x7f);
+            s.q[2*l + 0] = mmvqp_signed_grid(g0, m.x);
+            s.q[2*l + 1] = mmvqp_signed_grid(g1, m.y);
+        }
+        s.sc[0] = 2*(int) (aux >> 28) + 1;
+    } else if constexpr (type == GGML_TYPE_N2P) {
+        const uint32_t ex = w[20];
+        const uint32_t sc = w[16 + ib/2] >> 16*(ib%2);
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const uint32_t q = w[2*ib + k];
+#pragma unroll
+            for (int sb = 0; sb < 2; ++sb) {
+                const uint32_t T = (ex >> (4*ib + 2*k + sb)) & 1 ? N2P_TAB1 : N2P_TAB0;
+                s.q[4*k + 2*sb + 0] = (int) __byte_perm(T, T, q >> (16*sb));
+                s.q[4*k + 2*sb + 1] = (int) __byte_perm(T, T, q >> (16*sb + 2));
+                s.sc[2*k + sb] = (int) ((sc >> 4*(2*k + sb)) & 0xF) - 8;
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_N3P) {
+        const uint32_t * wb = w + o/4;
+        const uint32_t w0 = wb[0];
+        const bool     sh = (w0 >> (16 + ib)) & 1;
+        const uint32_t ta = sh ? N3P_TAB1A : N3P_TAB0A;
+        const uint32_t tb = sh ? N3P_TAB1B : N3P_TAB0B;
+        const uint32_t hi = wb[18 + ib];
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const uint32_t lo  = wb[2 + 2*ib + g/4];
+            const int      t   = 16*((g%4)/2) + 2*(g%2);
+            const int      sf  = 16*(g/4) + g%4 - 2;
+            const uint32_t hs  = sf >= 0 ? hi >> sf : hi << -sf;
+            const uint32_t sel = ((lo >> t) & 0x3333) | (hs & 0xCCCC);
+            s.q[g] = (int) __byte_perm(ta, tb, sel);
+        }
+        s.sc[0] = (int) (((wb[1] >> 4*ib) & 0xF) | (((w0 >> (24 + ib)) & 1) << 4)) - 16;
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        s.d = mmvqp_h2f_lo(mmvqp_u16_at(w, o));
+        const uint32_t qh = mmvqp_word_at(w, o + 2);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t q = mmvqp_word_at(w, o + 6 + 4*k);
+            s.q[k]     = (int) (q & 0x0F0F0F0F);
+            s.q[4 + k] = (int) (q & 0xF0F0F0F0);
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            s.h[k] = (int) mmvqp_bit_bytes((qh >> (4*k)) & 0xF);
+        }
+    } else { // GGML_TYPE_Q8_0
+        s.d = mmvqp_h2f_lo(mmvqp_u16_at(w, o));
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            s.q[k] = (int) mmvqp_word_at(w, o + 2 + 4*k);
+        }
+    }
+    GGML_UNUSED_VARS(tab, o, ib);
+}
+
+// The integer sum of a decoded sub-block with one token's activation words u, as mmvqp_dot forms it.
+template <ggml_type type>
+static __device__ __forceinline__ int mmvqp_sub_isum(const mmvqp_sub & s, const int * u) {
+    if constexpr (type == GGML_TYPE_IQ2_S) {
+        int p0 = 0;
+        int p1 = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            p0 = ggml_cuda_dp4a(s.q[k],     u[k],     p0);
+            p1 = ggml_cuda_dp4a(s.q[4 + k], u[4 + k], p1);
+        }
+        return s.sc[0] * p0 + s.sc[1] * p1;
+    } else if constexpr (type == GGML_TYPE_N2P) {
+        int isum = 0;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            int sumb = ggml_cuda_dp4a(s.q[2*g], u[2*g], 0);
+            sumb     = ggml_cuda_dp4a(s.q[2*g + 1], u[2*g + 1], sumb);
+            isum += sumb * s.sc[g];
+        }
+        return isum;
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        int lo = 0;
+        int hi = 0;
+        int hs = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            lo = ggml_cuda_dp4a(s.q[k], u[k], lo);
+            hi = mmvqp_dp4a_us((uint32_t) s.q[4 + k], u[4 + k], hi);
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            hs = ggml_cuda_dp4a(s.h[k], u[k], hs);
+        }
+        return (lo << 4) + hi + (hs << 8);
+    } else { // IQ3_XXS, N3P: one scale per sub-block; Q8_0: none
+        int isum = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            isum = ggml_cuda_dp4a(s.q[k], u[k], isum);
+        }
+        if constexpr (type == GGML_TYPE_Q8_0) {
+            return isum;
+        } else {
+            return isum * s.sc[0];
+        }
+    }
+}
+
+// Adds a token's sub-block sum: the super-block types into their super-block sum sumf (finished by mmvqp_sub_finish),
+// Q8_0 and Q5_0 into acc. ad, as: the token's activation scale and (Q5_0) offset term, as mmvqp_load_act makes them.
+template <ggml_type type>
+static __device__ __forceinline__ void mmvqp_sub_add(const mmvqp_sub & s, const int isum, const float ad, const float as,
+                                                     float & sumf, float & acc) {
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        acc = fmaf((float) isum, s.d * ad, acc);
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        acc = fmaf(s.d, fmaf((float) isum, ad, as), acc);
+    } else {
+        sumf = fmaf(ad, (float) isum, sumf);
+    }
+    GGML_UNUSED(as);
+}
+
+// A super-block's sum times its scale, added to acc (Q8_0 and Q5_0: nothing to do).
+template <ggml_type type>
+static __device__ __forceinline__ float mmvqp_sub_finish(const uint32_t * w, const int b, const float sumf, const float acc) {
+    if constexpr (type == GGML_TYPE_IQ2_S) {
+        return fmaf(0.125f * mmvqp_h2f_lo(w[0]), sumf, acc);
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        return fmaf(0.25f * mmvqp_h2f_lo(w[0]), sumf, acc);
+    } else if constexpr (type == GGML_TYPE_N2P) {
+        return fmaf(mmvqp_h2f_lo(w[21]), sumf, acc);
+    } else if constexpr (type == GGML_TYPE_N3P) {
+        return fmaf(mmvqp_h2f_lo(w[b * mmvqp_traits<type>::bs / 4]), sumf, acc);
+    } else {
+        GGML_UNUSED_VARS(w, b, sumf);
+        return acc;
+    }
+}
+
 // The launch shape per type: rows per lane group (R), blocks per lane (C), staged or direct loads. A row's summation
 // order depends only on C (blocks per lane) and the row width, which set the lanes per row; R and staging don't change
 // any row's sum.

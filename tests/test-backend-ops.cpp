@@ -11923,6 +11923,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // 2 to 4 tokens whose experts overlap, as an MTP verify step's consecutive tokens do (Pascal kernels: one weight read
+    // and one decode serve every token of an expert): 8 of 8 experts (every expert serves all tokens), 8 of 10 (most
+    // serve several), for the down product, a broadcast gate/up input and the fused gate/up; dense products at Ornith's
+    // widths, K = 8192 among them (the staged activations of 4 tokens then come in several tiles). Ornith's types and the
+    // dense Q8_0 and Q5_0 of its files.
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0 }) {
+        for (int64_t n : { 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 8, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 10, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 10, 8, true, 1024, n, 3072));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 10, 8, true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 8, 8, true));
+            if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 8192, { 1, 1 }, { 1, 1 }));
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4097, n, 1024, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+
     // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
     // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
     // leave partial tiles. One case at Flint's own expert shapes.
@@ -13086,16 +13106,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Ornith-1.5-122B's products (hidden 3072, experts of width 1024, 8 used of a 64-expert tensor: 25-50 M weights per
     // expert call, far beyond a P106's 1.5 MB L2; a dense 3072 -> 8192) at 1, 2 and 4 tokens, the shapes of the IQ
     // kernels' rig runs (fork branch pascal-p106-v3-iqmmvq): N2P and N3P against the formats of today's files (IQ2_S,
-    // IQ3_XXS, Q2_K, Q3_K) and the fast formats (Q4_0, Q8_0)
+    // IQ3_XXS, Q2_K, Q3_K) and the fast formats (Q4_0, Q8_0). 3 tokens are the verify step of two MTP drafts; Q5_0 holds
+    // the dense tensors and the output layer of the N2P/N3P file, so its dense shapes come with a K = 8192 product
+    // (ssm_out) and the 248,320-row output layer.
     for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-                            GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
-        for (int64_t n : { 1, 2, 4 }) {
+                            GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0 }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, n, 3072, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 1024, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, true,  1024, n, 3072));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
+            if (type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 8192, { 1, 1 }, { 1, 1 }));
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 248320, n, 3072, { 1, 1 }, { 1, 1 }));
+            }
         }
     }
 
