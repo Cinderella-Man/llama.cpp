@@ -1239,6 +1239,19 @@ static bool server_text_reuse_enabled() {
     return enabled;
 }
 
+// LLAMA_SERVER_TAIL_CKPT_MIN=<n>: take the end-of-prompt checkpoint only when the prompt ends at least n tokens past
+// the slot's newest checkpoint; checkpoints at user messages are unchanged. Each tail checkpoint waits for the pipeline
+// to drain, copies the sliding-window ring to the host (Flint, nine P106 cards: 52.5 MiB, ~0.3 s) and processes the
+// prompt's last 4 tokens as a micro-batch of their own. With LLAMA_SERVER_TEXT_REUSE a reply sent back unchanged needs
+// no checkpoint; one that comes back changed re-reads up to n tokens more. 0 (the default): every prompt.
+static uint32_t server_tail_ckpt_min() {
+    static const uint32_t n_min = [] {
+        const char * env = getenv("LLAMA_SERVER_TAIL_CKPT_MIN");
+        return env ? (uint32_t) std::max(0, atoi(env)) : 0u;
+    }();
+    return n_min;
+}
+
 // After the first token that differs (n), the longest stretch over which the cached tokens and the prompt spell the
 // same bytes, cut at the last byte offset where a token ends in both: the prompt's tokens up to there are replaced by
 // the cached ones, so the prompt's text is unchanged. Returns the number of cached tokens taken past n.
@@ -5143,6 +5156,12 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // the end-of-prompt checkpoint and the separate micro-batch of the last tokens it needs, unless
+                    // LLAMA_SERVER_TAIL_CKPT_MIN spaces them (server_tail_ckpt_min)
+                    const bool do_tail_checkpoint = do_checkpoint && (server_tail_ckpt_min() == 0 ||
+                            slot.prompt.checkpoints.empty() ||
+                            slot.task->n_tokens() >= slot.prompt.checkpoints.back().n_tokens + server_tail_ckpt_min());
+
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
                         if (!add_prompt_mixed(slot)) {
@@ -5272,7 +5291,7 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         // a sliding-window model needs only the second, taken with its whole ring of n_swa + n_ubatch cells:
                         // it serves every restore the first would (ckpt_trim); --checkpoint-tail2 takes both, as stock
-                        if (do_checkpoint) {
+                        if (do_tail_checkpoint) {
                             const bool tail2 = !ckpt_trim || params_base.checkpoint_tail2;
                             const int checkpoint_offsets[] = {tail2 ? 4 + n_ubatch : 4, 4};
 
@@ -5303,6 +5322,11 @@ private:
                     // one tail checkpoint with the whole sliding-window ring instead of two (--checkpoint-tail2): it serves
                     // the restores of both
                     const bool tail1 = ckpt_trim && !params_base.checkpoint_tail2;
+
+                    // spaced end-of-prompt checkpoints (LLAMA_SERVER_TAIL_CKPT_MIN): none this time; user messages keep theirs
+                    if (!do_tail_checkpoint && near_prompt_end && !is_user_start) {
+                        do_checkpoint = false;
+                    }
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
