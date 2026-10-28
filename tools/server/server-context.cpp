@@ -1292,8 +1292,11 @@ private:
 
     int32_t pipe_next = 0; // the next pipe slot to try (--pipe-depth)
 
-    // --pipe-guess staircase: the drafter is loaded, and the slot whose sequence it follows (-1: none)
+    // --pipe-guess staircase: the drafter is loaded, and the slot whose sequence it follows (-1: none). With
+    // LLAMA_PIPE_DRAFT_TAPS_ONLY=1 it follows the sequence (the hidden-state taps of every token, the prompt's final
+    // states) but never guesses, and the guesses are cont's: a measurement of what following costs
     bool         pipe_draft_on  = false;
+    bool         pipe_draft_taps_only = false;
     llama_seq_id pipe_draft_seq = -1;
 
     // the continuation store of --pipe-store, shared by the slots' guessers
@@ -1802,6 +1805,12 @@ private:
                     params_base.pipe_guess = "cont";
                 } else {
                     pipe_draft_on = true;
+                    const char * env = getenv("LLAMA_PIPE_DRAFT_TAPS_ONLY");
+                    pipe_draft_taps_only = env && atoi(env) != 0;
+                    if (pipe_draft_taps_only) {
+                        SRV_WRN("%s", "LLAMA_PIPE_DRAFT_TAPS_ONLY: the drafter follows the sequence and never guesses; "
+                                "guessing with cont\n");
+                    }
                 }
             }
             if (!params_base.sampling.backend_sampling) {
@@ -1831,7 +1840,7 @@ private:
                     // staircase: the copy lookup, the request's continuations of 2-token or longer contexts (on agent
                     // text they are right more often than the drafter), the store if there is one, then the drafter
                     // instead of the continuations of a 1-token context
-                    const bool stair = params_base.pipe_guess == "staircase";
+                    const bool stair = params_base.pipe_guess == "staircase" && !pipe_draft_taps_only;
                     slot.pipe_guesser.kind = params_base.pipe_guess == "none" ? common_pipe_guesser::NONE :
                                              params_base.pipe_guess == "copy" ? common_pipe_guesser::COPY :
                                                                                 common_pipe_guesser::CONT;
@@ -3954,7 +3963,7 @@ private:
 
     // whether the staircase drafter guesses for this slot
     bool pipe_drafts(const server_slot & slot) const {
-        return pipe_draft_on && pipe_draft_seq == slot.id;
+        return pipe_draft_on && !pipe_draft_taps_only && pipe_draft_seq == slot.id;
     }
 
     // the guess of the copy lookup for the position after the slot's window, or -1
