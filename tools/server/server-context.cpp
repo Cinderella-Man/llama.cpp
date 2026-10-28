@@ -1225,6 +1225,73 @@ struct server_prefix_store {
     }
 };
 
+// LLAMA_SERVER_TEXT_REUSE=1: keep the cached ids where a new prompt's text continues the cached tokens' text.
+// A model sampling at temperature > 0 sometimes writes a word in other ids than its tokenizer would (Flint: "file" +
+// "type" where the tokenizer writes "filetype"; 6 % of agent turns, 45 % of those over 4k tokens). The client sends
+// the reply back as text, the template renders it again and the tokenizer splits it its own way, so the token match
+// with the cache stops inside the reply; with sliding-window layers the server then restores the checkpoint at the
+// previous prompt's end and processes the whole reply again. Off by default.
+static bool server_text_reuse_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_SERVER_TEXT_REUSE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// After the first token that differs (n), the longest stretch over which the cached tokens and the prompt spell the
+// same bytes, cut at the last byte offset where a token ends in both: the prompt's tokens up to there are replaced by
+// the cached ones, so the prompt's text is unchanged. Returns the number of cached tokens taken past n.
+static size_t server_reuse_cached_ids(const llama_vocab * vocab, const llama_tokens & cache, llama_tokens & prompt, size_t & n) {
+    n = 0;
+    while (n < cache.size() && n < prompt.size() && cache[n] == prompt[n]) {
+        n++;
+    }
+    if (n == cache.size() || n == prompt.size()) {
+        return 0;
+    }
+
+    // the bytes after n and the offsets at which each token ends; the prompt only as far as the cache reaches
+    std::string tc, tp;
+    std::vector<size_t> ec, ep;
+    for (size_t i = n; i < cache.size(); i++) {
+        tc += common_token_to_piece(vocab, cache[i], true);
+        ec.push_back(tc.size());
+    }
+    for (size_t i = n; i < prompt.size() && tp.size() < tc.size(); i++) {
+        tp += common_token_to_piece(vocab, prompt[i], true);
+        ep.push_back(tp.size());
+    }
+    size_t n_same = 0;
+    while (n_same < tc.size() && n_same < tp.size() && tc[n_same] == tp[n_same]) {
+        n_same++;
+    }
+
+    size_t kc = 0, kp = 0;
+    for (size_t ic = 0, ip = 0; ic < ec.size() && ip < ep.size(); ) {
+        if (std::min(ec[ic], ep[ip]) > n_same) {
+            break;
+        }
+        if (ec[ic] == ep[ip]) {
+            kc = ++ic;
+            kp = ++ip;
+        } else if (ec[ic] < ep[ip]) {
+            ic++;
+        } else {
+            ip++;
+        }
+    }
+    if (kc == 0) {
+        return 0;
+    }
+
+    llama_tokens out(prompt.begin(), prompt.begin() + n);
+    out.insert(out.end(), cache.begin() + n, cache.begin() + n + kc);
+    out.insert(out.end(), prompt.begin() + n + kp, prompt.end());
+    prompt = std::move(out);
+    return kc;
+}
+
 //
 // server_context_impl (private implementation)
 //
@@ -2333,6 +2400,20 @@ private:
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
+        }
+
+        // LLAMA_SERVER_TEXT_REUSE=1: the cached ids wherever the prompt spells the same text (server_reuse_cached_ids)
+        if (server_text_reuse_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
+            !task.is_stateless() && task.n_tokens_shared == 0 && !lora_all_alora(slot.lora) &&
+            !task.tokens.has_mtmd && !slot.prompt.tokens.has_mtmd) {
+            llama_tokens ids = task.tokens.get_tokens();
+            size_t n_match = 0;
+            const size_t n_kept = server_reuse_cached_ids(vocab, slot.prompt.tokens.get_tokens(), ids, n_match);
+            if (n_kept > 0) {
+                SLT_INF(slot, "prompt ids differ from the cache at %zu, same text: %zu more cached tokens kept (%zu -> %zu prompt tokens)\n",
+                        n_match, n_kept, task.tokens.size(), ids.size());
+                task.tokens = server_tokens(ids, false);
+            }
         }
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
