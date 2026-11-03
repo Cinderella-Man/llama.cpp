@@ -216,7 +216,11 @@ bool llama_backend_dev_has_feature(struct ggml_backend_device * dev, const char 
     if (dev == nullptr) {
         return false;
     }
+    // a device without a registry (the meta device of a tensor split) reports no features
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
     auto * get_features_fn = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
     if (get_features_fn == nullptr) {
         return false;

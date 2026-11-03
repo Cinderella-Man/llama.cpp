@@ -2363,8 +2363,10 @@ int32_t llama_context::pipe_submit_impl(int32_t i_slot, const llama_token * toke
         }
         slot.ev_out   = ggml_backend_event_new(dev_res);
         slot.ev_dev   = dev_res;
-        slot.ev_query = (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(dev_res), "ggml_backend_event_query");
+        // a device without a registry (the meta device of a tensor split) has no event query
+        ggml_backend_reg_t reg_res = ggml_backend_dev_backend_reg(dev_res);
+        slot.ev_query = reg_res == nullptr ? nullptr : (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(
+                reg_res, "ggml_backend_event_query");
     }
 
     if (slot.ev_out) {
