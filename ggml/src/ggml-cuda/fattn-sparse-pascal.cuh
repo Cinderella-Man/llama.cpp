@@ -14,9 +14,11 @@
 // kv_rows. Anything else stays with the stock kernels, as does any GPU with Turing tensor cores in mode 1.
 //
 // GGML_CUDA_FATTN_SPARSE_PASCAL: 0 off (default), 1 on GPUs without Turing tensor cores (compute capability below 7.5, or
-// a build without Turing code) once the cache holds at least _MIN_RATIO x n_kv_max cells, 2 any NVIDIA GPU at any cache
-// size (for testing).
-// GGML_CUDA_FATTN_SPARSE_PASCAL_MIN_RATIO: cells per n_kv_max from which mode 1 takes a call (default 1.5).
+// a build without Turing code) once the cache holds at least _MIN_RATIO x n_kv_max cells per query token (each token
+// reads its own list, the dense kernels read the cache once for all of them), 2 any NVIDIA GPU at any cache size (for
+// testing).
+// GGML_CUDA_FATTN_SPARSE_PASCAL_MIN_RATIO: cells per n_kv_max and query token from which mode 1 takes a call (default
+// 1.5).
 // GGML_CUDA_FATTN_SPARSE_PASCAL_NQ: most query tokens per sequence (default 8).
 // GGML_CUDA_FATTN_SPARSE_PASCAL_SPLITS: splits per list (default: about 4 blocks per SM, at least 64 cells a split).
 // GGML_CUDA_FATTN_SPARSE_PASCAL_NSM: SM count the splits assume (default: the device's; 5 emulates a P106-090).

@@ -104,7 +104,8 @@ bool ggml_cuda_flash_attn_ext_sparse_pascal(ggml_backend_cuda_context & ctx, ggm
             mask->nb[3] % sizeof(half) != 0) {
         return false;
     }
-    if (env.mode == 1 && (double) n_kv < env.min_ratio*n_kv_max) {
+    // every query token reads its own list; the dense kernels read the cache once for all of them
+    if (env.mode == 1 && (double) n_kv < env.min_ratio*n_kv_max*n_q) {
         return false;
     }
     if (sinks && (sinks->type != GGML_TYPE_F32 || ggml_nelements(sinks) != n_head)) {
