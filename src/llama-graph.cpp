@@ -1640,6 +1640,19 @@ void llm_graph_result::reset() {
         if (!buffer) {
             throw std::bad_alloc();
         }
+        // LLAMA_GRAPH_META_CALLOC=0 writes the whole buffer once, as the std::vector before #31274 did, so that every
+        // page is resident (for host-memory A/B runs on one binary); 1 (default, as #31274) leaves unused pages alone
+        static const bool meta_calloc = [] {
+            const char * env = getenv("LLAMA_GRAPH_META_CALLOC");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (!meta_calloc) {
+            // one write per page through a volatile pointer: a memset of calloc's memory may be optimized away
+            volatile uint8_t * p = buffer;
+            for (size_t i = 0; i < meta_size; i += 4096) {
+                p[i] = 0;
+            }
+        }
         buf_compute_meta.reset(buffer);
         buf_compute_meta_size = meta_size;
     }

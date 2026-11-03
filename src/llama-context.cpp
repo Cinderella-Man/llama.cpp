@@ -442,6 +442,16 @@ llama_context::llama_context(
     {
         const char * env = getenv("LLAMA_SCHED_PER_SIZE"); // wip [TAG_SCHED_PER_SIZE]
         sched_per_size = env && atoi(env) != 0;
+
+        const char * env_graph = getenv("LLAMA_GRAPH_PER_SIZE");
+        graph_per_size = env_graph ? atoi(env_graph) != 0 : true;
+
+        if (sched_per_size && !graph_per_size) {
+            LLAMA_LOG_WARN("%s: LLAMA_SCHED_PER_SIZE=1 needs per-size graphs, ignored with LLAMA_GRAPH_PER_SIZE=0\n", __func__);
+            sched_per_size = false;
+        }
+        LLAMA_LOG_INFO("%s: graphs per batch size up to 8 tokens: %s, schedulers per size: %s\n", __func__,
+                graph_per_size ? "on" : "off (LLAMA_GRAPH_PER_SIZE=0)", sched_per_size ? "on (LLAMA_SCHED_PER_SIZE=1)" : "off");
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1898,6 +1908,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_set_copy_callback(ss->sched.get(), sched_copy_experts, this);
             ggml_backend_sched_set_realloc_callback(ss->sched.get(), sched_graph_realloc, this);
             ggml_backend_sched_set_input_upload(ss->sched.get(), plain_upload);
+            LLAMA_LOG_INFO("%s: scheduler for %u-token batches (%s outputs), %zu per-size schedulers\n", __func__,
+                    ubatch.n_tokens, n_outputs > 0 ? "with" : "without", sched_small.size());
         }
     }
     sched_active = ss ? ss->sched.get() : nullptr;
@@ -3617,7 +3629,7 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 uint32_t llama_context::gf_res_key(uint32_t n_tokens) const {
     // batches of up to 8 tokens (decode, speculative verify) are keyed by their size too
-    return (n_outputs > 0 ? 1u : 0u) | ((n_tokens <= 8 ? n_tokens : 0u) << 1);
+    return (n_outputs > 0 ? 1u : 0u) | ((graph_per_size && n_tokens <= 8 ? n_tokens : 0u) << 1);
 }
 
 void llama_context::gf_res_invalidate() {
@@ -5229,6 +5241,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            // the per-size schedulers (LLAMA_SCHED_PER_SIZE=1) allocate compute buffers of their own
+            for (const auto & e : sched_small) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(e.sched.get(), backend);
+            }
         }
     }
     return ret;

@@ -510,6 +510,11 @@ private:
     std::vector<sched_small_entry> sched_small;
     bool sched_per_size = false;
 
+    // env: LLAMA_GRAPH_PER_SIZE=0 keeps the two arenas of llama.cpp before #31156 (batches with and without outputs), so
+    // verify batches of every width share one arena and one CUDA graph key, as on -ladder2; 1 (default, as #31156) gives
+    // batches of up to 8 tokens one arena per token count. LLAMA_SCHED_PER_SIZE=1 needs it on.
+    bool graph_per_size = true;
+
     // scheduler of the graph of the last process_ubatch(), nullptr for the shared one
     ggml_backend_sched_t sched_active = nullptr;
 
