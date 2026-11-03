@@ -126,6 +126,7 @@ static __global__ void flash_attn_tile_pascal(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_rows_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -142,8 +143,9 @@ static __global__ void flash_attn_tile_pascal(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 #ifdef FLASH_ATTN_AVAILABLE
-    // max_bias and logit_softcap are 0 (checked on the host); the other unused sizes follow from Q, K and the mask
-    GGML_UNUSED_VARS(max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne13, ne31, ne32, nb32);
+    // max_bias and logit_softcap are 0 and there are no kv rows (checked on the host); the other unused sizes follow
+    // from Q, K and the mask
+    GGML_UNUSED_VARS(KV_rows_ptr, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne13, ne31, ne32, nb32);
 
     using S = ftp_shape<D>;
     using piece_K = ftp_piece<type_K>;
@@ -499,7 +501,7 @@ static __global__ void flash_attn_tile_pascal(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
