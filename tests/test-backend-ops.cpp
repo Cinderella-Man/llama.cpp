@@ -57,6 +57,21 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     }
 
     size_t nels = ggml_nelements(tensor);
+
+    // GGML_TEST_RAW_QUANT=1: quantized tensors get random bytes instead of quantized random floats, for perf runs on
+    // hosts whose CPU quantizes large IQ tensors slowly; the values are meaningless, so don't use it to compare results
+    static const bool raw_quant = getenv("GGML_TEST_RAW_QUANT") != nullptr;
+    if (raw_quant && ggml_is_quantized(tensor->type)) {
+        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        std::mt19937_64 gen(std::random_device{}());
+        for (size_t i = 0; i + sizeof(uint64_t) <= dataq.size(); i += sizeof(uint64_t)) {
+            const uint64_t r = gen();
+            memcpy(dataq.data() + i, &r, sizeof(r));
+        }
+        ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+        return;
+    }
+
     std::vector<float> data(nels);
     {
         // parallel initialization
@@ -12270,6 +12285,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                             true, false, false, { 1, 1 }));
     }
 
+    // the 2- and 3-bit grid types of Ornith-1.5-122B's files (Qwen3.5-122B shapes: hidden 3072, 8 of 256 experts of
+    // width 1024, a 1024-wide shared expert) on the Pascal matrix-vector kernels, 1 to 4 tokens: K = 3072 and 1024 stage
+    // with 8-byte loads, K = 512 (2 super-blocks per row) with 4-byte loads, K = 2048 with 16-byte loads; an odd row
+    // count; activations whose blocks sum past FP16's range
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 1024, 3072 }, { 3072, 1024 }, { 2048, 512 }, { 1024, 2048 }, { 4097, 3072 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, true,  1024, n, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 32, 8, true));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 3072, n, 1024, 32, 8));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 1024, n, 3072));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1024, 3072, false, 1, 1, false,
+                                                            false, true, false, { 1, 1 }));
+        for (int64_t n : { 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 1024));
+        }
+    }
+
     // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
     // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
     // leave partial tiles. One case at Flint's own expert shapes.
@@ -13541,6 +13581,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 128, 10, false, 2560, n, 640));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 640, n, 2560, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 2560, n, 640, { 1, 1 }, { 1, 1 }));
+    }
+
+    // the 2- and 3-bit grid types at Ornith-1.5-122B's shapes (hidden 3072, experts of width 1024, 8 used): the fused
+    // expert gate/up as llama.cpp runs it, the expert down projection, and an 8192-row dense product, at 1, 2 and 4
+    // tokens. Every call reads at least 8 MB of weights (8 experts of 64), beyond a P106's 1.5 MB L2, so repeated runs
+    // time memory reads rather than cache hits.
+    for (ggml_type type : { GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+        for (int64_t n : { 1, 2, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+        }
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
