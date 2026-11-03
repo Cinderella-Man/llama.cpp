@@ -257,7 +257,15 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, kq_cells_ctx.count(ctx) ? kq_cells_ctx.at(ctx) : nullptr });
+        // members by name: the rotations (init_rotation) sit between v_stream and kq_cells
+        kv_layer layer;
+        layer.il       = il;
+        layer.k        = k;
+        layer.v        = v;
+        layer.k_stream = std::move(k_stream);
+        layer.v_stream = std::move(v_stream);
+        layer.kq_cells = kq_cells_ctx.count(ctx) ? kq_cells_ctx.at(ctx) : nullptr;
+        layers.push_back(std::move(layer));
 
         // a copy is made with its device's first layer
         if (kq_cells_il.size() < kq_cells_devs.size()) {
