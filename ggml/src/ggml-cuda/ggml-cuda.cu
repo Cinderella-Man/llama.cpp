@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/mmvf-pascal.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-pascal.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -2245,6 +2246,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // BF16 weights of 1 to 4 tokens that the Pascal kernel (mmvf-pascal.cu) takes: compute 6.1 picks mul_mat_vec_f for
+    // them anyway, and GGML_CUDA_MMVF_PASCAL=2 sends them there on any GPU (for testing)
+    if (ggml_cuda_mmvf_pascal_supports(src0, src1, dst)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -7195,6 +7202,13 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         for (int id = 0; id < info.device_count; ++id) {
             if (ggml_cuda_mmvq_pascal_active(info.devices[id].cc)) {
                 features.push_back({ "MMVQ_PASCAL", "1"});
+                break;
+            }
+        }
+        // the Pascal BF16 matrix-vector kernels (mmvf-pascal.cu) run on some device
+        for (int id = 0; id < info.device_count; ++id) {
+            if (ggml_cuda_mmvf_pascal_active(info.devices[id].cc)) {
+                features.push_back({ "MMVF_PASCAL", "1"});
                 break;
             }
         }

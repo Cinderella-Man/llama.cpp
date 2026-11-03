@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmvf-pascal.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
 
@@ -635,6 +636,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
+
+    // BF16 weights, 1 to 4 tokens, on compute capability 6.1: the Pascal kernel (mmvf-pascal.cu)
+    if (!ids && ggml_cuda_mmvf_pascal(src0, src1, fusion, dst, ctx.stream())) {
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 

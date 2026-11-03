@@ -12166,6 +12166,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // BF16 products of 1 to 4 tokens at the shapes of Qwen3.8-Flash-Next's BF16 tensors (the hyper-connection
+    // projections 320 -> 10240, 10240 -> 320 and 10240 -> 4, the indexer's 2560 -> 512, the recurrent layers'
+    // 2560 -> 48), an odd row count, rows of 125 and 9 chunks of 8 weights, and a row width that is no multiple of 8
+    // (left to mul_mat_vec_f); these reach every lane-group size of the Pascal BF16 kernel (mmvf-pascal.cu;
+    // GGML_CUDA_MMVF_PASCAL=2 runs it on any GPU, GGML_CUDA_MMVF_PASCAL_NSM=5 with the P106-090's launch shapes)
+    for (int64_t n : { 1, 2, 3, 4 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                { 10240, 320 }, { 320, 10240 }, { 4, 10240 }, { 512, 2560 }, { 48, 2560 }, { 10241, 320 },
+                { 333, 1000 }, { 5, 72 }, { 64, 100 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+        // rows that are views of wider rows: 16-byte aligned (672 bytes apart) and not (648 bytes apart)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 256, n, 320, { 1, 1 }, { 1, 1 },
+                                                 { 0, 1, 2, 3 }, 336));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 256, n, 320, { 1, 1 }, { 1, 1 },
+                                                 { 0, 1, 2, 3 }, 324));
+    }
+    // one token with a fused bias (the Pascal kernel adds it), with a gate and with both (left to mul_mat_vec_f)
+    for (auto [bias, gate] : std::vector<std::pair<bool, bool>>{ { true, false }, { false, true }, { true, true } }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 10240, 320, false, 1, 1,
+                                                            false, bias, gate, false, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 48, 2560, false, 1, 1,
+                                                            false, bias, gate, false, { 1, 1 }));
+    }
+
     // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
     // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
     // leave partial tiles. One case at Flint's own expert shapes.
@@ -13414,6 +13439,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 48, 6, true,  512, n, 2048));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 48, 6, false, 2048, n, 512));
+        }
+    }
+
+    // Qwen3.8-Flash-Next's BF16 products (hyper-connection projections, indexer, recurrent gates) at 1 to 4 tokens;
+    // compare the Pascal BF16 kernel (mmvf-pascal.cu) on and off with GGML_CUDA_MMVF_PASCAL
+    for (int64_t n : { 1, 2, 3, 4 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                { 10240, 320 }, { 320, 10240 }, { 4, 10240 }, { 512, 2560 }, { 48, 2560 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
         }
     }
 
