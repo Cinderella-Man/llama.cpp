@@ -43,19 +43,32 @@ static __device__ __forceinline__ float4 fap_load_h4(const char * p) {
     return make_float4(a.x, a.y, b.x, b.y);
 }
 
+// One step of fap_transpose_reduce: lanes n/2 apart each keep one half of v[0 .. n-1], send the other and add what
+// they receive. The trip count is a template constant and both halves are read before the selects, so v stays in
+// registers. (In v2.0 the steps were one loop over n with an inner loop to n/2: the compiler unrolls inner loops first,
+// could only unroll that one 4 times, and `upper ? v[i] : v[i + n/2]`, a conditional on two array elements, became a
+// load at a lane-dependent index; both kept v in local memory: a 128-byte stack frame, 505 local loads and stores.)
+template <int n>
+static __device__ __forceinline__ void fap_transpose_step(float v[32], const int lane) {
+    const bool upper = lane & (n/2);
+#pragma unroll
+    for (int i = 0; i < n/2; ++i) {
+        const float lo = v[i];
+        const float hi = v[i + n/2];
+        const float send = upper ? lo : hi;
+        const float keep = upper ? hi : lo;
+        v[i] = keep + __shfl_xor_sync(0xFFFFFFFF, send, n/2, WARP_SIZE);
+    }
+}
+
 // v[32] holds each lane's partial sums of 32 values; afterwards v[0] of lane l is the sum over all lanes of value l.
 static __device__ __forceinline__ float fap_transpose_reduce(float v[32]) {
     const int lane = threadIdx.x;
-#pragma unroll
-    for (int o = 16, n = 32; o > 0; o >>= 1, n >>= 1) {
-        const bool upper = lane & o;
-#pragma unroll
-        for (int i = 0; i < n/2; ++i) {
-            const float send = upper ? v[i] : v[i + n/2];
-            const float keep = upper ? v[i + n/2] : v[i];
-            v[i] = keep + __shfl_xor_sync(0xFFFFFFFF, send, o, WARP_SIZE);
-        }
-    }
+    fap_transpose_step<32>(v, lane);
+    fap_transpose_step<16>(v, lane);
+    fap_transpose_step< 8>(v, lane);
+    fap_transpose_step< 4>(v, lane);
+    fap_transpose_step< 2>(v, lane);
     return v[0];
 }
 

@@ -13837,7 +13837,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Flint's one-token decode attention per layer call (4 KV heads of 8 query heads, head size 128, F16 cache viewed as
     // in the KV cache, sinks): the Pascal decode kernel against the stock ones (GGML_CUDA_FATTN_PASCAL=0/1)
-    for (int kv : { 256, 768, 8192, 32768, 131072 }) {
+    for (int kv : { 256, 768, 1024, 8192, 32768, 131072 }) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32,
                                                         GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
     }
