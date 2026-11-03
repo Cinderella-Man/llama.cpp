@@ -18,6 +18,7 @@ template <> struct mmvqp_traits<GGML_TYPE_Q4_K>   { static constexpr int bs = si
 template <> struct mmvqp_traits<GGML_TYPE_Q5_K>   { static constexpr int bs = sizeof(block_q5_K);   static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_IQ4_XS> { static constexpr int bs = sizeof(block_iq4_xs); static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_Q6_K>   { static constexpr int bs = sizeof(block_q6_K);   static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_Q2_0>   { static constexpr int bs = sizeof(block_q2_0);   static constexpr int na = QK2_0 / QK8_1; };
 
 constexpr __host__ __device__ int mmvqp_gcd(const int a, const int b) {
     return b == 0 ? a : mmvqp_gcd(b, a % b);
@@ -222,6 +223,21 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             }
             a.d[b] = d8;
             a.s[b] = 0.0f;
+        } else if constexpr (type == GGML_TYPE_Q2_0) {
+            // the lookup of a code word (mmvqp_q2_0_isum) returns weights (0, 2, 4, 6) and (1, 3, 5, 7) of each run of 8:
+            // the activations as the even and odd bytes of each pair of words, (a0, a2, a4, a6) and (a1, a3, a5, a7)
+            int p[8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                p[2*k + 0] = (int) __byte_perm(a.u[b][2*k], a.u[b][2*k + 1], 0x6420);
+                p[2*k + 1] = (int) __byte_perm(a.u[b][2*k], a.u[b][2*k + 1], 0x7531);
+            }
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                a.u[b][k] = p[k];
+            }
+            a.d[b] = d8;
+            a.s[b] = 0.0f;
         } else {
             a.d[b] = d8 * 0.0625f;
             a.s[b] = S;
@@ -243,6 +259,21 @@ static __device__ __forceinline__ int mmvqp_q4_isum16(
     lo = ggml_cuda_dp4a((int) (q3 & 0x0F0F0F0F), u[3], lo);
     hi = mmvqp_dp4a_us(q3 & 0xF0F0F0F0, u[7], hi);
     return (lo << 4) + hi;
+}
+
+// sum((code - 1) * activation) over the 16 weights of one Q2_0 code word q (weight j in bits 2j, 2j + 1), added to isum;
+// u: the activations of those weights as mmvqp_load_act regroups them (even, odd bytes of weights 0..7, then of 8..15).
+// The 2-bit codes are looked up with __byte_perm in a table of 4 bytes held in the selector's operands, which returns
+// them as the signed int8 values -1, 0, 1, 2: 4 lookups and 3 shifts per 16 weights, no masks and no offset sums.
+static __device__ __forceinline__ int mmvqp_q2_0_isum(const uint32_t q, const int * u, int isum) {
+    constexpr uint32_t t = 0x020100FF; // codes 0, 1, 2, 3 -> -1, 0, 1, 2
+    // each selector nibble holds two codes: the low one picks the byte; the high one sets bit 2 of the index, which
+    // only chooses between the two copies of t, and the nibble's top bit, which __byte_perm ignores
+    isum = ggml_cuda_dp4a((int) __byte_perm(t, t, q),       u[0], isum);
+    isum = ggml_cuda_dp4a((int) __byte_perm(t, t, q >> 2),  u[1], isum);
+    isum = ggml_cuda_dp4a((int) __byte_perm(t, t, q >> 16), u[2], isum);
+    isum = ggml_cuda_dp4a((int) __byte_perm(t, t, q >> 18), u[3], isum);
+    return isum;
 }
 
 // One Q4_K super-block as 36 words: dm, 3 words of scales, 32 words qs; activation blocks a0..a0+7. Sub-blocks 2j and
@@ -380,6 +411,14 @@ static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvq
             acc = mmvqp_dot_iq4_xs(w + o/4, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_Q6_K) {
             acc = mmvqp_dot_q6_K(w, a, 8*b, acc);
+        } else if constexpr (type == GGML_TYPE_Q2_0) {
+            // 64 weights: d, then 4 code words of 16 weights; activation blocks 2b (words 0, 1) and 2b + 1 (words 2, 3)
+            const float d  = mmvqp_h2f_lo(mmvqp_u16_at(w, o));
+            const int   i0 = mmvqp_q2_0_isum(mmvqp_word_at(w, o + 6),  a.u[2*b + 0] + 4,
+                             mmvqp_q2_0_isum(mmvqp_word_at(w, o + 2),  a.u[2*b + 0], 0));
+            const int   i1 = mmvqp_q2_0_isum(mmvqp_word_at(w, o + 14), a.u[2*b + 1] + 4,
+                             mmvqp_q2_0_isum(mmvqp_word_at(w, o + 10), a.u[2*b + 1], 0));
+            acc = fmaf(d, fmaf((float) i1, a.d[2*b + 1], (float) i0 * a.d[2*b + 0]), acc);
         } else if constexpr (type == GGML_TYPE_Q4_1) {
             const uint32_t dm = mmvqp_word_at(w, o);
             const int isum = mmvqp_q4_isum16(mmvqp_word_at(w, o + 4), mmvqp_word_at(w, o + 8), mmvqp_word_at(w, o + 12),
@@ -422,6 +461,7 @@ struct mmvqp_shape {
     int  R;
     int  C;
     bool staged;
+    bool tile = false; // staged: each warp stages its whole rows at once (rows whose segments aren't 16-byte aligned)
 };
 
 // Measured on a P106-090 at the shapes of Flint (K = 512 to 4096) with bench/mmvq_pascal of
@@ -444,6 +484,11 @@ static constexpr mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate)
             return gate ? mmvqp_shape{ 1, 1, false } : mmvqp_shape{ 1, 1, true };
         case GGML_TYPE_Q6_K:
             return { 1, 1, true };
+        // Qwen3.8-Flash-Next's routed experts (gate/up K = 2560, down K = 640): two blocks per lane keep the 18-byte
+        // blocks' chunks 4-byte aligned; down's 180-byte rows are staged a warp tile at a time (chosen on the host).
+        // Not yet measured on a P106 (bench/mmvq_pascal --q2_0 and GGML_CUDA_MMVQ_PASCAL_Q2_0 sweep the alternatives).
+        case GGML_TYPE_Q2_0:
+            return gate ? mmvqp_shape{ 2, 2, true } : mmvqp_shape{ 1, 2, true, true };
         default:
             GGML_ABORT("fatal error");
     }

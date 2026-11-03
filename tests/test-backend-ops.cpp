@@ -12166,6 +12166,44 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Q2_0 products of 1 to 4 tokens at the shapes of Qwen3.8-Flash-Next's experts (hidden 2560, experts of width 640
+    // with 10 of 512 used, a 640-wide shared expert): gate/up 2560 -> 640 (fused with SwiGLU), down 640 -> 2560, whose
+    // 180-byte rows the Pascal kernel (mmvq-pascal.cu) stages a warp tile at a time; odd and partial row counts, row
+    // widths of 1280 and 768 (also tile-staged), rows that are views of wider rows (direct loads), and widths of 5 and 3
+    // blocks (left to mul_mat_vec_q). GGML_CUDA_MMVQ_PASCAL=2 runs the Pascal kernels on any GPU;
+    // GGML_CUDA_MMVQ_PASCAL_Q2_0 selects the other launch shapes.
+    for (int64_t n : { 1, 2, 3, 4 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                { 640, 2560 }, { 2560, 640 }, { 641, 2560 }, { 2561, 640 }, { 2576, 640 }, { 1024, 1280 }, { 4096, 2048 },
+                { 64, 320 }, { 64, 192 } }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 2560, n, 640, { 1, 1 }, { 1, 1 },
+                                                 { 0, 1, 2, 3 }, 768));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 32, 10, true,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 32, 10, false, 2560, n, 640));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 32, 10,
+                                                            true));
+        // activations whose blocks sum past FP16's range (k a multiple of 256 here)
+        test_cases.emplace_back(new test_mul_mat_large_act(GGML_TYPE_Q2_0, 2560, n, 768, 32, 10));
+        test_cases.emplace_back(new test_mul_mat_large_act(GGML_TYPE_Q2_0, 640, n, 2560));
+        // the routed + shared expert launch, and tokens that pick the same expert more than once
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q2_0, n));
+        test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q2_0, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
+        test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q2_0, GGML_TYPE_F32, 28, 10, true, 1024, n, 256));
+    }
+    // all 512 experts, as the file has them
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, true, 512, 10,
+                                                        true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640));
+    // the shared expert's gate/up, and one token with a fused bias (segment- and tile-staged)
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, false, 1, 1, false,
+                                                        false, true, false, { 1, 1 }));
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 640, 2560 }, { 2560, 640 } }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, m, k, false, 1, 1, false,
+                                                            true, false, false, { 1, 1 }));
+    }
+
     // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
     // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
     // leave partial tiles. One case at Flint's own expert shapes.
@@ -13415,6 +13453,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 48, 6, true,  512, n, 2048));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 48, 6, false, 2048, n, 512));
         }
+    }
+
+    // Qwen3.8-Flash-Next's Q2_0 experts at 1 to 4 tokens: one routed gate or up projection (2560 -> 640), the down
+    // projection (640 -> 2560) and the shared expert's two shapes; compare the Pascal kernels on and off with
+    // GGML_CUDA_MMVQ_PASCAL and their launch shapes with GGML_CUDA_MMVQ_PASCAL_Q2_0. 10 of 128 random experts per
+    // token touch 19.2 and 35.5 distinct experts in 2 and 4 tokens (10 of 512: 19.8 and 38.7), with a quarter of the
+    // weights to initialize. Fused gate/up + SwiGLU is timed by bench/mmvq_pascal --q2_0 (perf mode repeats only a
+    // graph's last node).
+    for (int64_t n : { 1, 2, 3, 4 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 128, 10, true,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 128, 10, false, 2560, n, 640));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 640, n, 2560, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 2560, n, 640, { 1, 1 }, { 1, 1 }));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

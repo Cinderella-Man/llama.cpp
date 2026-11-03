@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -36,6 +37,15 @@
 //   - Q5_0's fifth bits stay where they are: a block's sum splits into sum(nibble * a) + 16 * sum(bit * a), and
 //     (qh >> j) & 0x01010101 holds the fifth bits of weights j, 8 + j, 16 + j and 24 + j, so the activations are
 //     regrouped the same way once per block (two 4 x 4 byte transposes), shared by all rows.
+//   - Q2_0 (64 weights, an FP16 scale and 16 bytes of 2-bit codes, as Q4_0's 18 bytes) takes two blocks per lane, so
+//     that chunks stay 4-byte aligned. Its codes are looked up with __byte_perm in a 4-byte table (0x020100FF: codes 0..3
+//     -> -1..2) with the code word itself as the selector, 4 lookups and 3 shifts per 16 weights; the lookups return
+//     weights (0, 2, 4, 6) and (1, 3, 5, 7) of each run of 8, so the activations are split into even and odd bytes once
+//     per load, shared by all rows. No masks, offsets or activation sums.
+//   - Tile staging (Q2_0 without a fused gate, where a lane group's segment isn't a multiple of 16 bytes, as for
+//     Qwen3.8-Flash-Next's 640-wide down projection: 180-byte rows, one lane per row, 36 bytes per iteration): each
+//     warp copies all its rows, which are contiguous, into dynamic shared memory once with coalesced 128-bit loads,
+//     then every lane reads its chunks from there, instead of each lane loading its own row 4 bytes at a time.
 //   - Row pointers are computed once and advanced by a constant; partial sums are reduced with warp shuffles only.
 // The expert path (ids), the routed + shared expert launch (fusion.shared_up), biases and the GLU epilogue follow
 // mul_mat_vec_q exactly.
@@ -55,6 +65,7 @@
 
 #define MMVQ_PASCAL_NWARPS 4
 #define MMVQP_MAX_COLS 4
+#define MMVQP_TILE_MAX_BYTES (48 * 1024) // a block's shared memory without opting in to more
 
 namespace {
 
@@ -144,9 +155,43 @@ static __device__ __forceinline__ void mmvqp_lds_chunk(uint32_t * w, const char 
     }
 }
 
+// Tile staging (mmvqp_shape::tile): rows [wrow0, wrow0 + (WARP_SIZE >> lpr_log2) * R) of matrix x, the warp's rows, which
+// lie one after the other in memory, copied once into the warp's part of the dynamic shared memory with coalesced 128-bit
+// loads, for rows whose per-iteration segments aren't 16-byte aligned (Q2_0 at K = 640: 180-byte rows). Returns the
+// warp's copy; row r - wrow0 starts at (r - wrow0) * row_bytes in it, as in global memory. The host checked that the rows
+// are contiguous, that a warp's tile is a whole number of 16-byte units and that each matrix ends at a 16-byte boundary.
+template <int R>
+static __device__ __forceinline__ const char * mmvqp_stage_tile(const char * x, const mmvqp_args & p, const uint32_t bx) {
+    extern __shared__ uint4 mmvqp_tile_sm[];
+    constexpr int UN = 4; // loads in flight per lane
+    const int wrows  = (WARP_SIZE >> p.lpr_log2) * R;
+    const int wrow0  = (int) (bx * MMVQ_PASCAL_NWARPS + threadIdx.y) * wrows;
+    const int wbytes = wrows * p.row_bytes;
+    uint4       * dsm = (uint4 *) ((char *) mmvqp_tile_sm + threadIdx.y * wbytes);
+    const uint4 * src = (const uint4 *) (x + (int64_t) wrow0 * p.row_bytes);
+    const int     nu  = (max(0, min(wrows, p.nrows - wrow0)) * p.row_bytes) >> 4;
+    for (int u0 = threadIdx.x; u0 < nu; u0 += UN * WARP_SIZE) {
+        uint4 v[UN];
+#pragma unroll
+        for (int j = 0; j < UN; ++j) {
+            if (u0 + j * WARP_SIZE < nu) {
+                v[j] = __ldg(src + u0 + j * WARP_SIZE);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < UN; ++j) {
+            if (u0 + j * WARP_SIZE < nu) {
+                dsm[u0 + j * WARP_SIZE] = v[j];
+            }
+        }
+    }
+    __syncwarp();
+    return (const char *) dsm;
+}
+
 // One token: the rows of row block bx (blockIdx.x of mul_mat_vec_q_pascal). Shared by mul_mat_vec_q_pascal and the
 // Q/K/V launch (mul_mat_vec_q_pascal_qkv), where each type's instantiation has its own staging memory.
-template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
+template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16, bool tile = false>
 static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const ggml_cuda_mm_fusion_args_device & fusion,
                                                      const uint32_t bx) {
     using unit_t = typename mmvqp_stage_unit<SU>::t;
@@ -158,7 +203,9 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     constexpr int M  = fk == MMVQP_GATE ? 2 : 1;   // matrices: up (or plain), gate
     constexpr int MS = mmvqp_staged_mats<type, M>(); // matrices staged at a time
     constexpr int NU = (WB + SU - 1) / SU;         // staged: units per lane and row, the last one predicated
-    __shared__ uint4 sm[staged ? NW : 1][staged ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
+    constexpr bool seg = staged && !tile;          // staged segment by segment (tile: whole rows, once)
+    static_assert(!tile || (staged && M == 1 && SU == 16), "tile staging: one matrix, 16-byte units");
+    __shared__ uint4 sm[seg ? NW : 1][seg ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
 
     const int lane     = threadIdx.x;
     const int lpr_log2 = p.lpr_log2;
@@ -194,8 +241,12 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     const char * yp = p.vy + sample_dst*p.sample_bytes_y + channel_y*p.channel_bytes_y + sl * YB;
     const int wstep = WB << lpr_log2;
     const int ystep = YB << lpr_log2;
-    [[maybe_unused]] char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * MS * WB << lpr_log2 : 0);
+    [[maybe_unused]] char * smw = (char *) sm[seg ? threadIdx.y : 0] + (seg ? grp * R * MS * WB << lpr_log2 : 0);
     [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> (SU == 16 ? 4 : SU == 8 ? 3 : 2);
+    [[maybe_unused]] const char * smt = nullptr; // tile: this lane's chunk of the lane group's first row
+    if constexpr (tile) {
+        smt = mmvqp_stage_tile<R>(xm[0], p, bx) + grp * R * p.row_bytes + sl * WB;
+    }
 
     float acc[M][R];
 #pragma unroll
@@ -210,7 +261,7 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
         mmvqp_act<NA> a;
 #pragma unroll
         for (int g = 0; g < M / MS; ++g) {
-            if constexpr (staged) {
+            if constexpr (seg) {
 #pragma unroll
                 for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
@@ -237,7 +288,9 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
                 for (int i = 0; i < R; ++i) {
                     const int m = g*MS + ms;
                     uint32_t w[(WB + 3) / 4];
-                    if constexpr (staged) {
+                    if constexpr (tile) {
+                        mmvqp_lds_chunk<type, WB>(w, smt + i * p.row_bytes);
+                    } else if constexpr (staged) {
                         mmvqp_lds_chunk<type, WB>(w, smw + ((ms*R + i) * WB << lpr_log2) + sl * WB);
                     } else {
                         mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(w, rw[m][i]);
@@ -246,9 +299,12 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
                     rw[m][i] += wstep;
                 }
             }
-            if constexpr (staged) {
+            if constexpr (seg) {
                 __syncwarp();
             }
+        }
+        if constexpr (tile) {
+            smt += wstep;
         }
         yp += ystep;
     }
@@ -307,10 +363,10 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     }
 }
 
-template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
+template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16, bool tile = false>
 __launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q_pascal(const mmvqp_args p, const ggml_cuda_mm_fusion_args_device fusion) {
-    mmvqp_rows_1t<type, R, C, staged, fk, SU>(p, fusion, blockIdx.x);
+    mmvqp_rows_1t<type, R, C, staged, fk, SU, tile>(p, fusion, blockIdx.x);
 }
 
 // One token, three products of the same activations in one launch (an attention block's Q, K and V): row blocks
@@ -335,7 +391,7 @@ static __global__ void mul_mat_vec_q_pascal_qkv(const mmvqp_args pq, const mmvqp
 // expert, samples) for MUL_MAT_ID, where block y = t * nslots + k is entry (token t, slot k) of ids.
 // sa: each token's activation segment is copied into shared memory by the whole warp with coalesced 128-bit loads, and
 // every lane reads its blocks from there, instead of loading its own blocks from global memory at a stride of YB bytes.
-template <ggml_type type, int R, int C, bool staged, int fk, bool sa, int SU = 16>
+template <ggml_type type, int R, int C, bool staged, int fk, bool sa, int SU = 16, bool tile = false>
 __launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml_cuda_mm_fusion_args_device fusion) {
     using unit_t = typename mmvqp_stage_unit<SU>::t;
@@ -349,7 +405,9 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
     constexpr int MS = mmvqp_staged_mats<type, M>(); // matrices staged at a time
     constexpr int NU = (WB + SU - 1) / SU;         // staged: units per lane and row, the last one predicated
     constexpr int NY = (WARP_SIZE * YB / 16 + WARP_SIZE - 1) / WARP_SIZE; // sa: 16-byte units per lane and token
-    __shared__ uint4 sm[staged ? NW : 1][staged ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
+    constexpr bool seg = staged && !tile;          // staged segment by segment (tile: whole rows, once)
+    static_assert(!tile || (staged && M == 1 && SU == 16), "tile staging: one matrix, 16-byte units");
+    __shared__ uint4 sm[seg ? NW : 1][seg ? (WARP_SIZE * R * MS * WB + mmvqp_staged_pad<type>()) / 16 : 1];
     __shared__ uint4 sm_y[sa ? NW : 1][sa ? WARP_SIZE * YB / 16 : 1];
 
     const int lane     = threadIdx.x;
@@ -442,8 +500,12 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
     }
     const int wstep = WB << lpr_log2;
     const int ystep = YB << lpr_log2;
-    [[maybe_unused]] char * smw = (char *) sm[staged ? threadIdx.y : 0] + (staged ? grp * R * MS * WB << lpr_log2 : 0);
+    [[maybe_unused]] char * smw = (char *) sm[seg ? threadIdx.y : 0] + (seg ? grp * R * MS * WB << lpr_log2 : 0);
     [[maybe_unused]] const int seg_units = (WB << lpr_log2) >> (SU == 16 ? 4 : SU == 8 ? 3 : 2);
+    [[maybe_unused]] const char * smt = nullptr; // tile: this lane's chunk of the lane group's first row
+    if constexpr (tile) {
+        smt = mmvqp_stage_tile<R>(xm[0], p, blockIdx.x) + grp * R * p.row_bytes + sl * WB;
+    }
 
     float acc[NC][M][R];
 #pragma unroll
@@ -461,7 +523,7 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
     for (int it = 0; it < p.niter; ++it) {
 #pragma unroll
         for (int g = 0; g < M / MS; ++g) {
-            if constexpr (staged) {
+            if constexpr (seg) {
 #pragma unroll
                 for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
@@ -488,7 +550,9 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
                 for (int ms = 0; ms < MS; ++ms) {
 #pragma unroll
                     for (int i = 0; i < R; ++i) {
-                        if constexpr (staged) {
+                        if constexpr (tile) {
+                            mmvqp_lds_chunk<type, WB>(wr[ms][i], smt + i * p.row_bytes);
+                        } else if constexpr (staged) {
                             mmvqp_lds_chunk<type, WB>(wr[ms][i], smw + ((ms*R + i) * WB << lpr_log2) + sl * WB);
                         } else {
                             mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(wr[ms][i], rw[g*MS + ms][i]);
@@ -528,7 +592,9 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
                             acc[j][m][i] = mmvqp_dot<type, C>(wr[ms][i], a, acc[j][m][i]);
                         } else {
                             uint32_t w[(WB + 3) / 4];
-                            if constexpr (staged) {
+                            if constexpr (tile) {
+                                mmvqp_lds_chunk<type, WB>(w, smt + i * p.row_bytes);
+                            } else if constexpr (staged) {
                                 mmvqp_lds_chunk<type, WB>(w, smw + ((ms*R + i) * WB << lpr_log2) + sl * WB);
                             } else {
                                 mmvqp_ldg_words<WB, mmvqp_gcd(WB, 16)>(w, rw[m][i]);
@@ -538,7 +604,7 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
                     }
                 }
             }
-            if constexpr (staged) {
+            if constexpr (seg) {
                 __syncwarp();
             }
         }
@@ -548,6 +614,9 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
             for (int i = 0; i < R; ++i) {
                 rw[m][i] += wstep;
             }
+        }
+        if constexpr (tile) {
+            smt += wstep;
         }
         yp += ystep;
     }
@@ -618,23 +687,24 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
     }
 }
 
-// The single-token kernel for one token, the multi-token one for more.
-template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16>
+// The single-token kernel for one token, the multi-token one for more. tile: smem bytes of dynamic shared memory hold the
+// block's warp tiles (mmvqp_stage_tile).
+template <ggml_type type, int R, int C, bool staged, int fk, int SU = 16, bool tile = false>
 static void mmvqp_launch_kernel(const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args_device & fusion, const dim3 grid,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const int smem = 0) {
     const dim3 block(WARP_SIZE, MMVQ_PASCAL_NWARPS, 1);
-    if constexpr (mmvqp_fits<type, R, C, staged, fk == MMVQP_GATE>()) {
+    if constexpr (mmvqp_fits<type, R, C, staged && !tile, fk == MMVQP_GATE>()) {
         if (p.ncols == 1) {
-            mul_mat_vec_q_pascal<type, R, C, staged, fk, SU><<<grid, block, 0, stream>>>(p, fusion);
+            mul_mat_vec_q_pascal<type, R, C, staged, fk, SU, tile><<<grid, block, smem, stream>>>(p, fusion);
             return;
         }
-        if constexpr (mmvqp_fits_mc<type, R, C, staged, fk == MMVQP_GATE, true>()) {
+        if constexpr (mmvqp_fits_mc<type, R, C, staged && !tile, fk == MMVQP_GATE, true>()) {
             if (p.stage_act) {
-                mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, true, SU><<<grid, block, 0, stream>>>(p, fusion);
+                mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, true, SU, tile><<<grid, block, smem, stream>>>(p, fusion);
                 return;
             }
         }
-        mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, false, SU><<<grid, block, 0, stream>>>(p, fusion);
+        mul_mat_vec_q_pascal_mc<type, R, C, staged, fk, false, SU, tile><<<grid, block, smem, stream>>>(p, fusion);
     } else {
         GGML_ABORT("fatal error");
     }
@@ -656,16 +726,44 @@ static void mmvqp_launch(const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args
     }
 }
 
-// su: bytes per staging load (16; Q6_K also 8 and 4)
+// Tile-staged rows (no fused gate: a tile holds one matrix).
+template <ggml_type type, int R, int C>
+static void mmvqp_launch_tile(const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args_device & fusion, const int fk,
+                              const dim3 grid, cudaStream_t stream, const int smem) {
+    switch (fk) {
+        case MMVQP_PLAIN:
+            mmvqp_launch_kernel<type, R, C, true, MMVQP_PLAIN, 16, true>(p, fusion, grid, stream, smem);
+            break;
+        case MMVQP_BIAS:
+            mmvqp_launch_kernel<type, R, C, true, MMVQP_BIAS, 16, true>(p, fusion, grid, stream, smem);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+// su: bytes per staging load (16; Q6_K also 8 and 4); smem: dynamic shared memory of a tile-staged shape
 template <ggml_type type>
 static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, const ggml_cuda_mm_fusion_args_device & fusion,
-                               const int fk, const dim3 grid, cudaStream_t stream, const int su) {
+                               const int fk, const dim3 grid, cudaStream_t stream, const int su, const int smem) {
 #define MMVQP_CASE(R_, C_, S_)                                              \
-    if (s.R == R_ && s.C == C_ && s.staged == S_) {                         \
+    if (!s.tile && s.R == R_ && s.C == C_ && s.staged == S_) {              \
         mmvqp_launch<type, R_, C_, S_>(p, fusion, fk, grid, stream);        \
         return;                                                             \
     }
-    if constexpr (type == GGML_TYPE_Q6_K) {
+#define MMVQP_TILE_CASE(R_, C_)                                             \
+    if (s.tile && s.R == R_ && s.C == C_) {                                 \
+        mmvqp_launch_tile<type, R_, C_>(p, fusion, fk, grid, stream, smem); \
+        return;                                                             \
+    }
+    if constexpr (type == GGML_TYPE_Q2_0) {
+        MMVQP_TILE_CASE(1, 2)
+        MMVQP_TILE_CASE(2, 2)
+        MMVQP_CASE(1, 2, true)
+        MMVQP_CASE(1, 2, false)
+        MMVQP_CASE(2, 2, true)
+        MMVQP_CASE(2, 2, false)
+    } else if constexpr (type == GGML_TYPE_Q6_K) {
         if (s.R == 1 && s.C == 1 && s.staged) {
             switch (su) {
                 case 16: mmvqp_launch<type, 1, 1, true, 16>(p, fusion, fk, grid, stream); return;
@@ -696,7 +794,8 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
         MMVQP_CASE(2, 2, false)
     }
 #undef MMVQP_CASE
-    GGML_UNUSED(su);
+#undef MMVQP_TILE_CASE
+    GGML_UNUSED_VARS(su, smem);
     GGML_ABORT("fatal error");
 }
 
@@ -725,6 +824,30 @@ static bool mmvqp_stage_act() {
         return env && atoi(env) != 0;
     }();
     return stage;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_Q2_0=G,P,T: Q2_0's launch shape, so that one binary measures the alternatives on a P106: G and P
+// rows per lane group (1 or 2) with and without a fused gate, and T where rows go whose segments can't be staged 16 bytes
+// at a time (K = 640): 0 direct loads, 1 tile staging (default), 2 tile staging wherever it fits. 0 or a missing field
+// keeps mmvqp_choose's value.
+struct mmvqp_q2_0_cfg {
+    int r_gate  = 0;
+    int r_plain = 0;
+    int tile    = 1;
+};
+
+static const mmvqp_q2_0_cfg & mmvqp_q2_0_config() {
+    static const mmvqp_q2_0_cfg cfg = [] {
+        mmvqp_q2_0_cfg c;
+        const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_Q2_0");
+        int v[3] = { 0, 0, 1 };
+        const int n = env ? sscanf(env, "%d,%d,%d", &v[0], &v[1], &v[2]) : 0;
+        c.r_gate  = n >= 1 && (v[0] == 1 || v[0] == 2) ? v[0] : 0;
+        c.r_plain = n >= 2 && (v[1] == 1 || v[1] == 2) ? v[1] : 0;
+        c.tile    = n >= 3 && v[2] >= 0 && v[2] <= 2 ? v[2] : 1;
+        return c;
+    }();
+    return cfg;
 }
 
 // GGML_CUDA_MMVQ_PASCAL_SKIP=q4_K,q6_K: weight types (ggml type names, comma-separated) left to mul_mat_vec_q, so that
@@ -777,7 +900,8 @@ bool ggml_cuda_mmvq_pascal(
         return false;
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
-            type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K) {
+            type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K &&
+            type != GGML_TYPE_Q2_0) {
         return false;
     }
     if (mmvqp_skip_type(type)) {
@@ -793,6 +917,10 @@ bool ggml_cuda_mmvq_pascal(
 
     const bool gate = fusion.gate != nullptr;
     mmvqp_shape s = mmvqp_choose(type, gate);
+    if (type == GGML_TYPE_Q2_0) {
+        const int r = gate ? mmvqp_q2_0_config().r_gate : mmvqp_q2_0_config().r_plain;
+        s.R = r > 0 ? r : s.R;
+    }
 
     const int64_t bs     = ggml_type_size(type);
     const int64_t blocks = ncols_x / ggml_blck_size(type);
@@ -812,7 +940,8 @@ bool ggml_cuda_mmvq_pascal(
             mmvqp_aligned(fusion.shared_gate, al) && row_bytes % al == 0 && (stride_channel_x * bs) % al == 0 &&
             (stride_sample_x * bs) % al == 0;
     };
-    int su = 16;
+    int su   = 16;
+    int smem = 0; // tile staging: the block's warp tiles
     if (type == GGML_TYPE_Q6_K) {
         // staged only (2-byte-aligned blocks), with the widest loads the rows and the segment allow
         su = 0;
@@ -826,7 +955,20 @@ bool ggml_cuda_mmvq_pascal(
             return false;
         }
     } else {
-        if (s.staged && (((s.C * bs) << lpr_log2) % 16 != 0 || !x_aligned(16))) {
+        const bool seg_ok = ((s.C * bs) << lpr_log2) % 16 == 0 && x_aligned(16);
+        // tile staging (shapes that allow it, no fused gate): the warp's rows must be contiguous, whole 16-byte units and
+        // fit, and every matrix must end at a 16-byte boundary so that the last tile reads nothing past it
+        const int tile_mode = type == GGML_TYPE_Q2_0 ? mmvqp_q2_0_config().tile : 0;
+        if (s.staged && s.tile && !gate && (tile_mode == 2 || (tile_mode == 1 && !seg_ok))) {
+            const int64_t wbytes = (int64_t) (WARP_SIZE >> lpr_log2) * s.R * row_bytes;
+            if (stride_row_x == blocks && wbytes % 16 == 0 && (nrows_x * row_bytes) % 16 == 0 && mmvqp_aligned(vx, 16) &&
+                    (stride_channel_x * bs) % 16 == 0 && (stride_sample_x * bs) % 16 == 0 &&
+                    MMVQ_PASCAL_NWARPS * wbytes <= MMVQP_TILE_MAX_BYTES) {
+                smem = (int) (MMVQ_PASCAL_NWARPS * wbytes);
+            }
+        }
+        s.tile = smem > 0;
+        if (s.staged && !s.tile && !seg_ok) {
             s.staged = false;
         }
         if (row_bytes > INT_MAX || (!s.staged && !x_aligned(mmvqp_gcd((int) (s.C * bs), 16)))) {
@@ -880,6 +1022,10 @@ bool ggml_cuda_mmvq_pascal(
         (stride_col_y * (int64_t) sizeof(block_q8_1)) % 16 == 0 &&
         (stride_channel_y * (int64_t) sizeof(block_q8_1)) % 16 == 0 &&
         (stride_sample_y * (int64_t) sizeof(block_q8_1)) % 16 == 0;
+    // the staged activations' static shared memory comes on top of a tile's
+    if (s.tile && p.stage_act && smem + MMVQ_PASCAL_NWARPS * WARP_SIZE * (yb_seg >> lpr_log2) > MMVQP_TILE_MAX_BYTES) {
+        p.stage_act = false;
+    }
 
     // several tokens with ids: one block per (token, slot) entry
     const int64_t nblocks_y = ids && ncols_dst > 1 ? nchannels_dst * ncols_dst : nchannels_dst;
@@ -890,14 +1036,15 @@ bool ggml_cuda_mmvq_pascal(
                     (unsigned) (nblocks_y + (fusion.shared_up ? 1 : 0)), (unsigned) nsamples_dst);
 
     switch (type) {
-        case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream, su); break;
-        case GGML_TYPE_Q4_1: mmvqp_launch_shape<GGML_TYPE_Q4_1>(s, p, fusion, fk, grid, stream, su); break;
-        case GGML_TYPE_Q5_0: mmvqp_launch_shape<GGML_TYPE_Q5_0>(s, p, fusion, fk, grid, stream, su); break;
-        case GGML_TYPE_Q4_K: mmvqp_launch_shape<GGML_TYPE_Q4_K>(s, p, fusion, fk, grid, stream, su); break;
-        case GGML_TYPE_Q5_K: mmvqp_launch_shape<GGML_TYPE_Q5_K>(s, p, fusion, fk, grid, stream, su); break;
-        case GGML_TYPE_IQ4_XS: mmvqp_launch_shape<GGML_TYPE_IQ4_XS>(s, p, fusion, fk, grid, stream, su); break;
-        case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream, su); break;
-        case GGML_TYPE_Q6_K: mmvqp_launch_shape<GGML_TYPE_Q6_K>(s, p, fusion, fk, grid, stream, su); break;
+        case GGML_TYPE_Q4_0: mmvqp_launch_shape<GGML_TYPE_Q4_0>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_Q4_1: mmvqp_launch_shape<GGML_TYPE_Q4_1>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_Q5_0: mmvqp_launch_shape<GGML_TYPE_Q5_0>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_Q4_K: mmvqp_launch_shape<GGML_TYPE_Q4_K>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_Q5_K: mmvqp_launch_shape<GGML_TYPE_Q5_K>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_IQ4_XS: mmvqp_launch_shape<GGML_TYPE_IQ4_XS>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_Q8_0: mmvqp_launch_shape<GGML_TYPE_Q8_0>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_Q6_K: mmvqp_launch_shape<GGML_TYPE_Q6_K>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_Q2_0: mmvqp_launch_shape<GGML_TYPE_Q2_0>(s, p, fusion, fk, grid, stream, su, smem); break;
         default:             GGML_ABORT("fatal error");
     }
     return true;
