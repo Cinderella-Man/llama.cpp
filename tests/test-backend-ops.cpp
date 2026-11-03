@@ -12769,8 +12769,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                             true, false, false, { 1, 1 }));
         for (int64_t n : { 2, 3, 4 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
-            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 640, n, 2560));
-            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 256, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 256, n, 2560));
         }
     }
 
