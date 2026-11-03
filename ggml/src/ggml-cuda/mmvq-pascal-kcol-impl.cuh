@@ -1,7 +1,7 @@
 #pragma once
 
 // The k-column Pascal matrix products of mmvq-pascal-kcol.cu without ggml's headers, so that a standalone benchmark can
-// time the same code (bench/mmvq_pascal --kcol in llms-on-crypto-mining-rigs carries a copy). The weight layouts are
+// time the same code (bench/mmvq_pascal/src/kcol_mm.cuh in llms-on-crypto-mining-rigs is a copy). The weight layouts are
 // ggml's (block_q8_0, block_q2_0, block_q3_K, block_q4_K, block_q5_K, block_q6_K, block_iq4_xs), read as bytes.
 //
 // What the kernels do (dst = x * y for k = 1 to 8 columns of y, the k tokens of a speculative-decoding verify):
@@ -27,6 +27,7 @@
 //     order. It depends on L only, which depends on the row width only, so a column's result is the same for every
 //     column count and launch shape.
 
+#include <cmath>
 #include <cstdint>
 #include <cuda_fp16.h>
 
@@ -34,6 +35,12 @@
 #define KCOL_NW        4           // warps per block
 #define KCOL_MAX_COLS  8
 #define KCOL_SMEM_MAX  (48 * 1024) // a block's shared memory without opting in to more
+
+// KCOL_HD: how the decoding is compiled (device code here; bench/mmvq_pascal/verify/kcol_unit_check.cu also builds it
+// for the host and checks each type's decoding against ggml's reference dequantization on a CPU).
+#ifndef KCOL_HD
+#define KCOL_HD __device__
+#endif
 
 namespace kcol {
 
@@ -85,7 +92,20 @@ inline type_info info(const int t) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Arithmetic helpers
 
-static __device__ __forceinline__ int dp4a(const int a, const int b, const int c) {
+static KCOL_HD __forceinline__ uint32_t prmt(const uint32_t a, const uint32_t b, const uint32_t sel) {
+#ifdef __CUDA_ARCH__
+    return __byte_perm(a, b, sel);
+#else
+    const uint64_t ab = ((uint64_t) b << 32) | a;
+    uint32_t r = 0;
+    for (int i = 0; i < 4; ++i) {
+        r |= (uint32_t) ((ab >> (8 * ((sel >> (4 * i)) & 7))) & 0xff) << (8 * i);
+    }
+    return r;
+#endif
+}
+
+static KCOL_HD __forceinline__ int dp4a(const int a, const int b, const int c) {
 #if __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
 #else
@@ -96,7 +116,7 @@ static __device__ __forceinline__ int dp4a(const int a, const int b, const int c
 }
 
 // a: 4 unsigned bytes, b: 4 signed bytes
-static __device__ __forceinline__ int dp4a_us(const uint32_t a, const int b, const int c) {
+static KCOL_HD __forceinline__ int dp4a_us(const uint32_t a, const int b, const int c) {
 #if __CUDA_ARCH__ >= 610
     int d;
     asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
@@ -108,11 +128,20 @@ static __device__ __forceinline__ int dp4a_us(const uint32_t a, const int b, con
 #endif
 }
 
-static __device__ __forceinline__ float h2f_lo(const uint32_t w) {
-    return __half2float(__ushort_as_half((unsigned short) (w & 0xffff)));
+static KCOL_HD __forceinline__ float h2f(const unsigned short h) {
+#ifdef __CUDA_ARCH__
+    return __half2float(__ushort_as_half(h));
+#else
+    const int e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    const float v = e == 0 ? m * (1.0f / 16777216.0f) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float) (1024 + m), e - 25);
+    return h & 0x8000 ? -v : v;
+#endif
 }
-static __device__ __forceinline__ float h2f_hi(const uint32_t w) {
-    return __half2float(__ushort_as_half((unsigned short) (w >> 16)));
+static KCOL_HD __forceinline__ float h2f_lo(const uint32_t w) {
+    return h2f((unsigned short) (w & 0xffff));
+}
+static KCOL_HD __forceinline__ float h2f_hi(const uint32_t w) {
+    return h2f((unsigned short) (w >> 16));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -205,7 +234,7 @@ struct act_blk {
 };
 
 template <int T>
-static __device__ __forceinline__ void load_act(act_blk & a, const uint32_t * rec, const int b) {
+static KCOL_HD __forceinline__ void load_act(act_blk & a, const uint32_t * rec, const int b) {
     constexpr int UW  = traits<T>::UW;
     constexpr int NAB = UW / 32;
     const uint4 q0 = ((const uint4 *) (rec + 8 * b))[0];
@@ -236,7 +265,7 @@ struct unit_ptr {
 };
 
 template <int AL>
-static __device__ __forceinline__ unit_ptr make_unit(const char * p) {
+static KCOL_HD __forceinline__ unit_ptr make_unit(const char * p) {
     unit_ptr u;
     if constexpr (AL == 2) {
         const int mis = (int) ((uintptr_t) p & 2);
@@ -251,13 +280,13 @@ static __device__ __forceinline__ unit_ptr make_unit(const char * p) {
 
 // N words of a unit from word w0 on; w0 a compile-time constant after unrolling.
 template <int AL, int N>
-static __device__ __forceinline__ void unit_words(uint32_t * w, const unit_ptr & u, const int w0) {
+static KCOL_HD __forceinline__ void unit_words(uint32_t * w, const unit_ptr & u, const int w0) {
     if constexpr (AL == 2) {
         uint32_t cur = u.a[w0];
 #pragma unroll
         for (int i = 0; i < N; ++i) {
             const uint32_t nxt = u.a[w0 + i + 1];
-            w[i] = __byte_perm(cur, nxt, u.sel);
+            w[i] = prmt(cur, nxt, u.sel);
             cur = nxt;
         }
     } else if constexpr (AL == 16) {
@@ -289,7 +318,7 @@ static __device__ __forceinline__ void unit_words(uint32_t * w, const unit_ptr &
 // record of column 0 in shared memory; column j's is cstride words further.
 
 template <int NC, int R>
-static __device__ __forceinline__ void unit_q8_0(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+static KCOL_HD __forceinline__ void unit_q8_0(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                  float (&acc)[R][NC]) {
     // two blocks of 34 bytes: d at bytes 0 and 34, the int8 values at 2..33 and 36..67
 #pragma unroll
@@ -304,7 +333,7 @@ static __device__ __forceinline__ void unit_q8_0(const unit_ptr (&wu)[R], const 
                 d[i] = h2f_lo(w[0]);
 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
-                    q[i][k] = (int) __byte_perm(w[k], w[k + 1], 0x5432);
+                    q[i][k] = (int) prmt(w[k], w[k + 1], 0x5432);
                 }
             } else {
                 uint32_t w[9];
@@ -335,16 +364,16 @@ static __device__ __forceinline__ void unit_q8_0(const unit_ptr (&wu)[R], const 
 
 // sum((code - 1) * activation) over the 16 weights of one Q2_0 code word c (weight j in bits 2j, 2j + 1), the
 // activations in act_pos<PERM_Q2>'s order: 4 lookups and 3 shifts per 16 weights.
-static __device__ __forceinline__ void q2_0_words(const uint32_t c, int * q) {
+static KCOL_HD __forceinline__ void q2_0_words(const uint32_t c, int * q) {
     constexpr uint32_t t = 0x020100FF; // codes 0, 1, 2, 3 -> -1, 0, 1, 2
-    q[0] = (int) __byte_perm(t, t, c);
-    q[1] = (int) __byte_perm(t, t, c >> 2);
-    q[2] = (int) __byte_perm(t, t, c >> 16);
-    q[3] = (int) __byte_perm(t, t, c >> 18);
+    q[0] = (int) prmt(t, t, c);
+    q[1] = (int) prmt(t, t, c >> 2);
+    q[2] = (int) prmt(t, t, c >> 16);
+    q[3] = (int) prmt(t, t, c >> 18);
 }
 
 template <int NC, int R>
-static __device__ __forceinline__ void unit_q2_0(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+static KCOL_HD __forceinline__ void unit_q2_0(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                  float (&acc)[R][NC]) {
     // two blocks of 18 bytes: d at bytes 0 and 18, 4 code words of 16 weights at 2, 6, 10, 14 and 20, 24, 28, 32;
     // activation blocks 2c and 2c + 1 take code words 0, 1 and 2, 3 of block c
@@ -361,7 +390,7 @@ static __device__ __forceinline__ void unit_q2_0(const unit_ptr (&wu)[R], const 
                 d[i] = h2f_lo(w[0]);
 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
-                    cw[k] = __byte_perm(w[k], w[k + 1], 0x5432);
+                    cw[k] = prmt(w[k], w[k + 1], 0x5432);
                 }
             } else {
                 unit_words<4, 5>(w, wu[i], 4);
@@ -404,7 +433,7 @@ struct k_scales {
     float    dmin;
     uint32_t sc_lo, m_lo, sc_hi, m_hi;
 };
-static __device__ __forceinline__ k_scales k_scales_of(const uint32_t * w) {
+static KCOL_HD __forceinline__ k_scales k_scales_of(const uint32_t * w) {
     k_scales s;
     s.d     = h2f_lo(w[0]);
     s.dmin  = h2f_hi(w[0]);
@@ -419,7 +448,7 @@ static __device__ __forceinline__ k_scales k_scales_of(const uint32_t * w) {
 // words (Q5_K: and bits 2p, 2p + 1 of the 8 qh words). Q4_K's high nibbles stay in place (unsigned dp4a on
 // q & 0xF0F0F0F0), the factor 16 they carry moved into the row's FP32 scale.
 template <int NC, int R, bool Q5>
-static __device__ __forceinline__ void unit_q45_K(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+static KCOL_HD __forceinline__ void unit_q45_K(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                   float (&acc)[R][NC]) {
     constexpr int T   = Q5 ? KQ5_K : KQ4_K;
     constexpr int QS0 = Q5 ? 12 : 4; // first word of the codes
@@ -495,7 +524,7 @@ static __device__ __forceinline__ void unit_q45_K(const unit_ptr (&wu)[R], const
 // IQ4_XS: block ib takes code words 2 + 4 ib .. 2 + 4 ib + 3; each word's 8 indices are looked up in kvalues_iq4nl
 // with __byte_perm (two words of int8 values per code word, in act_pos<PERM_IQ4>'s order).
 template <int NC, int R>
-static __device__ __forceinline__ void unit_iq4_xs(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+static KCOL_HD __forceinline__ void unit_iq4_xs(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                    float (&acc)[R][NC]) {
     constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u; // kvalues_iq4nl
     float    d[R];
@@ -520,8 +549,8 @@ static __device__ __forceinline__ void unit_iq4_xs(const unit_ptr (&wu)[R], cons
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const uint32_t sel = 0x32103210 | ((c[k] & 0x88888888) >> 1);
-                q[i][2 * k + 0] = (int) __byte_perm(__byte_perm(t0, t1, c[k]),       __byte_perm(t2, t3, c[k]),       sel);
-                q[i][2 * k + 1] = (int) __byte_perm(__byte_perm(t0, t1, c[k] >> 16), __byte_perm(t2, t3, c[k] >> 16), sel >> 16);
+                q[i][2 * k + 0] = (int) prmt(prmt(t0, t1, c[k]),       prmt(t2, t3, c[k]),       sel);
+                q[i][2 * k + 1] = (int) prmt(prmt(t0, t1, c[k] >> 16), prmt(t2, t3, c[k] >> 16), sel >> 16);
             }
             const int ls = (int) (((sl[i] >> (4 * ib)) & 0xF) | (((sh[i] >> (2 * ib)) & 3) << 4));
             dsc[i] = d[i] * (float) (ls - 32);
@@ -547,7 +576,7 @@ static __device__ __forceinline__ void unit_iq4_xs(const unit_ptr (&wu)[R], cons
 // 2k, 2k + 1 of qh words 32 + 8h + j; its two halves have the int8 scales of bytes 2s, 2s + 1 of the scale words
 // 48..51. The offset -32 comes from the records' half sums, the dp4a chains' initial values.
 template <int NC, int R>
-static __device__ __forceinline__ void unit_q6_K(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+static KCOL_HD __forceinline__ void unit_q6_K(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                  float (&acc)[R][NC]) {
     float d[R];
 #pragma unroll
@@ -616,7 +645,7 @@ static __device__ __forceinline__ void unit_q6_K(const unit_ptr (&wu)[R], const 
 // with the high bit moved next to them, so that one mask, one shift and one LOP3 give each word; the records carry
 // d / f and -4 f times the half sums, so the dp4a chains start at the offset. The 16 6-bit scales decode as in ggml.
 template <int NC, int R>
-static __device__ __forceinline__ void unit_q3_K(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+static KCOL_HD __forceinline__ void unit_q3_K(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                  float (&acc)[R][NC]) {
     uint32_t hm[R][8];
     uint32_t sc[R][4];
@@ -685,7 +714,7 @@ static __device__ __forceinline__ void unit_q3_K(const unit_ptr (&wu)[R], const 
 }
 
 template <int T, int NC, int R>
-static __device__ __forceinline__ void unit_dot(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+static KCOL_HD __forceinline__ void unit_dot(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                 float (&acc)[R][NC]) {
     if constexpr (T == KQ8_0) {
         unit_q8_0<NC, R>(wu, act, cstride, acc);
