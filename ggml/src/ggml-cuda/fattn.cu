@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-pascal.cuh"
+#include "fattn-sparse-pascal.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-tile-pascal.cuh"
 #include "fattn-vec.cuh"
@@ -801,6 +802,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
     // one-token decode on compute 6.1, only with GGML_CUDA_FATTN_PASCAL=1 (off by default: slower on the P106)
     if (ggml_cuda_flash_attn_ext_pascal(ctx, dst)) {
+        return;
+    }
+    // only the cells the mask keeps (the n_kv_max hint) below Turing, with GGML_CUDA_FATTN_SPARSE_PASCAL (off by default)
+    if (ggml_cuda_flash_attn_ext_sparse_pascal(ctx, dst)) {
         return;
     }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
