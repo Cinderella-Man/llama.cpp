@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-// Quantized matrix-vector products of 1 to 4 tokens (Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, IQ4_XS, Q6_K) tuned for
+// Quantized matrix-vector products of 1 to 4 tokens (Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, IQ4_XS, Q6_K, Q2_0) tuned for
 // compute capability 6.1 (Pascal with dp4a). On small Pascal cards such as the 5-SM P106-090, mul_mat_vec_q runs out of
 // instruction issue and load throughput long before memory bandwidth; these kernels give each row a lane group sized to
 // the row width, let several rows share one load of the activations, load several weight blocks per lane with coalesced
@@ -15,7 +15,9 @@
 // ran the product; false leaves it to mul_mat_vec_q. GGML_CUDA_MMVQ_PASCAL: 0 off, 1 compute capability 6.1 only
 // (default), 2 any NVIDIA GPU (for testing). GGML_CUDA_MMVQ_PASCAL_STAGE_ACT=1: with 2 to 4 tokens, stage each token's
 // activations through shared memory too (same results, a different load pattern). GGML_CUDA_MMVQ_PASCAL_SKIP=q4_K,q6_K:
-// leave the listed weight types (ggml type names) to mul_mat_vec_q.
+// leave the listed weight types (ggml type names) to mul_mat_vec_q. GGML_CUDA_MMVQ_PASCAL_Q2_0=G,P,T: Q2_0's rows per lane
+// group with and without a fused gate (1 or 2) and its tile staging (0 off, 1 where segments can't be staged, 2 wherever
+// it fits), for measuring the alternatives.
 bool ggml_cuda_mmvq_pascal(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
         float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x, int64_t stride_col_y,
