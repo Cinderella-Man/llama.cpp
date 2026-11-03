@@ -38,7 +38,7 @@ static __global__ void gdn_conv_f32(
         const float norm_eps, const float norm_scale, const int K) {
     constexpr int n_hist = d_conv - 1;
 
-    __shared__ __align__(16) float ys[1024];
+    __shared__ __align__(16) float row[1024];
     __shared__ float sum;
 
     const int  ch     = blockIdx.x * group + threadIdx.x;
@@ -67,7 +67,7 @@ static __global__ void gdn_conv_f32(
     }
 
     const float * xs = x + (int64_t) seq * x_s2 + ch;
-    float *       ys = out + (int64_t) seq * n_tokens * channels + ch;
+    float *       yo = out + (int64_t) seq * n_tokens * channels + ch;
 
     for (int t = 0; t < n_tokens; ++t) {
         float y = 0.0f;
@@ -86,13 +86,13 @@ static __global__ void gdn_conv_f32(
         }
         if (norm) {
             // as rms_norm(y, eps/group) then scale(1/sqrt(group)): (scale * y) * scale_out
-            ys[threadIdx.x] = y;
-            const float scale = rsqrtf(gdn_row_sum_sq(ys, group, &sum) / group + norm_eps);
+            row[threadIdx.x] = y;
+            const float scale = rsqrtf(gdn_row_sum_sq(row, group, &sum) / group + norm_eps);
             y = scale * y;
             y *= norm_scale;
         }
         if (active) {
-            ys[(int64_t) t * channels] = y;
+            yo[(int64_t) t * channels] = y;
         }
     }
 
