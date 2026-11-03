@@ -355,6 +355,16 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // a draft model reads these tensors (llama_share_tensor bits) from share_src, a loaded model with the same
+        // vocabulary and width, instead of loading its own copies; architectures without support load their own
+        const struct llama_model * share_src;
+        uint32_t                   share_tensors;
+    };
+
+    enum llama_share_tensor {
+        LLAMA_SHARE_TENSOR_TOK_EMBD = 1u << 0, // token embeddings
+        LLAMA_SHARE_TENSOR_OUTPUT   = 1u << 1, // output head (and its scale)
     };
 
     struct llama_sampler_seq_config {

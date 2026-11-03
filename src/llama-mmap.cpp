@@ -49,6 +49,46 @@
 #    define llama_mmap_fseek fseeko
 #endif
 
+namespace {
+struct llama_direct_io_staging {
+    size_t size  = LLAMA_DIRECT_IO_BUFFER_SIZE;
+    size_t count = LLAMA_DIRECT_IO_BUFFER_COUNT;
+
+    llama_direct_io_staging() {
+        const char * s = getenv("LLAMA_DIO_STAGING");
+        if (s == nullptr || *s == '\0') {
+            return;
+        }
+        char * end = nullptr;
+        const unsigned long n = strtoul(s, &end, 10);
+        if (end != s && n > 0) {
+            count = std::min<unsigned long>(n, 64);
+        }
+        if (*end == 'x' || *end == 'X') {
+            const char * p = end + 1;
+            const unsigned long mib = strtoul(p, &end, 10);
+            if (end != p && mib > 0) {
+                size = std::min<unsigned long>(mib, 1024) * 1024 * 1024;
+            }
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_DIO_STAGING: %zu staging buffers of %zu MiB\n", __func__, count, size / 1024 / 1024);
+    }
+};
+
+const llama_direct_io_staging & llama_direct_io_staging_get() {
+    static const llama_direct_io_staging staging;
+    return staging;
+}
+}
+
+size_t llama_direct_io_buffer_size() {
+    return llama_direct_io_staging_get().size;
+}
+
+size_t llama_direct_io_buffer_count() {
+    return llama_direct_io_staging_get().count;
+}
+
 // TODO: consider moving to llama-impl.h if needed in more places
 #if defined(_WIN32)
 static std::string llama_format_win_err(DWORD err) {
@@ -324,7 +364,7 @@ struct llama_file::impl {
         size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
 
         // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
-        const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
+        const size_t buffer_size = std::min<size_t>(bytes_to_read, llama_direct_io_buffer_size());
 
         void * raw_buffer = nullptr;
         int ret = posix_memalign(&raw_buffer, alignment, buffer_size);

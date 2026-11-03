@@ -1646,6 +1646,84 @@ bool llama_context::get_screen_head() const {
     return cparams.screen_head;
 }
 
+bool llama_context::head_shortlist_init(uint32_t k_low, uint32_t m_cap) {
+    const ggml_tensor * output = model.output;
+    if (output == nullptr || output->buffer == nullptr) {
+        LLAMA_LOG_ERROR("%s: the model has no output head in a buffer\n", __func__);
+        return false;
+    }
+    if (model.output_s || model.output_in_s) {
+        LLAMA_LOG_ERROR("%s: the output head has scales, which the shortlist does not apply\n", __func__);
+        return false;
+    }
+
+    // the shortlist reads rows of the head where they are: plain host memory, or a device's own buffer type (not a
+    // repacked or split one, whose rows are laid out differently)
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+    if (ggml_backend_buffer_is_host(output->buffer)) {
+        buft = ggml_backend_cpu_buffer_type();
+    } else {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev == nullptr || buft != ggml_backend_dev_buffer_type(dev)) {
+            LLAMA_LOG_ERROR("%s: the output head is in a %s buffer, whose rows the shortlist can't address\n",
+                    __func__, ggml_backend_buft_name(buft));
+            return false;
+        }
+    }
+
+    auto sl = std::make_unique<llama_head_shortlist>();
+    if (!sl->init((uint32_t) output->ne[1], k_low, m_cap)) {
+        LLAMA_LOG_ERROR("%s: a shortlist of the ids below %u and %u more does not fit a vocabulary of %" PRId64 " "
+                "(1 <= ids < vocabulary, at most 65535 more)\n", __func__, k_low, m_cap, output->ne[1]);
+        return false;
+    }
+    if (!sl->alloc(buft)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the shortlist in %s\n", __func__, ggml_backend_buft_name(buft));
+        return false;
+    }
+
+    head_short = std::move(sl);
+
+    cparams.head_short    = head_short.get();
+    cparams.head_short_on = false;
+    cparams.head_short_n  = 0;
+
+    LLAMA_LOG_INFO("%s: draft head shortlist: the ids below %u and up to %u more, in %s (%.2f MiB)\n", __func__,
+            head_short->k_low, head_short->m_cap, ggml_backend_buft_name(buft),
+            ggml_backend_buffer_get_size(head_short->buf.get()) / 1024.0 / 1024.0);
+
+    return true;
+}
+
+uint32_t llama_context::head_shortlist_add(const llama_token * ids, size_t n) {
+    if (!head_short) {
+        return 0;
+    }
+
+    const uint32_t n_added = head_short->add(ids, n);
+    if (n_added > 0) {
+        // a graph in flight may still read the ids
+        synchronize();
+        head_short->sync();
+        cparams.head_short_n = head_short->n_extra();
+    }
+
+    return n_added;
+}
+
+bool llama_context::head_shortlist_contains(llama_token id) const {
+    return head_short && head_short->contains(id);
+}
+
+uint32_t llama_context::head_shortlist_size() const {
+    return head_short ? head_short->size() : 0;
+}
+
+void llama_context::set_head_shortlist(bool value) {
+    // a flip rebuilds the graph (llm_graph_params::allow_reuse)
+    cparams.head_short_on = value && head_short != nullptr;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -5202,6 +5280,26 @@ void llama_set_screen_head(llama_context * ctx, bool enable) {
 
 bool llama_get_screen_head(const llama_context * ctx) {
     return ctx->get_screen_head();
+}
+
+bool llama_head_shortlist_init(llama_context * ctx, uint32_t k_low, uint32_t m_cap) {
+    return ctx->head_shortlist_init(k_low, m_cap);
+}
+
+uint32_t llama_head_shortlist_add(llama_context * ctx, const llama_token * ids, size_t n_ids) {
+    return ctx->head_shortlist_add(ids, n_ids);
+}
+
+bool llama_head_shortlist_contains(const llama_context * ctx, llama_token id) {
+    return ctx->head_shortlist_contains(id);
+}
+
+uint32_t llama_head_shortlist_size(const llama_context * ctx) {
+    return ctx->head_shortlist_size();
+}
+
+void llama_set_head_shortlist(llama_context * ctx, bool value) {
+    ctx->set_head_shortlist(value);
 }
 
 uint32_t llama_model_screen_head_m(const llama_model * model) {

@@ -1,6 +1,7 @@
 #include "speculative.h"
 
 #include "common.h"
+#include "draft-shortlist.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
@@ -1563,6 +1564,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // the draft head over a shortlist of tokens (LLAMA_DRAFT_SHORTLIST, Q592) and when each sequence falls back to the
+    // full head
+    bool                                       short_on = false;
+    std::vector<common_draft_shortlist_policy> short_pol;
+    std::vector<llama_token>                   short_add; // scratch: the tokens of a batch to add to the list
+    uint64_t                                   short_n_rounds = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1637,9 +1645,84 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        short_init();
+    }
+
+    void short_init() {
+        const auto cfg = common_draft_shortlist_config::from_string(getenv("LLAMA_DRAFT_SHORTLIST"));
+        if (cfg.k_low == 0) {
+            return;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        if (!llama_head_shortlist_init(ctx_dft, cfg.k_low, cfg.m_cap)) {
+            SPC_WRN("%s", "no shortlist for this draft's head: it drafts with the full head\n");
+            return;
+        }
+
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+        // the special tokens: chat markup, reasoning and tool-call tags and the end of a turn are frequent in agentic
+        // text, and in Qwen's vocabularies they sit at the top of the id range
+        std::vector<llama_token> ids;
+        for (llama_token id = (llama_token) cfg.k_low; id < n_vocab; ++id) {
+            const auto attr = llama_vocab_get_attr(vocab, id);
+            if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) || llama_vocab_is_eog(vocab, id)) {
+                ids.push_back(id);
+            }
+        }
+        const uint32_t n_special = llama_head_shortlist_add(ctx_dft, ids.data(), ids.size());
+
+        // a frequency list: one token id per line, most frequent first (anything after the id is ignored)
+        uint32_t n_file = 0;
+        if (const char * path = getenv("LLAMA_DRAFT_SHORTLIST_FILE")) {
+            std::ifstream f(path);
+            if (!f) {
+                SPC_WRN("cannot read LLAMA_DRAFT_SHORTLIST_FILE '%s'\n", path);
+            }
+            ids.clear();
+            std::string line;
+            while (std::getline(f, line)) {
+                char * end = nullptr;
+                const long v = std::strtol(line.c_str(), &end, 10);
+                if (end != line.c_str()) {
+                    ids.push_back((llama_token) v);
+                }
+            }
+            n_file = llama_head_shortlist_add(ctx_dft, ids.data(), ids.size());
+        }
+
+        short_on = true;
+        short_pol.assign(n_seq, {});
+        for (auto & p : short_pol) {
+            p.rounds = cfg.rounds;
+        }
+
+        SPC_INF("draft head shortlist: %u ids (below %u, %u special, %u from the file; the context's tokens join up to %u "
+                "more), full head for %d drafts after a target token outside it\n",
+                llama_head_shortlist_size(ctx_dft), cfg.k_low, n_special, n_file, cfg.m_cap, cfg.rounds);
+    }
+
+    void short_report() const {
+        uint64_t n_short = 0;
+        uint64_t n_full  = 0;
+        uint64_t n_miss  = 0;
+        for (const auto & p : short_pol) {
+            n_short += p.n_short;
+            n_full  += p.n_full;
+            n_miss  += p.n_miss;
+        }
+        SPC_INF("draft head shortlist: %" PRIu64 " drafts with it, %" PRIu64 " with the full head, %" PRIu64 " target "
+                "tokens outside it; %u ids in it\n", n_short, n_full, n_miss, llama_head_shortlist_size(this->params.ctx_dft));
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (short_on) {
+            short_report();
+        }
+
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1704,6 +1787,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // the context's tokens (prompt and generated) join the shortlist
+        if (short_on) {
+            short_add.clear();
+            for (int k = 0; k < n_tokens; ++k) {
+                const llama_token id = batch_in.tokens[k].id;
+                if (id != LLAMA_TOKEN_NULL && !llama_head_shortlist_contains(ctx_dft, id)) {
+                    short_add.push_back(id);
+                }
+            }
+            if (!short_add.empty()) {
+                llama_head_shortlist_add(ctx_dft, short_add.data(), short_add.size());
+            }
+        }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1830,6 +1927,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // the shortlisted head, unless a drafting sequence falls back: its target token (id_last) was outside the list
+        if (short_on && n_drafting > 0) {
+            bool use_short = true;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id]) {
+                    continue;
+                }
+                const llama_token id_last = dparams[seq_id].id_last;
+                use_short &= short_pol[seq_id].next(llama_head_shortlist_contains(ctx_dft, id_last));
+                llama_head_shortlist_add(ctx_dft, &id_last, 1);
+            }
+            llama_set_head_shortlist(ctx_dft, use_short);
+
+            if (++short_n_rounds % 1000 == 0) {
+                short_report();
+            }
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1939,6 +2054,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        if (short_on) {
+            llama_set_head_shortlist(ctx_dft, false); // the catch-up decodes produce no logits
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2754,6 +2873,29 @@ common_params common_base_params_to_speculative(const common_params & params) {
     return result;
 }
 
+// LLAMA_DRAFT_SHARE: a comma-separated list of "embd" (token embeddings), "head" (output head) or "all"
+static uint32_t common_draft_share_from_env() {
+    const char * s = getenv("LLAMA_DRAFT_SHARE");
+    if (s == nullptr) {
+        return 0;
+    }
+    uint32_t mask = 0;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (item == "embd") {
+            mask |= LLAMA_SHARE_TENSOR_TOK_EMBD;
+        } else if (item == "head") {
+            mask |= LLAMA_SHARE_TENSOR_OUTPUT;
+        } else if (item == "all" || item == "1") {
+            mask |= LLAMA_SHARE_TENSOR_TOK_EMBD | LLAMA_SHARE_TENSOR_OUTPUT;
+        } else if (!item.empty() && item != "0") {
+            LOG_WRN("%s: LLAMA_DRAFT_SHARE: unknown item '%s' (embd, head, all)\n", __func__, item.c_str());
+        }
+    }
+    return mask;
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -2792,6 +2934,16 @@ common_speculative_init_result::common_speculative_init_result(
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        // LLAMA_DRAFT_SHARE=embd,head: the draft reads the target's token embeddings and/or output head instead of
+        // loading its own copies (Q564; the architecture has to support it, qwen4exp does)
+        mparams.share_tensors = common_draft_share_from_env();
+        mparams.share_src     = mparams.share_tensors ? model_tgt : nullptr;
+        if (mparams.share_tensors) {
+            LOG_INF("%s: the draft reads the target's%s%s\n", __func__,
+                    mparams.share_tensors & LLAMA_SHARE_TENSOR_TOK_EMBD ? " token embeddings" : "",
+                    mparams.share_tensors & LLAMA_SHARE_TENSOR_OUTPUT   ? " output head"      : "");
+        }
 
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {

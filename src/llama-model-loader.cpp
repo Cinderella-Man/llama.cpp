@@ -1607,7 +1607,8 @@ bool llama_model_loader::load_all_data(
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
-    constexpr size_t n_buffers = 4;
+    // LLAMA_DIO_STAGING sets their number and, with direct I/O, their size (llama_direct_io_buffer_*)
+    const size_t n_buffers = llama_direct_io_buffer_count();
 
     size_t alignment = 1;
     for (const auto & file : files) {
@@ -1615,7 +1616,7 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    const size_t buffer_size = alignment != 1 ? llama_direct_io_buffer_size() + 2 * alignment : 1 * 1024 * 1024;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
@@ -1696,10 +1697,10 @@ bool llama_model_loader::load_all_data(
     }(__func__);
 
     if (upload_backend) {
-        LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
+        LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s, %zu x %zu KiB pinned staging\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs[0])),
-            ggml_backend_name(upload_backend));
+            ggml_backend_name(upload_backend), n_buffers, buffer_size / 1024);
     }
 
     std::vector<ggml_tensor *> tensors;

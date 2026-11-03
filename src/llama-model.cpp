@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1955,12 +1956,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+        // a shared output head comes with the source model's scales, not this file's
+        const bool output_shared = ml.share_used & LLAMA_SHARE_TENSOR_OUTPUT;
         // screened output head (optional): same shape as the output tensor, usually in a cheaper type
-        if (output && !output_screen) {
+        if (output && !output_screen && !output_shared) {
             output_screen = create_tensor(tn(LLM_TENSOR_OUTPUT_SCREEN, "weight"), {output->ne[0], output->ne[1]}, TENSOR_NOT_REQUIRED);
         }
         // output scales
-        if (output) {
+        if (output && !output_shared) {
             // weight scale
             if (!output_s && (ml.get_weight(tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) ||
                               gguf_find_tensor(ml.metadata, tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) >= 0)) {
@@ -1975,6 +1978,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     ml.done_getting_tensors();
+
+    if (ml.share_src && ml.share_tensors) {
+        if (ml.share_tensors & ~ml.share_used) {
+            LLAMA_LOG_WARN("%s: %s does not read shared tensors (mask 0x%x asked, 0x%x used): it loads its own copies\n",
+                    __func__, arch_name().c_str(), ml.share_tensors, ml.share_used);
+        }
+        if (ml.share_used) {
+            LLAMA_LOG_INFO("%s: reading from the source model:%s%s\n", __func__,
+                    ml.share_used & LLAMA_SHARE_TENSOR_TOK_EMBD ? " token embeddings" : "",
+                    ml.share_used & LLAMA_SHARE_TENSOR_OUTPUT   ? " output head"      : "");
+        }
+    }
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
@@ -3518,6 +3533,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.share_src                   =*/ nullptr,
+        /*.share_tensors               =*/ 0,
     };
 
     return result;
@@ -4071,6 +4088,59 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
     }
 
     return { trunk, mtp };
+}
+
+// the source model's tensor for share bit `bit`, or nullptr when it isn't asked for; a tensor that can't stand in for
+// this file's [n_embd, n_vocab] one is an error, since the caller asked for it
+static ggml_tensor * llama_share_source(llama_model_loader & ml, const llama_vocab & vocab, uint32_t bit,
+        ggml_tensor * src, int64_t n_embd, int64_t n_vocab, const char * what) {
+    if (ml.share_src == nullptr || !(ml.share_tensors & bit)) {
+        return nullptr;
+    }
+    if (src == nullptr || src->ne[0] != n_embd || src->ne[1] != n_vocab) {
+        throw std::runtime_error(format("cannot read the %s from the source model: it has %s, this model needs [%" PRId64 ", %" PRId64 "]",
+                what, src ? format("[%" PRId64 ", %" PRId64 "]", src->ne[0], src->ne[1]).c_str() : "none", n_embd, n_vocab));
+    }
+    // same size is not same vocabulary: compare the texts of a spread of tokens
+    const llama_vocab & vocab_src = ml.share_src->vocab;
+    for (int64_t i = 0; i < 16; ++i) {
+        const llama_token id = (llama_token) (i * (n_vocab - 1) / 15);
+        if (strcmp(vocab.token_get_text(id), vocab_src.token_get_text(id)) != 0) {
+            throw std::runtime_error(format("cannot read the %s from the source model: token %d differs ('%s' against '%s')",
+                    what, id, vocab.token_get_text(id), vocab_src.token_get_text(id)));
+        }
+    }
+    ml.share_used |= bit;
+    return src;
+}
+
+ggml_tensor * llama_model_base::create_tok_embd_shared(llama_model_loader & ml, int flags) {
+    const int64_t n_embd  = hparams.n_embd;
+    const int64_t n_vocab = vocab.n_tokens();
+
+    ggml_tensor * src = llama_share_source(ml, vocab, LLAMA_SHARE_TENSOR_TOK_EMBD,
+            ml.share_src ? ml.share_src->tok_embd : nullptr, n_embd, n_vocab, "token embeddings");
+    if (src) {
+        // counted as created, and its bytes left out of the load
+        create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+        return src;
+    }
+    return create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, flags);
+}
+
+ggml_tensor * llama_model_base::create_output_shared(llama_model_loader & ml, int flags) {
+    const int64_t n_embd  = hparams.n_embd;
+    const int64_t n_vocab = vocab.n_tokens();
+
+    ggml_tensor * src = llama_share_source(ml, vocab, LLAMA_SHARE_TENSOR_OUTPUT,
+            ml.share_src ? ml.share_src->output : nullptr, n_embd, n_vocab, "output head");
+    if (src) {
+        create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+        output_s    = ml.share_src->output_s;
+        output_in_s = ml.share_src->output_in_s;
+        return src;
+    }
+    return create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, flags);
 }
 
 void llama_model_base::load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first) {

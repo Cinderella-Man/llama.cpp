@@ -976,6 +976,8 @@ struct llm_graph_params {
             layer_inp_src == other.layer_inp_src &&
             cparams.screen_head             == other.cparams.screen_head             &&
             cparams.screen_head_m           == other.cparams.screen_head_m           &&
+            cparams.head_short_on           == other.cparams.head_short_on           &&
+            cparams.head_short_n            == other.cparams.head_short_n            &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

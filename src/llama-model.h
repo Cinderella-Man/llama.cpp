@@ -1040,6 +1040,11 @@ struct llama_model_base : public llama_model {
     };
     nextn_flags_t nextn_flags(llama_model_loader & ml, llm_tensor trunk_probe = LLM_TENSOR_ATTN_NORM) const;
 
+    // helper: the token embeddings and the output head [n_embd, n_vocab], read from llama_model_params::share_src when
+    // its share_tensors asks for them (the file's own copy is then skipped), else created from this file with flags
+    ggml_tensor * create_tok_embd_shared(llama_model_loader & ml, int flags);
+    ggml_tensor * create_output_shared  (llama_model_loader & ml, int flags);
+
     // helper: read the prism.hadamard metadata and record which weights are folded
     void load_hparams_hadamard(llama_model_loader & ml);
 

@@ -179,6 +179,16 @@ LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, l
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// A shortlist for a draft context's output head (Q592): while it is on, a decode with one output computes the logits
+// of the token ids below k_low and of up to m_cap further ids only, and gives every other token -INFINITY. The
+// further ids are added with llama_head_shortlist_add (ids already in the list and ids past the room are skipped).
+// Supported by the qwen4exp MTP draft. Returns false when the head can't take one (scaled, repacked or split).
+LLAMA_API bool     llama_head_shortlist_init    (struct llama_context * ctx, uint32_t k_low, uint32_t m_cap);
+LLAMA_API uint32_t llama_head_shortlist_add     (struct llama_context * ctx, const llama_token * ids, size_t n_ids);
+LLAMA_API bool     llama_head_shortlist_contains(const struct llama_context * ctx, llama_token id);
+LLAMA_API uint32_t llama_head_shortlist_size    (const struct llama_context * ctx); // ids in the list, 0 without one
+LLAMA_API void     llama_set_head_shortlist     (struct llama_context * ctx, bool value);
+
 //
 // model/context data extraction
 //

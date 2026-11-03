@@ -5,6 +5,7 @@
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
+#include "llama-head-shortlist.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
@@ -133,6 +134,13 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_screen_head(bool value);
     void set_warmup(bool value);
+
+    // a shortlist for this (draft) context's output head (llama_head_shortlist_*)
+    bool     head_shortlist_init(uint32_t k_low, uint32_t m_cap);
+    uint32_t head_shortlist_add(const llama_token * ids, size_t n);
+    bool     head_shortlist_contains(llama_token id) const;
+    uint32_t head_shortlist_size() const;
+    void     set_head_shortlist(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -506,6 +514,9 @@ private:
 
     // the staircase drafter fed by the pipe slots' taps and llama_decode's prompt captures (llama_pipe_draft_*)
     std::unique_ptr<llama_pipe_drafter> pipe_drafter;
+
+    // the output head's shortlist (head_shortlist_init), referenced by cparams.head_short
+    std::unique_ptr<llama_head_shortlist> head_short;
 
     // how the slots upload their host inputs (ggml_backend_sched_set_input_upload, LLAMA_PIPE_UPLOAD)
     int pipe_upload = 2;

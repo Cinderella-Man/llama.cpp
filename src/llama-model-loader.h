@@ -82,6 +82,12 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // llama_model_params::share_src and share_tensors; an architecture that reads a shared tensor sets its bit in
+    // share_used (and skips its own copy)
+    const llama_model * share_src     = nullptr;
+    uint32_t            share_tensors = 0;
+    uint32_t            share_used    = 0;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {
