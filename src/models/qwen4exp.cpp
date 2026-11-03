@@ -1346,10 +1346,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_input->nb[1], conv_input->nb[2],
                 ggml_row_size(conv_input->type, s_idx));
 
+        // without rollback slots the tail goes to the state group this ubatch writes: its pipe slot's, 0 for
+        // llama_decode (llama_memory_recurrent::n_grp)
+        const int64_t grp = cparams.n_rs_seq == 0 ? (int64_t) mctx_cur->get_grp() : slot;
+
         ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                 state_cols * channels, n_seqs,
                 conv_states_all->nb[1],
-                (slot * mem_size + kv_head) * row_size);
+                (grp * mem_size + kv_head) * row_size);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
     }
