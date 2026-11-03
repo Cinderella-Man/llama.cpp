@@ -71,6 +71,21 @@ struct llama_cparams {
     bool                         head_short_on = false;
     uint32_t                     head_short_n  = 0;
 
+    // fewer routed experts on confident tokens (Q618, llama_set_moe_tail, LLAMA_MOE_TAIL): after the router's top-k a
+    // slot's weight becomes 0 when the shares of the slots ranked above it already sum to moe_tail_p, or when its own
+    // share is below moe_tail_w (shares: the slot's weight over the token's sum of its k weights); moe_tail_renorm
+    // rescales the kept weights to that sum; moe_tail_hist makes the graph output the experts kept per token and layer
+    bool  moe_tail        = false;
+    float moe_tail_p      = 1.0f;
+    float moe_tail_w      = 0.0f;
+    bool  moe_tail_renorm = false;
+    bool  moe_tail_hist   = false;
+
+    // the main model's head over the shortlist head_short with an exact bound on the other logits (Q619,
+    // llama_head_bound_*): while head_bound_on, a decode with one output computes the shortlist's logits and keeps
+    // the head's input row for the bound and the full-head fallback
+    bool head_bound_on = false;
+
     size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

@@ -978,6 +978,12 @@ struct llm_graph_params {
             cparams.screen_head_m           == other.cparams.screen_head_m           &&
             cparams.head_short_on           == other.cparams.head_short_on           &&
             cparams.head_short_n            == other.cparams.head_short_n            &&
+            cparams.moe_tail                == other.cparams.moe_tail                &&
+            cparams.moe_tail_p              == other.cparams.moe_tail_p              &&
+            cparams.moe_tail_w              == other.cparams.moe_tail_w              &&
+            cparams.moe_tail_renorm         == other.cparams.moe_tail_renorm         &&
+            cparams.moe_tail_hist           == other.cparams.moe_tail_hist           &&
+            cparams.head_bound_on           == other.cparams.head_bound_on           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1045,6 +1051,9 @@ public:
     ggml_tensor * t_embd_all    = nullptr; // [n_embd, n_tokens] final hidden state of every position (cparams.pipe_embd_all)
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    std::vector<ggml_tensor *> t_moe_kept; // F32 [1, n_tokens] per MoE layer: the routed experts kept (cparams.moe_tail_hist)
+    ggml_tensor * t_head_h = nullptr;      // [n_embd, 1] the input row of a shortlist head (cparams.head_bound_on)
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1312,6 +1321,14 @@ struct llm_graph_context {
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
+                     int   il) const;
+
+    // the router's weights [1, n_expert_used, n_tokens] (slots in router order) with the low-weight tail of each token
+    // set to 0 (cparams.moe_tail_*)
+    ggml_tensor * build_moe_tail(
+             ggml_tensor * weights,
+                 int64_t   n_expert_used,
+                 int64_t   n_tokens,
                      int   il) const;
 
     //

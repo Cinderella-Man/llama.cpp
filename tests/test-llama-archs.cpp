@@ -306,6 +306,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
     }
 
+    // LLAMA_TEST_ARCHS_N_VOCAB=<n>: a larger vocabulary, for the tests of shortlisted output heads
+    if (const char * e = getenv("LLAMA_TEST_ARCHS_N_VOCAB")) {
+        n_vocab = (uint32_t) atoi(e);
+    }
+
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
@@ -669,8 +674,18 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : arch == LLM_ARCH_CLOVER_MOE ? 4 : 2));
-        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
+        uint32_t n_expert      = host_experts_test(arch) ? 64 : arch == LLM_ARCH_CLOVER_MOE ? 4 : 2;
+        uint32_t n_expert_used = 2;
+        // LLAMA_TEST_ARCHS_N_EXPERT=<n>,<used>: more routed experts, for the tests of per-token expert cuts
+        if (const char * e = getenv("LLAMA_TEST_ARCHS_N_EXPERT")) {
+            char * end = nullptr;
+            n_expert = (uint32_t) strtoul(e, &end, 10);
+            if (end && *end == ',') {
+                n_expert_used = (uint32_t) strtoul(end + 1, nullptr, 10);
+            }
+        }
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               n_expert);
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          n_expert_used);
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
 
         uint32_t gating_func = 2;

@@ -7,6 +7,8 @@
 
 #include "ggml.h"
 
+#include "../src/llama-ext.h" // staging API: llama_head_bound_ith / llama_head_bound_full (Q619)
+
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -664,6 +666,48 @@ static bool common_sampler_test_reject(struct common_sampler * gsmpl) {
     return every > 0 && ++gsmpl->n_checked % every == 0;
 }
 
+// a row of the shortlist head's logits (Q619): it stands only if its bound leaves out every token this sampling could
+// pick from cur_p as it is now (after the reasoning budget and, when it comes first, the grammar, both of which only
+// remove candidates); otherwise the full head's logits replace it. Returns whether they did: set cur_p again.
+static bool common_sampler_head_bound(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    const float bound = llama_head_bound_ith(ctx, idx);
+    if (bound == INFINITY) {
+        return false; // the full head's row
+    }
+
+    // a forced token does not depend on the logits
+    if (common_reasoning_budget_get_forced(gsmpl->rbudget) != LLAMA_TOKEN_NULL) {
+        return false;
+    }
+
+    common_head_bound_need need;
+    bool ok = !std::isnan(bound) && common_sampling_head_bound_need(gsmpl->params, need);
+    if (ok) {
+        // the model's suppressed tokens are a -INFINITY logit bias: they may push down as many of the highest
+        int32_t n_suppress = 0;
+        llama_vocab_get_suppress_tokens(llama_model_get_vocab(llama_get_model(ctx)), &n_suppress);
+
+        const int32_t k   = need.k + n_suppress;
+        const float   thr = bound/need.temp;
+
+        int32_t n_above = 0;
+        for (size_t i = 0; i < gsmpl->cur_p.size && n_above < k; ++i) {
+            n_above += gsmpl->cur_p.data[i].logit/need.temp + need.log_p > thr;
+        }
+        ok = n_above >= k;
+    }
+
+    if (ok) {
+        gsmpl->stats.n_head_short++;
+        return false;
+    }
+    if (!llama_head_bound_full(ctx, idx)) {
+        GGML_ABORT("the full head failed for a shortlist row");
+    }
+    gsmpl->stats.n_head_full++;
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -749,6 +793,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
+    // a shortlist head's row the bound can't keep: the same steps on the full head's row
+    if (common_sampler_head_bound(gsmpl, ctx, idx)) {
+        gsmpl->set_logits(ctx, idx);
+
+        llama_sampler_apply(rbudget, &cur_p);
+
+        if (grammar_first && grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
+    }
+
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
@@ -772,6 +827,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     if (grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr,  &cur_p);
+    }
+
+    // the grammar may have masked the shortlist's highest tokens
+    if (common_sampler_head_bound(gsmpl, ctx, idx)) {
+        gsmpl->set_logits(ctx, idx);
+
+        llama_sampler_apply(rbudget,  &cur_p);
+
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr,  &cur_p);
+        }
     }
 
     llama_sampler_apply(chain, &cur_p);

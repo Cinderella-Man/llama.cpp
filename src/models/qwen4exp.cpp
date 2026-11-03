@@ -574,7 +574,21 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // the main model's head over a shortlist, with the exact bound of llama_head_bound for the other logits: one
+    // output row of a plain head; the input row is kept for the bound and the full-head fallback
+    if (cparams.head_bound_on && cparams.head_short && n_outputs == 1 && cur->ne[1] == 1 && !model.output_s &&
+            !model.output_in_s && (!loras || loras->empty())) {
+        ggml_tensor * h = build_hadamard_input(model.output, cur);
+        if (!ggml_is_contiguous(h)) {
+            h = ggml_cont(ctx0, h);
+        }
+        ggml_set_output(h);
+        res->t_head_h = h;
+
+        cur = llama_head_shortlist_logits(ctx0, *cparams.head_short, model.output, h);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

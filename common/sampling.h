@@ -112,6 +112,8 @@ struct common_sampler_stats {
     int32_t n_rejected        = 0; // ... whose first draw the grammar rejected: resampled from the masked full row
     int32_t n_rejected_device = 0; // ... of these, first drawn by a backend sampler (the row fetched from the device)
     int32_t n_forced          = 0; // ... forced by the reasoning budget
+    int32_t n_head_short      = 0; // ... from a shortlist head's row that the bound let stand (llama_head_bound_ith)
+    int32_t n_head_full       = 0; // ... from such a row replaced by the full head's (llama_head_bound_full)
 };
 
 const common_sampler_stats & common_sampler_get_stats(const struct common_sampler * gsmpl);
