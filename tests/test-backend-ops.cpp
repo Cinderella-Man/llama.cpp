@@ -12284,6 +12284,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             { GGML_TYPE_Q5_K,    4096,  2560,    0 }, { GGML_TYPE_Q5_K,     333,  1280,    0 },
             { GGML_TYPE_Q6_K,    4096,  2560,    0 }, { GGML_TYPE_Q6_K,     333,  1024,    0 },
             { GGML_TYPE_Q6_K,     256,  2560, 2816 },
+            // the shared expert's other down types, 640 -> 2560 (Q630); 192-wide rows of 3 lane units (one lane per
+            // row), rows that are views of wider rows, and rows of an odd number of blocks or 2-byte-aligned views
+            // (left to the other kernels)
+            { GGML_TYPE_Q4_0,   2560,   640,    0 }, { GGML_TYPE_Q4_0,     333,  1280,    0 },
+            { GGML_TYPE_Q4_0,    129,   192,    0 }, { GGML_TYPE_Q4_0,     256,   640,  768 },
+            { GGML_TYPE_Q4_0,     64,   672,    0 }, { GGML_TYPE_Q4_0,     256,   640,  672 },
+            { GGML_TYPE_Q5_0,   2560,   640,    0 }, { GGML_TYPE_Q5_0,     333,  1280,    0 },
+            { GGML_TYPE_Q5_0,    129,   192,    0 }, { GGML_TYPE_Q5_0,     256,   640,  768 },
+            { GGML_TYPE_Q5_0,     64,   672,    0 },
+            { GGML_TYPE_IQ4_NL, 2560,   640,    0 }, { GGML_TYPE_IQ4_NL,   640,  2560,    0 },
+            { GGML_TYPE_IQ4_NL,  333,  1280,    0 }, { GGML_TYPE_IQ4_NL,   129,   192,    0 },
+            { GGML_TYPE_IQ4_NL,  256,   640,  768 }, { GGML_TYPE_IQ4_NL,    64,   672,    0 },
         };
         for (int64_t n = 1; n <= 8; ++n) {
             for (const kcol_case & c : kcol_cases) {
@@ -12293,7 +12305,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // activations whose blocks sum past FP16's range
         for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q2_0, GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K,
-                                GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+                                GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL }) {
             for (int64_t n : { 1, 4, 8 }) {
                 test_cases.emplace_back(new test_mul_mat_large_act(type, 2560, n, 2560));
             }
@@ -13586,14 +13598,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3.8-Flash-Next's dense quantized products at 1 to 8 tokens (a speculative-decoding verify): the retyped
     // hyper-connection projections (Q8_0), attn_qkv, attn_gate and attn_q (Q3_K, IQ4_XS), ssm_out (IQ4_XS, Q4_K), the
-    // shared expert's down projection (Q2_0) and the output layer (Q5_K, the draft's Q6_K); compare the k-column kernels
-    // (mmvq-pascal-kcol.cu) on and off with GGML_CUDA_MMVQ_PASCAL_KCOL
+    // shared expert's down projection (Q2_0, Q4_0, Q5_0, IQ4_NL) and the output layer (Q5_K, the draft's Q6_K); compare
+    // the k-column kernels (mmvq-pascal-kcol.cu) on and off with GGML_CUDA_MMVQ_PASCAL_KCOL
     for (int64_t n = 1; n <= 8; ++n) {
         for (auto [type, m, k] : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
                 { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 320, 10240 },
                 { GGML_TYPE_Q3_K, 10240, 2560 }, { GGML_TYPE_Q3_K, 6144, 2560 }, { GGML_TYPE_Q3_K, 12288, 2560 },
                 { GGML_TYPE_IQ4_XS, 10240, 2560 }, { GGML_TYPE_IQ4_XS, 12288, 2560 }, { GGML_TYPE_IQ4_XS, 2560, 6144 },
                 { GGML_TYPE_Q4_K, 2560, 6144 }, { GGML_TYPE_Q2_0, 2560, 640 },
+                { GGML_TYPE_Q4_0, 2560, 640 }, { GGML_TYPE_Q5_0, 2560, 640 }, { GGML_TYPE_IQ4_NL, 2560, 640 },
                 { GGML_TYPE_Q5_K, 248320, 2560 }, { GGML_TYPE_Q6_K, 248320, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
         }
