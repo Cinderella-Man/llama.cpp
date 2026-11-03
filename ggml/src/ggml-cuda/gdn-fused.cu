@@ -4,25 +4,28 @@
 // ---------------------------------------------------------------------------------------------------------------------
 // GGML_OP_GDN_CONV: one block per group of channels (a q or k head, or as many v channels) and sequence, one thread
 // per channel. Each thread keeps its channel's window in registers: the history from the sequence's cache row, then
-// one x value per token. The block sums the squares of a normalized group for each token.
+// one x value per token. For a normalized group the block sums the squares of each token's row the way rms_norm's
+// vector path does for a row of up to 128 floats (a float4 per lane, then one warp sum), so a q or k head of 128
+// comes out bit for bit as RMS_NORM+SCALE makes it.
 // ---------------------------------------------------------------------------------------------------------------------
 
-// every thread gets the sum; red holds one value per warp and is reused across calls
-static __device__ __forceinline__ float gdn_block_sum(float v, float * red) {
-    v = warp_reduce_sum(v);
-    const int n_warps = blockDim.x / WARP_SIZE;
-    if (n_warps == 1) {
-        return v;
+// the sum of squares of the group's row in ys, as rms_norm_f32<32, 1, true>; every thread gets it
+static __device__ __forceinline__ float gdn_row_sum_sq(const float * ys, const int group, float * sum) {
+    __syncthreads(); // ys written
+    if (threadIdx.x < WARP_SIZE) {
+        const float4 * y4  = (const float4 *) ys;
+        float          tmp = 0.0f;
+        for (int i = threadIdx.x; i < group / 4; i += WARP_SIZE) {
+            const float4 v = y4[i];
+            tmp += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        }
+        tmp = warp_reduce_sum(tmp);
+        if (threadIdx.x == 0) {
+            *sum = tmp;
+        }
     }
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int warp = threadIdx.x / WARP_SIZE;
-    __syncthreads(); // the previous call's reads of red are done
-    if (lane == 0) {
-        red[warp] = v;
-    }
-    __syncthreads();
-    v = lane < n_warps ? red[lane] : 0.0f;
-    return warp_reduce_sum(v);
+    __syncthreads(); // sum written; ys and sum are rewritten only after the next call's first barrier
+    return *sum;
 }
 
 template <int d_conv>
@@ -35,7 +38,8 @@ static __global__ void gdn_conv_f32(
         const float norm_eps, const float norm_scale, const int K) {
     constexpr int n_hist = d_conv - 1;
 
-    __shared__ float red[32];
+    __shared__ __align__(16) float ys[1024];
+    __shared__ float sum;
 
     const int  ch     = blockIdx.x * group + threadIdx.x;
     const int  seq    = blockIdx.y;
@@ -81,11 +85,11 @@ static __global__ void gdn_conv_f32(
             }
         }
         if (norm) {
-            // as rms_norm(y, eps/group) then scale(1/sqrt(group))
-            const float sum   = gdn_block_sum(y * y, red);
-            const float mean  = sum / group;
-            const float scale = rsqrtf(mean + norm_eps);
-            y = norm_scale * (scale * y);
+            // as rms_norm(y, eps/group) then scale(1/sqrt(group)): (scale * y) * scale_out
+            ys[threadIdx.x] = y;
+            const float scale = rsqrtf(gdn_row_sum_sq(ys, group, &sum) / group + norm_eps);
+            y = scale * y;
+            y *= norm_scale;
         }
         if (active) {
             ys[(int64_t) t * channels] = y;
@@ -192,8 +196,9 @@ void ggml_cuda_op_gdn_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, c
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// gated rms norm: one warp per row; the same products, in the same order, as the RMS_NORM+MUL fusion, the SIGMOID
-// and the MUL it replaces
+// gated rms norm: one warp per row of up to 128 floats, a float4 per lane; the same sums and products, in the same
+// order, as the RMS_NORM+MUL fusion's vector path (rms_norm_f32<32, 1, true>), the SIGMOID and the MUL it replaces,
+// so the result is bit for bit theirs
 // ---------------------------------------------------------------------------------------------------------------------
 
 static __global__ void gated_rms_norm_f32(
@@ -212,24 +217,36 @@ static __global__ void gated_rms_norm_f32(
     const int64_t i2 = (row / ne1) % ne2;
     const int64_t i3 = row / (ne1 * ne2);
 
-    const float * xr = x + i1 * x_s1 + i2 * x_s2 + i3 * x_s3;
-    const float * zr = z + i1 * z_s1 + i2 * z_s2 + i3 * z_s3;
-    float *       dr = dst + row * ncols;
+    const float4 * x4 = (const float4 *) (x + i1 * x_s1 + i2 * x_s2 + i3 * x_s3);
+    const float4 * w4 = (const float4 *) w;
+    const float *  zr = z + i1 * z_s1 + i2 * z_s2 + i3 * z_s3;
+    float *        dr = dst + row * ncols;
+
+    const int ncols4 = ncols / 4;
 
     ggml_cuda_pdl_sync();
-    float tmp = 0.0f;
-    for (int col = lane; col < ncols; col += WARP_SIZE) {
-        const float xi = xr[col];
-        tmp += xi * xi;
+    float4 xs  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  tmp = 0.0f;
+    if (lane < ncols4) {
+        xs = x4[lane];
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
     }
     tmp = warp_reduce_sum(tmp);
+    const float scale = rsqrtf(tmp / ncols + eps);
 
-    const float mean  = tmp / ncols;
-    const float scale = rsqrtf(mean + eps);
-
-    for (int col = lane; col < ncols; col += WARP_SIZE) {
-        const float gate = 1.0f / (1.0f + expf(-zr[col]));
-        dr[col] = (scale * xr[col] * w[col]) * gate;
+    if (lane < ncols4) {
+        float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+        const float4 m = w4[lane];
+        r.x *= m.x;
+        r.y *= m.y;
+        r.z *= m.z;
+        r.w *= m.w;
+        const float * zc = zr + 4*lane;
+        float *       dc = dr + 4*lane;
+        dc[0] = r.x * (1.0f / (1.0f + expf(-zc[0])));
+        dc[1] = r.y * (1.0f / (1.0f + expf(-zc[1])));
+        dc[2] = r.z * (1.0f / (1.0f + expf(-zc[2])));
+        dc[3] = r.w * (1.0f / (1.0f + expf(-zc[3])));
     }
 }
 
@@ -242,11 +259,16 @@ bool ggml_cuda_gated_rms_norm_supported(const ggml_tensor * rms_norm, const ggml
     auto rows_f32 = [](const ggml_tensor * t) {
         return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float);
     };
+    // the vector path's float4 loads: 16-byte rows and bases (no data yet in graph_optimize: checked again at compute)
+    auto rows_16 = [](const ggml_tensor * t) {
+        return ((uintptr_t) t->data & 15) == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
+    };
 
     return rows_f32(x) && rows_f32(w) && rows_f32(z) && rows_f32(mul_gate) &&
            ggml_is_contiguous(w) && ggml_nrows(w) == 1 && w->ne[0] == x->ne[0] &&
            ggml_are_same_shape(x, z) && ggml_are_same_shape(x, mul_gate) && ggml_is_contiguous(mul_gate) &&
-           x->ne[0] <= 0x7fffffff;
+           x->ne[0] % 4 == 0 && x->ne[0] <= 4 * WARP_SIZE &&
+           rows_16(x) && rows_16(w) && rows_16(mul_gate);
 }
 
 void ggml_cuda_op_gated_rms_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
