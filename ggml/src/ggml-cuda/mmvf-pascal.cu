@@ -11,13 +11,15 @@
 // How the launch shape is chosen (G lanes per row group, R rows per group; 4 warps per block):
 //   - G from the row width: the smallest of 8, 32 and 128 that leaves each lane at most 16 chunks of 8 weights
 //     (K = 320: 8 lanes, 5 chunks each; K = 2,560: 32 lanes; K = 10,240: 128 lanes, 10 chunks each).
-//   - R as large as the token count allows (4 for 1 and 2 tokens, 2 for 3 and 4), lowered while the grid has fewer
-//     than 4 blocks per SM; if one row per group still leaves too few blocks, G grows so that a few rows are spread
-//     over more lanes (K = 2,560 with 48 rows: 128 lanes).
+//   - R rows per group: 4 for 1 to 4 tokens, 8 for 5 to 8 (each activation load then serves 8 rows, which keeps the
+//     activation loads at most 2 per weight load), lowered while the grid has fewer than 4 blocks per SM; if one row
+//     per group still leaves too few blocks, G grows so that a few rows are spread over more lanes (K = 2,560 with
+//     48 rows: 128 lanes). At 2 tokens and R = 4 a P106 runs the 320- and 10,240-wide projections as fast as at one
+//     (R16); at 3 and 4 tokens the earlier rule's R = 2 cost 1.2-1.5x.
 // On the P106-090 (5 SMs) this gives Flash-Next's 320 x 10,240 projections G = 8, R = 4 (160 blocks), 10,240 x 320
 // G = 128, R = 4 (80 blocks), 10,240 x 4 G = 128, R = 1 and 2,560 x 512 G = 32, R = 4.
 
-#define MMVF_PASCAL_MAX_COLS 4
+#define MMVF_PASCAL_MAX_COLS 8
 
 namespace {
 
@@ -55,8 +57,8 @@ static const int * mmvfp_forced_shape() {
         static int gr[2] = { 0, 0 };
         const char * env = getenv("GGML_CUDA_MMVF_PASCAL_SHAPE");
         if (env && sscanf(env, "%d,%d", &gr[0], &gr[1]) == 2) {
-            if ((gr[0] != 8 && gr[0] != 32 && gr[0] != 128) || (gr[1] != 1 && gr[1] != 2 && gr[1] != 4)) {
-                GGML_LOG_WARN("%s: GGML_CUDA_MMVF_PASCAL_SHAPE=%s ignored: G must be 8, 32 or 128 and R 1, 2 or 4\n",
+            if ((gr[0] != 8 && gr[0] != 32 && gr[0] != 128) || (gr[1] != 1 && gr[1] != 2 && gr[1] != 4 && gr[1] != 8)) {
+                GGML_LOG_WARN("%s: GGML_CUDA_MMVF_PASCAL_SHAPE=%s ignored: G must be 8, 32 or 128 and R 1, 2, 4 or 8\n",
                               __func__, env);
                 gr[0] = gr[1] = 0;
             }
@@ -72,11 +74,11 @@ static int mmvfp_blocks(const int nrows, const int G, const int R) {
 }
 
 static void mmvfp_pick_shape(const int nchunks, const int nrows, const int ncols_dst, const int nsm, int & G, int & R) {
-    const int rmax = ncols_dst <= 2 ? 4 : 2;
+    const int rmax = ncols_dst <= 4 ? 4 : 8;
     const int * forced = mmvfp_forced_shape();
     if (forced[0] != 0) {
         G = forced[0];
-        R = forced[1] < rmax ? forced[1] : rmax;
+        R = forced[1];
         return;
     }
     G = 8;
@@ -110,20 +112,13 @@ static void mmvfp_launch_cols(const mmvfp_params & p, const int ncols_dst, cudaS
     switch (ncols_dst) {
         case 1: mmvfp_launch<G, R, 1, false>(p, stream); break;
         case 2: mmvfp_launch<G, R, 2, false>(p, stream); break;
-        case 3:
-            if constexpr (R <= 2) {
-                mmvfp_launch<G, R, 3, false>(p, stream);
-                break;
-            }
-            GGML_ABORT("fatal error");
-        case 4:
-            if constexpr (R <= 2) {
-                mmvfp_launch<G, R, 4, false>(p, stream);
-                break;
-            }
-            GGML_ABORT("fatal error");
-        default:
-            GGML_ABORT("fatal error");
+        case 3: mmvfp_launch<G, R, 3, false>(p, stream); break;
+        case 4: mmvfp_launch<G, R, 4, false>(p, stream); break;
+        case 5: mmvfp_launch<G, R, 5, false>(p, stream); break;
+        case 6: mmvfp_launch<G, R, 6, false>(p, stream); break;
+        case 7: mmvfp_launch<G, R, 7, false>(p, stream); break;
+        case 8: mmvfp_launch<G, R, 8, false>(p, stream); break;
+        default: GGML_ABORT("fatal error");
     }
 }
 
@@ -133,6 +128,7 @@ static void mmvfp_launch_rows(const mmvfp_params & p, const int R, const int nco
         case 1: mmvfp_launch_cols<G, 1>(p, ncols_dst, stream); break;
         case 2: mmvfp_launch_cols<G, 2>(p, ncols_dst, stream); break;
         case 4: mmvfp_launch_cols<G, 4>(p, ncols_dst, stream); break;
+        case 8: mmvfp_launch_cols<G, 8>(p, ncols_dst, stream); break;
         default: GGML_ABORT("fatal error");
     }
 }
@@ -155,7 +151,7 @@ bool ggml_cuda_mmvf_pascal_supports(const ggml_tensor * src0, const ggml_tensor 
     if (!ggml_cuda_mmvf_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
     }
-    // 2-D weights with rows of whole 16-byte chunks, 1 to 4 tokens of one channel, float4-aligned activation columns
+    // 2-D weights with rows of whole 16-byte chunks, 1 to 8 tokens of one channel, float4-aligned activation columns
     return src0->ne[0] % 8 == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
         src0->nb[0] == ggml_type_size(src0->type) && src0->nb[1] % 16 == 0 && mmvfp_aligned(src0->data, 16) &&
         src0->ne[1] <= INT_MAX && src0->nb[1] / 16 <= INT_MAX &&

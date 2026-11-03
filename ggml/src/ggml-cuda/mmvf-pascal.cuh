@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 
-// BF16 matrix-vector products of 1 to 4 tokens with FP32 activations, tuned for compute capability 6.1 (Pascal, which
+// BF16 matrix-vector products of 1 to 8 tokens with FP32 activations, tuned for compute capability 6.1 (Pascal, which
 // has no BF16 arithmetic). mul_mat_vec_f gives every row a block whose threads read 4 bytes each, which on a 5-SM
 // P106-090 leaves short rows latency-bound: the 320-wide hyper-connection projections of Qwen3.8-Flash-Next
 // (10,240 rows) ran at ~20 GB/s. These kernels give each row group a lane group sized to the row width (8, 32 or 128
@@ -12,8 +12,8 @@
 //
 // GGML_CUDA_MMVF_PASCAL: 0 off, 1 compute capability 6.1 only (default), 2 any NVIDIA GPU (for testing).
 // GGML_CUDA_MMVF_PASCAL_NSM=n: choose the launch shape as for a card of n SMs (e.g. 5, to run the P106-090's shapes on
-// another GPU). GGML_CUDA_MMVF_PASCAL_SHAPE=G,R: force G lanes per row group and R rows per group (testing and tuning;
-// R is lowered where the token count needs it).
+// another GPU). GGML_CUDA_MMVF_PASCAL_SHAPE=G,R: force G lanes per row group (8, 32, 128) and R rows per group
+// (1, 2, 4, 8) for testing and tuning.
 
 // Whether the kernels run on a device of compute capability cc under GGML_CUDA_MMVF_PASCAL.
 bool ggml_cuda_mmvf_pascal_active(int cc);

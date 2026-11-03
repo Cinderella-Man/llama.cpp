@@ -2246,7 +2246,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    // BF16 weights of 1 to 4 tokens that the Pascal kernel (mmvf-pascal.cu) takes: compute 6.1 picks mul_mat_vec_f for
+    // BF16 weights of 1 to 8 tokens that the Pascal kernel (mmvf-pascal.cu) takes: compute 6.1 picks mul_mat_vec_f for
     // them anyway, and GGML_CUDA_MMVF_PASCAL=2 sends them there on any GPU (for testing)
     if (ggml_cuda_mmvf_pascal_supports(src0, src1, dst)) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);

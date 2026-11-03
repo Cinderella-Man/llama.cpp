@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-pascal.cuh"
+#include "mmvq-pascal-kcol.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1519,6 +1520,11 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    // plain products of 1 to 8 tokens on compute capability 6.1: the k-column kernels (mmvq-pascal-kcol.cu)
+    if (!ids && !fusion && ggml_cuda_mmvq_pascal_kcol(ctx, src0, src1, dst)) {
+        return;
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
