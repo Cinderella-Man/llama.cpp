@@ -32,6 +32,9 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <future>
+#include <limits>
+#include <map>
 #include <random>
 #include <utility>
 #include <fstream>
@@ -304,6 +307,10 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // --ctx-checkpoints-spread: where the last prompt batch stopped for a checkpoint inside the prompt, which the next
+    // batch takes before it is decoded
+    int64_t ckpt_spread_pos = -1;
+
     // pipelined speculation (--pipe-depth): the slot's tokens in flight in the context's pipe slots (llama_pipe_*),
     // [0] its newest sampled token, then guesses of the tokens after it
     struct pipe_entry {
@@ -373,7 +380,19 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        // checkpoints on the devices (--ctx-checkpoints-vram) go into the cache as host copies: the slot reuses its
+        // stores
+        server_prompt prompt_host;
+        const bool on_dev = std::any_of(prompt.checkpoints.begin(), prompt.checkpoints.end(),
+                [](const common_prompt_checkpoint & ck) { return ck.store >= 0; });
+        if (on_dev) {
+            prompt_host = prompt.clone();
+            for (auto it = prompt_host.checkpoints.begin(); it != prompt_host.checkpoints.end(); ) {
+                it = it->tgt_to_host(ctx_tgt, id) ? std::next(it) : prompt_host.checkpoints.erase(it);
+            }
+        }
+
+        auto * cur = prompt_cache.alloc(on_dev ? prompt_host : prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
@@ -911,6 +930,7 @@ struct server_slot {
         mem.seq_cp(id, other.id, -1, -1);
 
         other.prompt = prompt.clone();
+        drop_device_checkpoints(other.prompt);
     }
 
     void copy_state_to(server_slot & other) const {
@@ -924,7 +944,14 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        drop_device_checkpoints(other.prompt);
         other.init_sampler();
+    }
+
+    // a checkpoint on the devices (--ctx-checkpoints-vram) lives in a store of this slot's sequence, which this slot
+    // reuses: a copy for another slot leaves it out
+    static void drop_device_checkpoints(server_prompt & p) {
+        p.checkpoints.remove_if([](const common_prompt_checkpoint & ck) { return ck.store >= 0; });
     }
 };
 
@@ -1359,6 +1386,17 @@ private:
     std::vector<llama_token> ckpt_gen_tokens;
     bool                     ckpt_trim = false;
 
+    // --ctx-checkpoints-vram (C22): a slot's newest ckpt_vram_n checkpoints live in device stores of its sequence, with
+    // ids 0 .. ckpt_vram_stores - 1 (one more than ckpt_vram_n while older ones move to the host: the moving one keeps
+    // its store until its host copy is done, at most one per slot)
+    struct ckpt_spill_job {
+        int32_t store = -1;
+        std::future<std::vector<uint8_t>> data;
+    };
+    int32_t ckpt_vram_n      = 0;
+    int32_t ckpt_vram_stores = 0;
+    std::map<int, ckpt_spill_job> ckpt_spills; // by slot id
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1381,6 +1419,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // the background copies of checkpoints to the host read the context's stores: let them finish first
+        ckpt_spills.clear();
+
         spec.reset();
         spec_init.reset();
 
@@ -1924,6 +1965,16 @@ private:
         }
 
         ckpt_trim = n_swa > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && ctx_dft == nullptr;
+
+        ckpt_vram_n      = std::min(params_base.checkpoint_vram, std::max(params_base.n_ctx_checkpoints, 0));
+        ckpt_vram_stores = ckpt_vram_n + (params_base.n_ctx_checkpoints > ckpt_vram_n ? 1 : 0);
+        if (ckpt_vram_n > 0) {
+            SRV_INF("context checkpoints on the devices: the newest %d of each slot, older ones move to the host %s\n",
+                    ckpt_vram_n, params_base.checkpoint_vram_sync ? "at once" : "in the background");
+        }
+        if (params_base.checkpoint_spread > 0 && params_base.n_ctx_checkpoints > 0) {
+            SRV_INF("context checkpoints inside prompts every %d tokens, evicted by the smallest gap\n", params_base.checkpoint_spread);
+        }
 
         if (!params_base.prefix_cache_dir.empty()) {
             if (ctx_dft != nullptr || mctx != nullptr || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -3183,11 +3234,17 @@ private:
 
         slot.stats.n_ckpt_created++;
 
+        // --ctx-checkpoints-spread: a full list drops the checkpoint whose removal leaves the smallest gap
+        while (params_base.checkpoint_spread > 0 && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+            ckpt_evict_smallest_gap(slot, id_task);
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
+                params_base.checkpoint_spread == 0 &&
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
@@ -3235,15 +3292,215 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.ring = ring;
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ring ? LLAMA_STATE_SEQ_FLAGS_SWA_RING : 0));
+
+        const llama_state_seq_flags flags_tgt = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ring ? LLAMA_STATE_SEQ_FLAGS_SWA_RING : 0);
+
+        const int64_t t_save_start = ggml_time_us();
+
+        // --ctx-checkpoints-vram: into a device store of the slot's sequence, where one is free and can be allocated
+        bool on_dev = false;
+        if (ckpt_vram_n > 0) {
+            const int32_t store = ckpt_store_free(slot);
+            on_dev = store >= 0 && cur.update_tgt_store(ctx_tgt, slot.id, store, flags_tgt);
+            if (!on_dev) {
+                SLT_WRN(slot, "context checkpoints on the devices failed (store %d) - on the host from now on\n", store);
+                ckpt_vram_n = 0;
+            }
+        }
+        if (!on_dev) {
+            cur.update_tgt(ctx_tgt, slot.id, flags_tgt);
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        const int64_t t_save_us = ggml_time_us() - t_save_start;
+
+        slot.stats.t_ckpt_save_us += t_save_us;
+        slot.stats.n_ckpt_dev     += on_dev ? 1 : 0;
+
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, on the devices %.3f MiB, store %d, %.1f ms)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (float) cur.size_dev / 1024 / 1024, cur.store, t_save_us / 1000.0);
+
+        if (on_dev) {
+            ckpt_vram_trim(slot);
+        }
+    }
+
+    // --ctx-checkpoints-spread (C28): erases the checkpoint whose removal leaves the smallest gap between its neighbours
+    // (the prompt's start before the first). The newest stays, and the current task's go only when no other is left
+    void ckpt_evict_smallest_gap(server_slot & slot, int id_task) {
+        auto & cks = slot.prompt.checkpoints;
+
+        auto best = cks.begin();
+        if (cks.size() > 1) {
+            int64_t best_gap = std::numeric_limits<int64_t>::max();
+            bool    best_cur = true;
+            int64_t prev     = 0;
+            for (auto it = cks.begin(); std::next(it) != cks.end(); ++it) {
+                const int64_t gap = std::next(it)->n_tokens - prev;
+                const bool    cur = it->id_task == id_task;
+                if ((best_cur && !cur) || (best_cur == cur && gap < best_gap)) {
+                    best     = it;
+                    best_gap = gap;
+                    best_cur = cur;
+                }
+                prev = it->n_tokens;
+            }
+        }
+
+        SLT_TRC(slot, "erasing context checkpoint by the smallest gap (n_tokens = %" PRId64 ", size = %.3f MiB, store %d)\n",
+                best->n_tokens, (float) (best->size() + best->size_dev) / 1024 / 1024, best->store);
+
+        cks.erase(best);
+    }
+
+    // --ctx-checkpoints-spread: a checkpoint inside the prompt goes at the first message start spread tokens or more after
+    // ref (the last checkpoint, or the batch's start where it takes one), or 2 * spread after ref without one; none in
+    // the prompt's last batch, which the tail checkpoints cover
+    bool ckpt_spread_at(const server_slot & slot, int64_t n, int64_t ref) const {
+        const int64_t spread = params_base.checkpoint_spread;
+        if (spread <= 0 || n + (int64_t) llama_n_ubatch(ctx_tgt) + 4 >= (int64_t) slot.task->n_tokens()) {
+            return false;
+        }
+        if (n == ref + 2*spread) {
+            return true;
+        }
+        if (n < ref + spread) {
+            return false;
+        }
+        for (const auto & span : slot.task->params.message_spans.spans) {
+            if ((int64_t) span.pos == n) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // --ctx-checkpoints-vram: a host copy that finished in the background replaces its checkpoint's store; wait = until
+    // it is done
+    void ckpt_spill_land(server_slot & slot, bool wait) {
+        const auto it = ckpt_spills.find(slot.id);
+        if (it == ckpt_spills.end()) {
+            return;
+        }
+        if (!wait && it->second.data.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            return;
+        }
+
+        const int32_t store = it->second.store;
+
+        std::vector<uint8_t> data;
+        try {
+            data = it->second.data.get();
+        } catch (const std::exception & e) {
+            SLT_WRN(slot, "moving a context checkpoint to the host failed: %s\n", e.what());
+        }
+        ckpt_spills.erase(it);
+
+        // the checkpoint may be gone by now (invalidated, or the slot holds another prompt): then so is the copy
+        for (auto ck = slot.prompt.checkpoints.begin(); ck != slot.prompt.checkpoints.end(); ++ck) {
+            if (ck->store != store) {
+                continue;
+            }
+            if (data.empty()) {
+                SLT_WRN(slot, "erasing context checkpoint (n_tokens = %" PRId64 "): its host copy failed\n", ck->n_tokens);
+                slot.prompt.checkpoints.erase(ck);
+            } else {
+                ck->data_tgt = std::move(data);
+                ck->store    = -1;
+                ck->size_dev = 0;
+                SLT_TRC(slot, "context checkpoint (n_tokens = %" PRId64 ") moved to the host, %.3f MiB\n",
+                        ck->n_tokens, (float) ck->size() / 1024 / 1024);
+            }
+            break;
+        }
+    }
+
+    // a free device store for a new checkpoint of the slot, -1 if none
+    int32_t ckpt_store_free(server_slot & slot) {
+        ckpt_spill_land(slot, false);
+
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::vector<bool> used(ckpt_vram_stores, false);
+            for (const auto & ck : slot.prompt.checkpoints) {
+                if (ck.store >= 0 && ck.store < ckpt_vram_stores) {
+                    used[ck.store] = true;
+                }
+            }
+
+            const auto it = ckpt_spills.find(slot.id);
+            if (it != ckpt_spills.end()) {
+                used[it->second.store] = true;
+            }
+
+            for (int32_t k = 0; k < ckpt_vram_stores; ++k) {
+                if (!used[k]) {
+                    return k;
+                }
+            }
+
+            if (it == ckpt_spills.end()) {
+                break;
+            }
+
+            // all taken, one of them by a move to the host: wait for it
+            ckpt_spill_land(slot, true);
+        }
+
+        return -1;
+    }
+
+    // keeps the slot's newest ckpt_vram_n checkpoints on the devices: the oldest beyond them moves to the host, in the
+    // background unless --ctx-checkpoints-vram-sync (one at a time)
+    void ckpt_vram_trim(server_slot & slot) {
+        const auto spilling = [&]() {
+            const auto it = ckpt_spills.find(slot.id);
+            return it == ckpt_spills.end() ? -1 : it->second.store;
+        };
+
+        int32_t n_dev = 0;
+        for (const auto & ck : slot.prompt.checkpoints) {
+            n_dev += ck.store >= 0 && ck.store != spilling() ? 1 : 0;
+        }
+        if (n_dev <= ckpt_vram_n) {
+            return;
+        }
+
+        ckpt_spill_land(slot, true);
+
+        const auto ck = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                [](const common_prompt_checkpoint & c) { return c.store >= 0; });
+        if (ck == slot.prompt.checkpoints.end()) {
+            return;
+        }
+
+        if (params_base.checkpoint_vram_sync) {
+            const int64_t t_start = ggml_time_us();
+            if (!ck->tgt_to_host(ctx_tgt, slot.id)) {
+                SLT_WRN(slot, "erasing context checkpoint (n_tokens = %" PRId64 "): its host copy failed\n", ck->n_tokens);
+                slot.prompt.checkpoints.erase(ck);
+                return;
+            }
+            SLT_TRC(slot, "context checkpoint (n_tokens = %" PRId64 ") moved to the host, %.3f MiB, %.1f ms\n",
+                    ck->n_tokens, (float) ck->size() / 1024 / 1024, (ggml_time_us() - t_start) / 1000.0);
+            return;
+        }
+
+        const size_t n = llama_state_seq_store_get_size_host(ctx_tgt, slot.id, ck->store);
+
+        auto & job = ckpt_spills[slot.id];
+        job.store = ck->store;
+        job.data  = std::async(std::launch::async,
+                [ctx = ctx_tgt, seq_id = slot.id, store = ck->store, meta = ck->data_tgt, n]() {
+                    std::vector<uint8_t> data(n);
+                    if (n == 0 || llama_state_seq_store_get_data_host(ctx, meta.data(), meta.size(), data.data(), data.size(), seq_id, store) != n) {
+                        data.clear();
+                    }
+                    return data;
+                });
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -3303,7 +3560,19 @@ private:
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
+            if (cur.store >= 0) {
+                // a checkpoint on the devices (--ctx-checkpoints-vram) goes into the file as its host copy
+                common_prompt_checkpoint host;
+                host.data_tgt = cur.data_tgt;
+                host.store    = cur.store;
+                if (!host.tgt_to_host(ctx_tgt, slot.id)) {
+                    SLT_WRN(slot, "failed to copy a context checkpoint from the devices for '%s'\n", filepath.c_str());
+                    return false;
+                }
+                ckpt_write_buf(ofs, host.data_tgt, n_written);
+            } else {
+                ckpt_write_buf(ofs, cur.data_tgt,  n_written);
+            }
             ckpt_write_buf(ofs, cur.data_dft,  n_written);
             ckpt_write_buf(ofs, cur.data_spec, n_written);
         }
@@ -4282,6 +4551,13 @@ private:
         }
 #endif
 
+        // checkpoint copies to the host that finished in the background take their checkpoints' place
+        if (!ckpt_spills.empty()) {
+            for (auto & slot : slots) {
+                ckpt_spill_land(slot, false);
+            }
+        }
+
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
         {
@@ -5061,7 +5337,7 @@ private:
                                         // pos_max, which a recurrent state needs
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max + (ckpt_trim ? 1 : 0)));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, %.1f ms)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024, (ggml_time_us() - t_ckpt_start) / 1000.0);
+                                        SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, on the devices %.3f MiB, %.1f ms)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024, (float) it->size_dev / 1024 / 1024, (ggml_time_us() - t_ckpt_start) / 1000.0);
 
                                         slot.stats.cache_src     = 2;
                                         slot.stats.n_ckpt_pos    = it->n_tokens;
@@ -5263,6 +5539,17 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // --ctx-checkpoints-spread: this batch starts where the last one stopped for a checkpoint inside the
+                    // prompt; the next such checkpoint is spread tokens after the last one, or after this batch's start
+                    // where it takes one
+                    const int64_t n_batch_start = slot.prompt.n_tokens();
+                    const bool    spread_start  = n_batch_start == slot.ckpt_spread_pos;
+                    int64_t ckpt_spread_ref = slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens;
+                    if (spread_start || spans.is_user_start(n_batch_start)) {
+                        ckpt_spread_ref = std::max(ckpt_spread_ref, n_batch_start);
+                    }
+                    slot.ckpt_spread_pos = -1;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -5310,6 +5597,11 @@ private:
                             if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
+                        }
+
+                        if (do_checkpoint && ckpt_spread_at(slot, slot.prompt.n_tokens(), ckpt_spread_ref)) {
+                            slot.ckpt_spread_pos = slot.prompt.n_tokens();
+                            break;
                         }
 
                         if (prefix_break && (int32_t) slot.prompt.n_tokens() == first_user_pos) {
@@ -5376,9 +5668,15 @@ private:
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
                         // (one tail checkpoint: only the last batch, 4 tokens before the end, takes it)
-                        if (!is_user_start && (!near_prompt_end || tail1)) {
+                        // (--ctx-checkpoints-spread: or the last batch stopped for one inside the prompt)
+                        if (!is_user_start && !spread_start && (!near_prompt_end || tail1)) {
                             do_checkpoint = false;
                         }
+                    }
+
+                    // a batch that took no tokens leaves the checkpoint inside the prompt to the next one
+                    if (spread_start && n_tokens_cur == 0) {
+                        slot.ckpt_spread_pos = n_batch_start;
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -5396,7 +5694,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || spread_start ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

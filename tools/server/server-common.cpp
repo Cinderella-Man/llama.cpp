@@ -169,6 +169,8 @@ json server_slot_stats::to_json() const {
     base["cache_ckpt_n"]    = n_ckpt_pos;
     base["ckpt_created_n"]  = n_ckpt_created;
     base["cache_restore_ms"] = t_restore_us / 1000.0;
+    base["ckpt_save_ms"]     = t_ckpt_save_us / 1000.0;
+    base["ckpt_dev_n"]       = n_ckpt_dev;
 
     return base;
 }

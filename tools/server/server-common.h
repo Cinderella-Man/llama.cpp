@@ -413,6 +413,8 @@ struct server_slot_stats {
     int64_t  n_ckpt_pos         = -1; // the restored checkpoint's token count
     uint64_t n_ckpt_created     = 0;  // checkpoints created for this task (prompt and generation)
     int64_t  t_restore_us       = 0;  // checkpoint and prefix restores
+    int64_t  t_ckpt_save_us     = 0;  // checkpoint saves (on the devices with --ctx-checkpoints-vram)
+    uint64_t n_ckpt_dev         = 0;  // of the created checkpoints, those saved on the devices
 
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result

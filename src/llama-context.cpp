@@ -4363,6 +4363,237 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
+static ggml_backend_buffer_type_t llama_tensor_buft(const ggml_tensor * t) {
+    return ggml_backend_buffer_get_type(t->view_src ? t->view_src->buffer : t->buffer);
+}
+
+// writes the rest of a state into the blob and copies its tensor data into a numbered store; commit() does the copy and
+// reports whether the store's buffers could be allocated
+class llama_io_write_store : public llama_io_write_i {
+public:
+    llama_io_write_store(uint8_t * p, size_t len, llama_state_store & store) : ptr(p), buf_size(len), store(store) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > 0) {
+            winfos.push_back({tensor, offset, size, size_written});
+        }
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+    bool commit() {
+        // a store keeps its buffers while the state's tensors keep their types, sizes and devices
+        bool same = store.pieces.size() == winfos.size();
+        for (size_t i = 0; same && i < winfos.size(); ++i) {
+            const ggml_tensor * cpy = store.pieces[i].first;
+            same = cpy->type == winfos[i].tensor->type && ggml_nbytes(cpy) == winfos[i].size &&
+                   llama_tensor_buft(cpy) == llama_tensor_buft(winfos[i].tensor);
+        }
+
+        if (!same) {
+            store = {};
+
+            std::vector<ggml_backend_buffer_type_t> bufts; // of store.bufs
+            for (const auto & w : winfos) {
+                // the copies are 1d views of the rows: no block types
+                if (ggml_blck_size(w.tensor->type) != 1 || w.size % ggml_element_size(w.tensor) != 0) {
+                    LLAMA_LOG_WARN("%s: %s rows cannot be stored\n", __func__, ggml_type_name(w.tensor->type));
+                    store = {};
+                    return false;
+                }
+
+                auto * buft = llama_tensor_buft(w.tensor);
+
+                const size_t i_buf = std::find(bufts.begin(), bufts.end(), buft) - bufts.begin();
+                if (i_buf == bufts.size()) {
+                    ggml_init_params params = {
+                        /*.mem_size   =*/ winfos.size()*ggml_tensor_overhead(),
+                        /*.mem_buffer =*/ NULL,
+                        /*.no_alloc   =*/ true,
+                    };
+                    bufts.push_back(buft);
+                    store.bufs.emplace_back(ggml_context_ptr(ggml_init(params)), nullptr);
+                }
+
+                ggml_tensor * cpy = ggml_new_tensor_1d(store.bufs[i_buf].first.get(), w.tensor->type, w.size/ggml_element_size(w.tensor));
+                store.pieces.emplace_back(cpy, w.meta_off);
+            }
+
+            for (size_t i = 0; i < store.bufs.size(); ++i) {
+                auto & [ctx, buf] = store.bufs[i];
+
+                buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), bufts[i]));
+                if (!buf) {
+                    LLAMA_LOG_WARN("%s: failed to allocate a state store in '%s'\n", __func__, ggml_backend_buft_name(bufts[i]));
+                    store = {};
+                    return false;
+                }
+            }
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ (winfos.size() + 1)*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_views(ggml_init(params));
+
+        std::vector<const ggml_tensor *> srcs;
+        std::vector<ggml_tensor *>       dsts;
+
+        store.size_data = 0;
+        for (size_t i = 0; i < winfos.size(); ++i) {
+            const auto & w = winfos[i];
+
+            ggml_tensor * src = ggml_view_1d(ctx_views.get(), w.tensor, w.size/ggml_element_size(w.tensor), w.offset);
+            ggml_backend_view_init(src);
+
+            srcs.push_back(src);
+            dsts.push_back(store.pieces[i].first);
+
+            store.pieces[i].second = w.meta_off;
+            store.size_data += w.size;
+        }
+
+        ggml_backend_tensor_copy_n(srcs.data(), dsts.data(), srcs.size());
+
+        store.size_meta = size_written;
+        store.meta.assign(ptr - size_written, ptr);
+
+        return true;
+    }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+
+    struct write_info {
+        ggml_tensor * tensor;
+        size_t offset;
+        size_t size;
+        size_t meta_off;
+    };
+    std::vector<write_info> winfos;
+
+    llama_state_store & store;
+};
+
+// reads the rest of a state from the blob, and its tensor data from a numbered store with commit()
+class llama_io_read_store : public llama_io_read_i {
+public:
+    llama_io_read_store(const uint8_t * p, size_t len, const llama_state_store & store) : ptr(p), buf_size(len), store(store) {}
+
+    void read(void * dst, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(dst, ptr, size);
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > 0) {
+            rinfos.push_back({tensor, offset, size});
+        }
+    }
+
+    void discard() override {
+        rinfos.clear();
+        buf_size = 0;
+    }
+
+    size_t n_bytes() override {
+        return size_read;
+    }
+
+    // the restore enumerates the same bytes in the same order as the save, but may cut them into other row ranges: the
+    // copies follow a byte cursor across both
+    bool commit() {
+        size_t total = 0;
+        for (const auto & r : rinfos) {
+            total += r.size;
+        }
+        if (total != store.size_data) {
+            LLAMA_LOG_ERROR("%s: the state reads %zu bytes, the store holds %zu\n", __func__, total, store.size_data);
+            return false;
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*(store.pieces.size() + rinfos.size() + 1)*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_views(ggml_init(params));
+
+        std::vector<const ggml_tensor *> srcs;
+        std::vector<ggml_tensor *>       dsts;
+
+        size_t i_src   = 0;
+        size_t off_src = 0;
+        for (const auto & r : rinfos) {
+            for (size_t off_dst = 0; off_dst < r.size; ) {
+                ggml_tensor * cpy = store.pieces[i_src].first;
+
+                const size_t n = std::min(ggml_nbytes(cpy) - off_src, r.size - off_dst);
+                if (cpy->type != r.tensor->type || n % ggml_element_size(cpy) != 0) {
+                    LLAMA_LOG_ERROR("%s: the store's rows do not match the state's\n", __func__);
+                    return false;
+                }
+
+                const int64_t ne = n/ggml_element_size(cpy);
+
+                ggml_tensor * src = ggml_view_1d(ctx_views.get(), cpy,      ne, off_src);
+                ggml_tensor * dst = ggml_view_1d(ctx_views.get(), r.tensor, ne, r.offset + off_dst);
+                ggml_backend_view_init(src);
+                ggml_backend_view_init(dst);
+
+                srcs.push_back(src);
+                dsts.push_back(dst);
+
+                off_src += n;
+                off_dst += n;
+                if (off_src == ggml_nbytes(cpy)) {
+                    ++i_src;
+                    off_src = 0;
+                }
+            }
+        }
+
+        ggml_backend_tensor_copy_n(srcs.data(), dsts.data(), srcs.size());
+
+        return true;
+    }
+
+private:
+    const uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_read = 0;
+
+    struct read_info {
+        ggml_tensor * tensor;
+        size_t offset;
+        size_t size;
+    };
+    std::vector<read_info> rinfos;
+
+    const llama_state_store & store;
+};
+
 size_t llama_context::state_get_size() {
     llama_io_write_dummy io(false);
     try {
@@ -4466,6 +4697,141 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         io->discard();
         return 0;
     }
+}
+
+size_t llama_context::state_seq_get_data_store(llama_seq_id seq_id, int32_t store_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+    llama_state_store * store = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_stores_mtx);
+        store = &state_stores[{seq_id, store_id}];
+    }
+
+    llama_io_write_store io(dst, size, *store);
+
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        const size_t n = state_seq_write_data(io, seq_id, flags);
+
+        if (!io.commit()) {
+            return 0;
+        }
+
+        return n;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_set_data_store(llama_seq_id seq_id, int32_t store_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+    // the store belongs to the sequence that wrote src
+    uint32_t     magic_read  = 0;
+    llama_seq_id seq_id_read = -1;
+    if (size >= sizeof(magic_read) + sizeof(seq_id_read)) {
+        memcpy(&magic_read,  src,                      sizeof(magic_read));
+        memcpy(&seq_id_read, src + sizeof(magic_read), sizeof(seq_id_read));
+    }
+    if (magic_read != io_magic) {
+        LLAMA_LOG_ERROR("%s: wrong sequence state magic\n", __func__);
+        return 0;
+    }
+
+    const llama_state_store * store = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_stores_mtx);
+        const auto it = state_stores.find({seq_id_read, store_id});
+        if (it != state_stores.end() && it->second.size_meta == size && memcmp(it->second.meta.data(), src, size) == 0) {
+            store = &it->second;
+        }
+    }
+    if (store == nullptr) {
+        LLAMA_LOG_ERROR("%s: store %d of seq %d does not hold this state\n", __func__, store_id, seq_id_read);
+        return 0;
+    }
+
+    llama_io_read_store io(src, size, *store);
+
+    try {
+        io.read(&magic_read,  sizeof(magic_read));
+        io.read(&seq_id_read, sizeof(seq_id_read));
+
+        const size_t n = state_seq_read_data(io, seq_id, flags);
+
+        if (!io.commit()) {
+            // the cells are restored without their data: drop them
+            if (memory) {
+                memory->seq_rm(seq_id, -1, -1);
+            }
+            return 0;
+        }
+
+        return n;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io.discard();
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_store_get_size_host(llama_seq_id seq_id, int32_t store_id) {
+    std::lock_guard<std::mutex> lock(state_stores_mtx);
+
+    const auto it = state_stores.find({seq_id, store_id});
+    if (it == state_stores.end() || it->second.size_meta == 0) {
+        return 0;
+    }
+
+    return it->second.size_meta + it->second.size_data;
+}
+
+size_t llama_context::state_seq_store_get_data_host(llama_seq_id seq_id, int32_t store_id, const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_size) {
+    std::vector<std::pair<ggml_tensor *, size_t>> pieces;
+
+    size_t size_meta = 0;
+    size_t size_data = 0;
+    {
+        std::lock_guard<std::mutex> lock(state_stores_mtx);
+
+        const auto it = state_stores.find({seq_id, store_id});
+        if (it != state_stores.end() && it->second.size_meta == src_size && memcmp(it->second.meta.data(), src, src_size) == 0) {
+            pieces    = it->second.pieces;
+            size_meta = it->second.size_meta;
+            size_data = it->second.size_data;
+        }
+    }
+
+    if (size_meta == 0 || dst_size < size_meta + size_data) {
+        LLAMA_LOG_ERROR("%s: store %d of seq %d does not hold this state, or dst is too small\n", __func__, store_id, seq_id);
+        return 0;
+    }
+
+    // the blob's bytes, with each copy's bytes put back where the state wrote them
+    size_t    pos = 0;
+    uint8_t * out = dst;
+    for (const auto & [cpy, off] : pieces) {
+        memcpy(out, src + pos, off - pos);
+        out += off - pos;
+        pos  = off;
+
+        ggml_backend_tensor_get(cpy, out, 0, ggml_nbytes(cpy));
+        out += ggml_nbytes(cpy);
+    }
+    memcpy(out, src + pos, size_meta - pos);
+    out += size_meta - pos;
+
+    return out - dst;
+}
+
+void llama_context::state_seq_store_free(llama_seq_id seq_id, int32_t store_id) {
+    std::lock_guard<std::mutex> lock(state_stores_mtx);
+
+    state_stores.erase({seq_id, store_id});
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
@@ -5595,6 +5961,31 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_data_store(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t store, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_store(seq_id, store, dst, size, flags);
+}
+
+size_t llama_state_seq_set_data_store(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id dest_seq_id, int32_t store, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_set_data_store(dest_seq_id, store, src, size, flags);
+}
+
+size_t llama_state_seq_store_get_size_host(llama_context * ctx, llama_seq_id seq_id, int32_t store) {
+    return ctx->state_seq_store_get_size_host(seq_id, store);
+}
+
+// no synchronize: it may run on another thread, and the store's copies were complete when it was filled
+size_t llama_state_seq_store_get_data_host(llama_context * ctx, const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_size, llama_seq_id seq_id, int32_t store) {
+    return ctx->state_seq_store_get_data_host(seq_id, store, src, src_size, dst, dst_size);
+}
+
+void llama_state_seq_store_free(llama_context * ctx, llama_seq_id seq_id, int32_t store) {
+    ctx->state_seq_store_free(seq_id, store);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
