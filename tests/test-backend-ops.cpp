@@ -14143,14 +14143,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the five grid types at Qwen3.8-Flash-Next's shapes, 1 to 4 tokens (Q222): one routed gate or up projection
     // (2560 -> 640, 10 of 128 random experts per token), the fused routed gate/up + SwiGLU (perf mode times its last
     // node; bench/mmvq_pascal/iq_perf.sh times it under GGML_CUDA_PROFILE), and the dense attention and recurrent
-    // shapes attn_qkv, attn_q (2560 -> 10240, 12288) and attn_output / ssm_out (6144 -> 2560). Every call reads 4 MB or
-    // more (the shared expert's 2560 -> 640, under 1 MB, would be timed from the 1.5 MB L2). Compare the Pascal kernels
-    // with GGML_CUDA_MMVQ_PASCAL_SKIP=<type>; GGML_TEST_RAW_QUANT=1 skips the slow quantization of the random weights.
+    // shapes attn_qkv, attn_q, attn_gate (2560 -> 10240, 12288, 6144) and attn_output / ssm_out (6144 -> 2560). Every
+    // call reads 4 MB or more (the shared expert's 2560 -> 640, under 1 MB, would be timed from the 1.5 MB L2). Compare
+    // the Pascal kernels with GGML_CUDA_MMVQ_PASCAL_SKIP=<type>; GGML_TEST_RAW_QUANT=1 skips the slow quantization of
+    // the random weights.
     for (ggml_type type : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
         for (int64_t n : { 1, 2, 3, 4 }) {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 10, true, 640, n, 2560));
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 128, 10, true));
-            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 10240, 2560 }, { 12288, 2560 }, { 2560, 6144 } }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 10240, 2560 }, { 12288, 2560 }, { 6144, 2560 }, { 2560, 6144 } }) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
             }
         }
