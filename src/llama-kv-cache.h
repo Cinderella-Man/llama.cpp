@@ -296,7 +296,6 @@ public:
     static constexpr uint32_t kq_cells_n_changed_max = 32;
 
     // the mask set_input_attn_mask writes (rows == nullptr shape), as F32 into data [n_kv, n_tokens/n_stream, 1, n_stream]
-    // REBASE PROBE: upstream renamed set_input_kq_mask -> set_input_attn_mask (#29510); body not re-checked
     void fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const;
 
     uint32_t       get_n_swa()    const { return n_swa; }

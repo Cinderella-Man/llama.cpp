@@ -808,7 +808,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    // the mask built on the device: its input (REBASE PROBE: self_attn_mask stays empty in this mode)
+    // the mask built on the device: its input (self_attn_mask stays empty in this mode)
     if (kq_dev.upd && kq_dev.upd->buffer) {
         kq_dev.set_input(ubatch, cparams.causal_attn);
     }
@@ -966,7 +966,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     mctx->get_swa()->set_input_attn_mask(self_attn_mask_swa, ubatch, cparams.causal_attn);
 
     // the mask built on the device: its input (self_attn_mask{,_swa} stay empty then, so the host setters above do
-    // nothing). REBASE PROBE: k/v rotations are no longer per-ubatch inputs upstream (#31073)
+    // nothing)
     if (kq_dev.upd && kq_dev.upd->buffer) {
         kq_dev.set_input(ubatch, cparams.causal_attn);
     }
@@ -3463,7 +3463,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
         if (kq_mask_dev && !cparams.training && llama_kq_mask_on_device(hparams, cparams, ubatch) && mctx_cur->get_kq_cells_resident()) {
-            // REBASE PROBE: no _cnv node any more (#31558); self_attn_mask stays empty, build_attn makes the per-layer masks
+            // self_attn_mask stays empty: build_attn makes the per-layer masks
             GGML_UNUSED(cb);
             inp->kq_dev.build_inputs(ctx0, ubatch, cparams, { mctx_cur });
         } else {
@@ -3545,7 +3545,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kv_rows = inp->self_attn_mask.rows;
     if (inp->kq_dev.upd) {
         // the mask built on the device: one node per layer, from the cell copy of the layer's device, which the
-        // scheduler callback places on that device (REBASE PROBE: no kv rows in this mode)
+        // scheduler callback places on that device; its columns are the cells, so attention reads no kv rows
         kq_mask = inp->kq_dev.build_mask(ctx0, gf, [this](ggml_tensor * t, const char * name, int i) { cb(t, name, i); }, 0, il);
         kv_rows = nullptr;
     }
@@ -3845,7 +3845,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kv_rows = is_swa ? inp->self_attn_mask_swa.rows : inp->self_attn_mask.rows;
     if (inp->kq_dev.upd) {
         // the mask built on the device: one node per layer, from the cell copy of the layer's device, which the
-        // scheduler callback places on that device (REBASE PROBE: no kv rows in this mode, #29510)
+        // scheduler callback places on that device; its columns are the cells, so attention reads no kv rows
         kq_mask = inp->kq_dev.build_mask(ctx0, gf, [this](ggml_tensor * t, const char * name, int i) { cb(t, name, i); }, is_swa ? 1 : 0, il);
         kv_rows = nullptr;
     }
@@ -4104,7 +4104,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
 
         if (kq_mask_dev) {
-            // REBASE PROBE: upstream dropped the _cnv copies (#31558); the device mode leaves self_attn_mask empty
+            // self_attn_mask stays empty: build_attn makes the per-layer masks
             GGML_UNUSED(kq_cb);
         } else {
             inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);

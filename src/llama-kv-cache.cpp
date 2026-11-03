@@ -1385,7 +1385,6 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     // LLAMA_KV_PAD (a power of 2 from 256 up) pads further: every graph is rebuilt when n_kv grows by a step, which
     // costs once per pipe slot (llama_pipe_*), against attention over up to that many masked cells
-    // REBASE PROBE: upstream removed the n_pad member (#31200); the pad is 256 unless LLAMA_KV_PAD
     static const uint32_t n_pad_env = [] {
         const char * e = getenv("LLAMA_KV_PAD");
         uint32_t v = e ? (uint32_t) atoi(e) : 0;
@@ -2063,7 +2062,7 @@ void llama_kv_cache::fill_kq_mask_f32(float * data, int64_t n_kv, int64_t n_stre
         causal_attn = swa_type != LLAMA_SWA_TYPE_NONE;
     }
 
-    // REBASE PROBE: upstream renamed args_set_input_kq_mask/set_input_kq_mask_impl (#29510); no cell rows here
+    // the columns are the cells (no kv rows) and every token has its own row, as in the device mask
     const args_set_input_attn_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,

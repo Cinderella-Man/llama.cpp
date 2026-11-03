@@ -602,7 +602,7 @@ public:
 
     // with the mask built on the device (LLAMA_GPU_KQ_MASK, kq_dev.upd set; caches base, swa), its input replaces
     // the host-filled self_attn_mask and self_attn_mask_swa, which stay empty: build_attn makes a ggml_kq_mask node per
-    // layer, on that layer's device, and passes no kv rows. REBASE PROBE: ported onto llm_attn_mask (#29510, #31558)
+    // layer, on that layer's device, and passes no kv rows
     llm_graph_kq_dev kq_dev;
 
     std::vector<ggml_tensor *> self_k_rot;
