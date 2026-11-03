@@ -4440,6 +4440,8 @@ public:
                     store = {};
                     return false;
                 }
+                LLAMA_LOG_INFO("%s: allocated a state store in '%s', %.3f MiB\n", __func__,
+                        ggml_backend_buft_name(bufts[i]), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
             }
         }
 
