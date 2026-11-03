@@ -1776,10 +1776,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_VRAM_SYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--ctx-checkpoints-spread"}, "N",
-        string_format("a context checkpoint every N tokens inside a prompt, at the first message start N or more tokens "
-            "after the previous checkpoint (or 2N after it if no message starts), and a full list drops the checkpoint "
-            "whose removal leaves the smallest gap; so a client that edits its history far back resumes near the edit "
-            "(recurrent models; default: %d, 0 = off)", params.checkpoint_spread),
+        string_format("context checkpoints at most N tokens apart inside a prompt: at the first message start N/2 or "
+            "more tokens after the previous checkpoint, or N tokens after it if no message starts, and a full list "
+            "drops the checkpoint whose removal leaves the smallest gap; so a client that edits its history far back "
+            "resumes near the edit (recurrent models; default: %d, 0 = off)", params.checkpoint_spread),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("ctx-checkpoints-spread must be non-negative");

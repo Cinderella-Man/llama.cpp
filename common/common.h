@@ -664,7 +664,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t checkpoint_vram     = 0;     // newest context checkpoints of a slot kept in device memory; 0 = all on the host
     bool    checkpoint_vram_sync = false; // move an older one to the host at once, not in the background
-    int32_t checkpoint_spread   = 0;     // a context checkpoint every N tokens inside a prompt, evicted by the smallest gap; 0 = off
+    int32_t checkpoint_spread   = 0;     // context checkpoints at most N tokens apart inside a prompt, evicted by the smallest gap; 0 = off
     bool    checkpoint_tail2    = false; // two checkpoints at a prompt's end (4 + n_ubatch and 4 tokens before it), as stock
 
     // agent sessions: checkpoints while generating, at tokens that end a reasoning block or start a tool call

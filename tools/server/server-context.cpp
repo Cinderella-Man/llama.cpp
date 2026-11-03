@@ -3234,10 +3234,7 @@ private:
 
         slot.stats.n_ckpt_created++;
 
-        // --ctx-checkpoints-spread: a full list drops the checkpoint whose removal leaves the smallest gap
-        while (params_base.checkpoint_spread > 0 && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            ckpt_evict_smallest_gap(slot, id_task);
-        }
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -3259,7 +3256,7 @@ private:
             ++it;
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+        while (params_base.checkpoint_spread == 0 && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
@@ -3271,7 +3268,6 @@ private:
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -3280,6 +3276,12 @@ private:
                     ++it;
                 }
             }
+        }
+
+        // --ctx-checkpoints-spread: a full list drops the checkpoint whose removal leaves the smallest gap
+        while (params_base.checkpoint_spread > 0 && !slot.prompt.checkpoints.empty() &&
+                slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+            ckpt_evict_smallest_gap(slot, n_tokens_new);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -3329,26 +3331,22 @@ private:
         }
     }
 
-    // --ctx-checkpoints-spread (C28): erases the checkpoint whose removal leaves the smallest gap between its neighbours
-    // (the prompt's start before the first). The newest stays, and the current task's go only when no other is left
-    void ckpt_evict_smallest_gap(server_slot & slot, int id_task) {
+    // --ctx-checkpoints-spread (C28): erases the checkpoint whose removal leaves the smallest gap between its neighbours:
+    // the prompt's start before the first, the new checkpoint at n_tokens_new after the last (so of two checkpoints at
+    // a prompt's end, the earlier goes before one far back does); the older of equal gaps goes first
+    void ckpt_evict_smallest_gap(server_slot & slot, int64_t n_tokens_new) {
         auto & cks = slot.prompt.checkpoints;
 
-        auto best = cks.begin();
-        if (cks.size() > 1) {
-            int64_t best_gap = std::numeric_limits<int64_t>::max();
-            bool    best_cur = true;
-            int64_t prev     = 0;
-            for (auto it = cks.begin(); std::next(it) != cks.end(); ++it) {
-                const int64_t gap = std::next(it)->n_tokens - prev;
-                const bool    cur = it->id_task == id_task;
-                if ((best_cur && !cur) || (best_cur == cur && gap < best_gap)) {
-                    best     = it;
-                    best_gap = gap;
-                    best_cur = cur;
-                }
-                prev = it->n_tokens;
+        auto    best     = cks.begin();
+        int64_t best_gap = std::numeric_limits<int64_t>::max();
+        int64_t prev     = 0;
+        for (auto it = cks.begin(); it != cks.end(); ++it) {
+            const int64_t next = std::next(it) != cks.end() ? std::next(it)->n_tokens : n_tokens_new;
+            if (next - prev < best_gap) {
+                best     = it;
+                best_gap = next - prev;
             }
+            prev = it->n_tokens;
         }
 
         SLT_TRC(slot, "erasing context checkpoint by the smallest gap (n_tokens = %" PRId64 ", size = %.3f MiB, store %d)\n",
@@ -3357,18 +3355,18 @@ private:
         cks.erase(best);
     }
 
-    // --ctx-checkpoints-spread: a checkpoint inside the prompt goes at the first message start spread tokens or more after
-    // ref (the last checkpoint, or the batch's start where it takes one), or 2 * spread after ref without one; none in
-    // the prompt's last batch, which the tail checkpoints cover
+    // --ctx-checkpoints-spread: a checkpoint inside the prompt goes at the first message start spread / 2 tokens or more
+    // after ref (the last checkpoint, or the batch's start where it takes one), or spread tokens after ref without one;
+    // none in the prompt's last batch, which the tail checkpoints cover
     bool ckpt_spread_at(const server_slot & slot, int64_t n, int64_t ref) const {
         const int64_t spread = params_base.checkpoint_spread;
         if (spread <= 0 || n + (int64_t) llama_n_ubatch(ctx_tgt) + 4 >= (int64_t) slot.task->n_tokens()) {
             return false;
         }
-        if (n == ref + 2*spread) {
+        if (n == ref + spread) {
             return true;
         }
-        if (n < ref + spread) {
+        if (n < ref + spread/2) {
             return false;
         }
         for (const auto & span : slot.task->params.message_spans.spans) {
