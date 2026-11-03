@@ -1904,6 +1904,7 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
     this->n_outputs = n_stream;
 
     size_t size_total = 0;
+    std::vector<size_t> size_dev(backend_ptrs.size(), 0); // per backend index, over all slots
 
     // the samplers of one sequence, for the reserve
     const auto reserve_samplers = sampling.samplers.empty() ? sampling.samplers
@@ -1944,8 +1945,10 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
         slot.res->reset();
         slot.res_valid = false;
 
-        for (auto * backend : slot.backends) {
-            size_total += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+        for (size_t i = 0; i < slot.backends.size(); i++) {
+            const size_t size = ggml_backend_sched_get_buffer_size(slot.sched.get(), slot.backends[i]);
+            size_total  += size;
+            size_dev[i] += size;
         }
 
         slot.buf_out.reset(ggml_backend_buft_alloc_buffer(buft_out, n_vocab*sizeof(float)));
@@ -1964,6 +1967,12 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
             "input upload %d, chunk streams %zu\n", __func__, n_slots, n_chunk_slots, n_chunk_tokens,
             size_total/1024.0/1024.0, ggml_backend_sched_get_n_splits(pipe_slots[0].sched.get()), pipe_upload,
             pipe_chunk_backends.size());
+
+    // what pipelining costs each device (the memory budget on cards that hold a few layers each)
+    for (size_t i = 0; i < backend_ptrs.size(); i++) {
+        LLAMA_LOG_INFO("%s: %10s pipe slots' compute buffers = %8.2f MiB\n", __func__,
+                ggml_backend_name(backend_ptrs[i]), size_dev[i]/1024.0/1024.0);
+    }
 
     return 0;
 }
