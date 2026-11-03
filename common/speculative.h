@@ -53,6 +53,44 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// What a drafter proposed at each position of a draft, for offline analysis of token trees and draft lengths
+// (llama-server's LLAMA_SPEC_DUMP). An implementation fills it only when the caller sets
+// common_speculative_draft_params::info; nothing is computed otherwise.
+struct common_speculative_draft_info {
+    // in
+    int32_t k_max      = 8;     // the most candidates kept per position
+    bool    full_block = false; // DFlash2: decode the whole trained block for the lattice; the draft stays at n_max
+
+    // out, one entry per position after the anchor (DFlash2: every position of the decoded block, drafted or not)
+    std::string type;            // the implementation that filled it
+    bool        lattice = false; // true: DFlash2's selector, p[i] holds the conditional rows; false: marginals
+    std::vector<std::vector<llama_token>> ids;  // candidates, highest marginal probability first
+    // lattice: p[0] has ids[0].size() values (given the anchor), p[i > 0] ids[i - 1].size() * ids[i].size() values,
+    //          row-major, row = the candidate taken at position i - 1: the selector's probabilities over its whole
+    //          top-k, so a row sums to less than 1 when candidates were cut
+    // else:    p[i] has ids[i].size() values, the drafter's probabilities given the drafted prefix
+    std::vector<std::vector<float>> p;
+    std::vector<int32_t> pick; // the drafter's own walk: index into ids[i] (-1: the walk stopped before it)
+    std::vector<float>   kept; // lattice: the selector's marginal mass of the kept candidates per position
+
+    void clear() {
+        type.clear();
+        lattice = false;
+        ids.clear();
+        p.clear();
+        pick.clear();
+        kept.clear();
+    }
+};
+
+// Reduce a DFlash2 selector lattice to info (exposed for tests). Each of the n_pos rows, row_stride floats apart,
+// holds top_k candidate ids (as floats) and top_k * top_k scores, row-major with row = the predecessor's candidate
+// index (the first position's rows all score from the anchor). walk[i] is the candidate index the drafter took at
+// position i, -1 after it stopped. Probabilities are softmax(scores) at temperature 1, the forward marginals rank
+// the candidates, and each position keeps the info.k_max highest plus the walked one.
+void common_speculative_lattice_info(common_speculative_draft_info & info, const float * lattice, size_t row_stride,
+        int32_t n_pos, int32_t top_k, const std::vector<int32_t> & walk);
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -79,6 +117,9 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // when set, the implementation that drafts records its candidates here (see common_speculative_draft_info)
+    common_speculative_draft_info * info = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

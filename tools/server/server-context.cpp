@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
@@ -139,6 +140,119 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     result.push_back(id);
 
     return result;
+}
+
+// LLAMA_SPEC_DUMP=<file>: one JSON line per speculative verify step, for offline analysis of token trees and draft
+// lengths (bench/tree_replay in the Miner Llama repository). Off by default; when unset nothing below runs.
+//   LLAMA_SPEC_DUMP_K=<n>        candidates kept per drafted position (default 8)
+//   LLAMA_SPEC_DUMP_TGT_K=<n>    the target's most probable tokens per sampled position (default 8, 0: none)
+//   LLAMA_SPEC_DUMP_NGRAM=<n>    the longest context match looked for and the tokens kept after it (default 16, 0: none)
+//   LLAMA_SPEC_DUMP_FULL_BLOCK=1 DFlash2 decodes its whole trained block for the lattice, drafting still n_max
+// Replayed steps (after a checkpoint restore) and synthetic acceptance are not written.
+struct server_spec_dump {
+    FILE *   f          = nullptr;
+    int32_t  k          = 8;
+    int32_t  tgt_k      = 8;
+    int32_t  ngram      = 16;
+    bool     full_block = false;
+    uint64_t n_steps    = 0;
+    int64_t  run        = 0; // the server start in microseconds: tells apart runs appended to one file
+
+    static server_spec_dump & get() {
+        static server_spec_dump d = [] {
+            server_spec_dump r;
+            const char * path = getenv("LLAMA_SPEC_DUMP");
+            if (path == nullptr || *path == '\0') {
+                return r;
+            }
+            r.f = fopen(path, "a");
+            if (r.f == nullptr) {
+                LOG_ERR("LLAMA_SPEC_DUMP: cannot open '%s' for appending\n", path);
+                return r;
+            }
+            auto env_int = [](const char * name, int32_t def) {
+                const char * v = getenv(name);
+                return v && *v ? std::max(0, atoi(v)) : def;
+            };
+            r.k          = std::max(1, env_int("LLAMA_SPEC_DUMP_K", 8));
+            r.tgt_k      = env_int("LLAMA_SPEC_DUMP_TGT_K", 8);
+            r.ngram      = env_int("LLAMA_SPEC_DUMP_NGRAM", 16);
+            r.full_block = env_int("LLAMA_SPEC_DUMP_FULL_BLOCK", 0) != 0;
+            r.run        = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            LOG_INF("LLAMA_SPEC_DUMP: verify steps to '%s' (k %d, target k %d, n-gram %d, full block %d)\n",
+                    path, r.k, r.tgt_k, r.ngram, (int) r.full_block);
+            return r;
+        }();
+        return d;
+    }
+
+    static bool on() { return get().f != nullptr; }
+};
+
+static double spec_dump_round(double x) {
+    return std::round(x * 1e5) / 1e5;
+}
+
+// the k most probable tokens of a logits row at temperature 1, and the probability of `sampled`
+static void spec_dump_top(const float * logits, int32_t n_vocab, int32_t k, llama_token sampled,
+        json & ids, json & probs, double & p_sampled) {
+    float mx = -INFINITY;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        mx = std::max(mx, logits[i]);
+    }
+    double sum = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        sum += std::exp((double) logits[i] - mx);
+    }
+    // a min-heap of the k largest
+    std::vector<std::pair<float, llama_token>> top;
+    top.reserve(k + 1);
+    auto cmp = [](const std::pair<float, llama_token> & a, const std::pair<float, llama_token> & b) { return a.first > b.first; };
+    for (int32_t i = 0; i < n_vocab && k > 0; ++i) {
+        if ((int32_t) top.size() < k) {
+            top.emplace_back(logits[i], i);
+            std::push_heap(top.begin(), top.end(), cmp);
+        } else if (logits[i] > top.front().first) {
+            std::pop_heap(top.begin(), top.end(), cmp);
+            top.back() = { logits[i], i };
+            std::push_heap(top.begin(), top.end(), cmp);
+        }
+    }
+    std::sort(top.begin(), top.end(), cmp);
+    ids   = json::array();
+    probs = json::array();
+    for (const auto & t : top) {
+        ids.push_back(t.second);
+        probs.push_back(spec_dump_round(std::exp((double) t.first - mx) / sum));
+    }
+    p_sampled = sampled >= 0 && sampled < n_vocab ? std::exp((double) logits[sampled] - mx) / sum : 0.0;
+}
+
+// the longest suffix of ctx + [last] (up to n_max tokens) that occurs earlier, its most recent occurrence, and up to
+// n_max tokens that followed it there: what a copy (n-gram) drafter would propose
+static int32_t spec_dump_ngram(const llama_tokens & ctx, llama_token last, int32_t n_max, llama_tokens & next) {
+    next.clear();
+    const int32_t N = (int32_t) ctx.size(); // last sits at index N
+    auto at = [&](int32_t i) { return i == N ? last : ctx[i]; };
+    int32_t best = 0, best_j = -1;
+    for (int32_t j = N - 1; j >= 0 && best < n_max; --j) {
+        if (ctx[j] != last) {
+            continue;
+        }
+        int32_t len = 1;
+        while (len < n_max && j - len >= 0 && ctx[j - len] == at(N - len)) {
+            ++len;
+        }
+        if (len > best) {
+            best   = len;
+            best_j = j;
+        }
+    }
+    for (int32_t i = best_j + 1; best_j >= 0 && i <= N && (int32_t) next.size() < n_max; ++i) {
+        next.push_back(at(i));
+    }
+    return best;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -306,6 +420,7 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+    common_speculative_draft_info spec_info; // the drafter's candidates, for LLAMA_SPEC_DUMP
 
     // --ctx-checkpoints-spread: where the last prompt batch stopped for a checkpoint inside the prompt, which the next
     // batch takes before it is decoded
@@ -954,6 +1069,91 @@ struct server_slot {
         p.checkpoints.remove_if([](const common_prompt_checkpoint & ck) { return ck.store >= 0; });
     }
 };
+
+// one verify step to LLAMA_SPEC_DUMP's file: where it starts, what the drafter proposed, what the target sampled
+// (accepted: the target's tokens, the accepted drafts and then its own), and what a copy drafter would have proposed
+static void spec_dump_step(const server_slot & slot, llama_context * ctx_tgt, const std::vector<int32_t> & spec_i_batch,
+        const llama_tokens & accepted, bool rejection) {
+    auto & d = server_spec_dump::get();
+
+    const size_t n_draft = slot.spec_draft.size();
+    const auto & info    = slot.spec_info;
+
+    json line = {
+        {"v",        1},
+        {"run",      d.run},
+        {"step",     d.n_steps++},
+        {"task",     slot.task->id},
+        {"slot",     slot.id},
+        {"pos",      (int64_t) slot.prompt.tokens.pos_next() - (int64_t) n_draft - 1}, // the position of "last"
+        {"n_prompt", slot.task->n_tokens()},
+        {"temp",     spec_dump_round(slot.task->params.sampling.temp)},
+        {"verify",   rejection ? "reject" : "match"},
+        {"type",     info.type},
+        {"last",     slot.sampled},
+        {"draft",    slot.spec_draft},
+        {"sampled",  accepted},
+        {"n_acc",    accepted.size() - 1},
+    };
+
+    if (!info.ids.empty()) {
+        json p = json::array();
+        for (const auto & row : info.p) {
+            json r = json::array();
+            for (const float x : row) {
+                r.push_back(spec_dump_round(x));
+            }
+            p.push_back(std::move(r));
+        }
+        json cand = json::array();
+        for (const auto & row : info.ids) {
+            cand.push_back(row);
+        }
+        line["lattice"] = info.lattice;
+        line["k"]       = info.k_max;
+        line["cand"]    = std::move(cand);
+        line["p"]       = std::move(p);
+        line["pick"]    = info.pick;
+        if (info.lattice) {
+            json kept = json::array();
+            for (const float x : info.kept) {
+                kept.push_back(spec_dump_round(x));
+            }
+            line["kept"] = std::move(kept);
+        }
+    }
+
+    if (d.tgt_k > 0) {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+        json t_ids = json::array(), t_p = json::array(), t_ps = json::array();
+        for (size_t i = 0; i < accepted.size() && i < spec_i_batch.size(); ++i) {
+            const float * logits = llama_get_logits_ith_fetch(ctx_tgt, spec_i_batch[i]);
+            if (logits == nullptr) {
+                break;
+            }
+            json ids, probs;
+            double ps = 0.0;
+            spec_dump_top(logits, n_vocab, d.tgt_k, accepted[i], ids, probs, ps);
+            t_ids.push_back(std::move(ids));
+            t_p.push_back(std::move(probs));
+            t_ps.push_back(spec_dump_round(ps));
+        }
+        line["tgt_ids"] = std::move(t_ids);
+        line["tgt_p"]   = std::move(t_p);
+        line["tgt_ps"]  = std::move(t_ps);
+    }
+
+    if (d.ngram > 0) {
+        llama_tokens next;
+        line["ng_len"] = spec_dump_ngram(slot.spec_prompt, slot.sampled, d.ngram, next);
+        line["ng"]     = next;
+    }
+
+    const std::string s = line.dump(); // numbers and fixed names only
+    fputs(s.c_str(), d.f);
+    fputc('\n', d.f);
+    fflush(d.f);
+}
 
 // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
 // returns 0 on success
@@ -4917,6 +5117,13 @@ private:
 
                         const bool spec_reject = slot.use_spec_rejection();
 
+                        const bool spec_dump = server_spec_dump::on();
+                        if (spec_dump) {
+                            slot.spec_info.clear();
+                            slot.spec_info.k_max      = server_spec_dump::get().k;
+                            slot.spec_info.full_block = server_spec_dump::get().full_block;
+                        }
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -4927,6 +5134,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .info     = */ spec_dump ? &slot.spec_info : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -6089,6 +6297,10 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                if (server_spec_dump::on() && synth_probs.empty() && !slot.spec_is_replay) {
+                    spec_dump_step(slot, slot.ctx_tgt, spec_i_batch, accepted, use_rejection);
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
