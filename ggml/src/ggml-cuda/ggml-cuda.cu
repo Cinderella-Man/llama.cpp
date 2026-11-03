@@ -65,6 +65,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/gdn-fused.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -177,6 +178,13 @@ static bool ggml_cuda_register_host_enabled() {
 static bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     return disabled;
+}
+
+// GGML_CUDA_GDN_FUSE=0 turns off the recurrent-layer fusions (the state read from the cache, the conv window's tail
+// write, the gated output norm), so one binary runs both arms; the other fusions stay on
+static bool ggml_cuda_gdn_fuse_enabled() {
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_GDN_FUSE", 1) != 0 && !ggml_cuda_fusion_disabled();
+    return enabled;
 }
 
 static bool ggml_cuda_p2p_enabled() {
@@ -2776,6 +2784,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_CONV:
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
+        case GGML_OP_GDN_CONV:
+            ggml_cuda_op_gdn_conv(ctx, dst);
+            break;
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
@@ -3267,6 +3278,221 @@ static int ggml_cuda_try_gdn_cache_fusion(
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
     return skip;
+}
+
+// how many nodes read t (through src[], not through views of it)
+static int32_t ggml_cuda_tensor_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (hash_pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[hash_pos];
+}
+
+// match the get_rows that gathers a gated_delta_net's initial state from the recurrent cache, so the gdn reads the
+// cache row itself and the get_rows is skipped: no temporary state, no read and write of it (C19, Q437). The gdn's
+// snapshot cpy must fuse too (the gdn then writes its state in place) and the ubatch must hold one sequence with no
+// extra states, so the one row read is the only row any block writes besides its own. Returns the get_rows' index,
+// or -1. Graph shape (llm_graph_context::build_rs, then a reshape): gdn.src[5] -> reshape/view at offset 0 -> get_rows.
+static constexpr int ggml_cuda_gdn_gather_window = 256; // most nodes between the gather and the gdn
+static int ggml_cuda_try_gdn_state_gather_fusion(
+        const ggml_cgraph * cgraph, int gdn_idx, ggml_cuda_gated_delta_net_state_rows & rows) {
+    static const bool concurrent = ggml_cuda_env_int("GGML_CUDA_GRAPH_OPT", 0) == 1;
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (!ggml_cuda_gdn_fuse_enabled() || concurrent || gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return -1;
+    }
+    {
+        ggml_cuda_gated_delta_net_fused_cache unused;
+        if (ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, unused) == 0) {
+            return -1;
+        }
+    }
+
+    const ggml_tensor * src_v = gdn->src[2];
+    const int64_t       D     = src_v->ne[0] * src_v->ne[0] * src_v->ne[1]; // S_v * S_v * H
+    if (src_v->ne[3] != 1) {
+        return -1;
+    }
+
+    // the state: views and reshapes of the whole gathered row, each read only by the next link
+    std::array<const ggml_tensor *, 4> chain = {};
+    int                                n_chain = 0;
+    const ggml_tensor *                t       = gdn->src[5];
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) {
+        if (n_chain == (int) chain.size() || t->view_offs != 0 || !ggml_is_contiguous(t) ||
+            (t->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_tensor_use_count(cgraph, t) != 1) {
+            return -1;
+        }
+        chain[n_chain++] = t;
+        t = t->src[0];
+    }
+    const ggml_tensor * gather = t;
+    if (gather == nullptr || gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 ||
+        (gather->flags & GGML_TENSOR_FLAG_OUTPUT) || (gather->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        gather->ne[0] != D || ggml_nrows(gather) != 1) {
+        return -1;
+    }
+    const ggml_tensor * cache = gather->src[0];
+    const ggml_tensor * ids   = gather->src[1];
+    if (cache->type != GGML_TYPE_F32 || cache->data == nullptr || cache->nb[0] != sizeof(float) ||
+        cache->ne[2] != 1 || cache->ne[3] != 1 || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1) {
+        return -1; // ids has no data yet in graph_optimize (it is a graph input), only at compute
+    }
+
+    int gather_idx = -1;
+    for (int j = gdn_idx - 1; j >= 0 && j >= gdn_idx - ggml_cuda_gdn_gather_window; --j) {
+        if (cgraph->nodes[j] == gather) {
+            gather_idx = j;
+            break;
+        }
+    }
+    if (gather_idx < 0) {
+        return -1;
+    }
+
+    // between the gather and the gdn: every other reader of the gathered row is empty (build_rs's copy of the extra
+    // states, none here), and nothing writes the cache, since the gdn now reads it later than the gather did
+    const char * c0      = (const char *) cache->data;
+    const char * c1      = c0 + ggml_nbytes(cache);
+    int          readers = 0;
+    for (int j = gather_idx + 1; j < gdn_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == gather) {
+                readers++;
+                if (n != chain[n_chain - 1] && !ggml_is_empty(n)) {
+                    return -1;
+                }
+            }
+        }
+        // views write nothing; a node that writes into the cache (cpy, set_rows, an in-place op) has its data there
+        if (ggml_cuda_is_view_or_noop(n) || n->data == nullptr) {
+            continue;
+        }
+        const char * n0 = (const char *) n->data;
+        if (n0 < c1 && c0 < n0 + ggml_nbytes(n)) {
+            return -1;
+        }
+    }
+    if (n_chain == 0 || readers != ggml_cuda_tensor_use_count(cgraph, gather)) {
+        return -1;
+    }
+
+    rows.data       = (const float *) cache->data;
+    rows.ids        = (const int32_t *) ids->data;
+    rows.row_stride = (int64_t) (cache->nb[1] / sizeof(float));
+    return gather_idx;
+}
+
+// whether node idx is a state gather that a later gated_delta_net reads from the cache itself (see above)
+static bool ggml_cuda_gdn_state_gather_skipped(const ggml_cgraph * cgraph, int idx) {
+    if (cgraph->nodes[idx]->op != GGML_OP_GET_ROWS || !ggml_cuda_gdn_fuse_enabled()) {
+        return false;
+    }
+    for (int i = idx + 1; i < cgraph->n_nodes && i <= idx + ggml_cuda_gdn_gather_window; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
+            ggml_cuda_gated_delta_net_state_rows rows;
+            if (ggml_cuda_try_gdn_state_gather_fusion(cgraph, i, rows) == idx) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// match gdn_conv + the cpy of its new histories into the conv cache (slot k -> rollback group k), so the kernel writes
+// them there and the cpy is skipped (C20, Q438). The kernel reads each sequence's history from the cache row by id,
+// so with more than one sequence a sequence could read a row that another one writes in the same launch.
+static int ggml_cuda_try_gdn_conv_cache_fusion(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_conv_fused_cache & fused) {
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    if (!ggml_cuda_gdn_fuse_enabled() || conv->op != GGML_OP_GDN_CONV || (conv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * x = conv->src[2];
+    const ggml_tensor * c = conv->src[3];
+    const int64_t n_hist   = c->ne[0] - 1;
+    const int64_t channels = c->ne[1];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_seqs   = x->ne[2];
+    const int64_t K        = ggml_get_op_params_i32(conv, 3);
+    if (n_seqs != 1) {
+        return 0;
+    }
+
+    // the cpy is the first real node after the conv
+    const ggml_tensor * cpy  = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    // src: all K histories, right after the conv output; dst: a [n_hist * channels, n_seqs, K] cache view
+    const ggml_tensor * src = cpy->src[0];
+    const ggml_tensor * dst = cpy->src[1];
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { n_hist * channels, n_seqs, K, 1 };
+    if (src->op != GGML_OP_VIEW || src->view_src != conv || !ggml_is_contiguous(src) ||
+        src->view_offs != (size_t) ggml_row_size(GGML_TYPE_F32, channels * n_tokens * n_seqs) ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), src->ne)) {
+        return 0;
+    }
+    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) || dst->nb[0] != sizeof(float)) {
+        return 0;
+    }
+
+    fused.data        = (float *) dst->data;
+    fused.seq_stride  = (int64_t) (dst->nb[1] / sizeof(float));
+    fused.slot_stride = (int64_t) (dst->nb[2] / sizeof(float));
+    return skip;
+}
+
+// rms_norm(x) -> mul(w) -> sigmoid(z) -> mul: four nodes in this order with at most views between them
+// (llama_model_qwen4exp::graph::build_norm_gated puts the gate first, so they are consecutive there), each
+// intermediate read only inside the four. Fills idx with their indices.
+static bool ggml_cuda_gated_rms_norm_match(const ggml_cgraph * cgraph, int i, int (&idx)[4]) {
+    if (!ggml_cuda_gdn_fuse_enabled() || cgraph->nodes[i]->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    idx[0] = i;
+    for (int k = 1; k < 4; ++k) {
+        int j = idx[k - 1] + 1;
+        while (j < cgraph->n_nodes && j <= idx[k - 1] + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        if (j >= cgraph->n_nodes || ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            return false;
+        }
+        idx[k] = j;
+    }
+    const ggml_tensor * norm  = cgraph->nodes[idx[0]];
+    const ggml_tensor * mul_w = cgraph->nodes[idx[1]];
+    const ggml_tensor * sig   = cgraph->nodes[idx[2]];
+    const ggml_tensor * mul_g = cgraph->nodes[idx[3]];
+    if (mul_w->op != GGML_OP_MUL || (mul_w->src[0] != norm && mul_w->src[1] != norm) ||
+        sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+        mul_g->op != GGML_OP_MUL ||
+        !((mul_g->src[0] == mul_w && mul_g->src[1] == sig) || (mul_g->src[0] == sig && mul_g->src[1] == mul_w))) {
+        return false;
+    }
+    const ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx, 4, ops, &idx[3], 1)) {
+        return false;
+    }
+    return ggml_cuda_gated_rms_norm_supported(norm, mul_w, sig, mul_g);
 }
 
 // match ssm_scan + the strided cpy that scatters its state snapshots into the cache, so the kernel writes them and skips the cpy
@@ -4522,11 +4748,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
+            // and the state gather, which the loop skipped (ggml_cuda_gdn_state_gather_skipped)
+            ggml_cuda_gated_delta_net_state_rows rows;
+            const bool read_rows = ggml_cuda_try_gdn_state_gather_fusion(cgraph, i, rows) >= 0;
 #ifdef GGML_CUDA_DEBUG
-            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
-                          __func__, node->name, nodes_to_skip);
+            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes, state from the cache: %d)\n",
+                          __func__, node->name, nodes_to_skip, read_rows);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy, read_rows ? &rows : nullptr);
             return nodes_to_skip;
         }
     }
@@ -4542,6 +4771,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // gdn_conv -> cpy: the conv window writes its new histories into the cache
+    if (node->op == GGML_OP_GDN_CONV) {
+        ggml_cuda_gdn_conv_fused_cache fused_tail_cpy;
+        const int nodes_to_skip = ggml_cuda_try_gdn_conv_cache_fusion(cgraph, i, fused_tail_cpy);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_gdn_conv(*cuda_ctx, node, &fused_tail_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // rms_norm * w * sigmoid(z): the gated output norm of the recurrent layers, one launch for four
+    {
+        int idx[4];
+        if (ggml_cuda_gated_rms_norm_match(cgraph, i, idx) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, idx[3] - i + 1, &idx[3], 1)) {
+            ggml_cuda_op_gated_rms_norm(*cuda_ctx, node, cgraph->nodes[idx[1]], cgraph->nodes[idx[2]], cgraph->nodes[idx[3]]);
+            return idx[3] - i;
         }
     }
 
@@ -5603,6 +5852,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // a recurrent state gather whose gated_delta_net reads the cache row itself
+                if (ggml_cuda_gdn_state_gather_skipped(cgraph, i)) {
+                    continue;
+                }
+
                 const ggml_tensor * q8_1_row_before = cuda_ctx->q8_1_row.src;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -6022,6 +6276,22 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         }
                     }
                 }
+            }
+        }
+
+        // a gated_delta_net that reads its state row from the cache reads the gather's row ids after the skipped
+        // gather would have, so they must not be freed before it
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_gated_delta_net_state_rows rows;
+            const int gather_idx = ggml_cuda_try_gdn_state_gather_fusion(cgraph, i, rows);
+            if (gather_idx >= 0) {
+                params->add_alloc_dep(params->user_data, cgraph->nodes[gather_idx]->src[1], cgraph->nodes[i]);
+            }
+            // the gated norm reads x and z until it writes its output, so neither may share its memory
+            int idx[4];
+            if (ggml_cuda_gated_rms_norm_match(cgraph, i, idx)) {
+                add_alloc_deps(i, idx[3]);
+                i = idx[3];
             }
         }
     }
@@ -6936,6 +7206,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
+        case GGML_OP_GDN_CONV:
+            return ggml_cuda_gdn_conv_supported(op);
         case GGML_OP_CONT:
             return true;
         case GGML_OP_DIAG_MASK_INF:

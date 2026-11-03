@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -802,6 +803,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
+    // LLAMA_ARCHS_N_RS_SEQ=<n>: recurrent snapshots per sequence, so the rollback slots' writes run too
+    if (const char * env = getenv("LLAMA_ARCHS_N_RS_SEQ")) {
+        ctx_params.n_rs_seq = (uint32_t) atoi(env);
+    }
     if (moe_cache_size > 0) {
         // the MoE cache is only used for small ubatches
         ctx_params.moe_cache_size = moe_cache_size;
@@ -887,6 +892,81 @@ static int32_t get_logits_mixed(
         }
     }
     return 0;
+}
+
+// the tokens decoded from an empty memory in steps of 1, 2, ..., 8 tokens: the sizes of decode steps and k-token verifies
+static std::vector<float> get_logits_steps(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens.size();
+
+    llama_memory_clear(llama_get_memory(lctx), true);
+
+    common_batch batch(lctx);
+    std::vector<float> ret;
+    ret.reserve((size_t) n_tokens*n_vocab);
+    uint32_t pos = 0;
+    for (uint32_t step = 1; pos < n_tokens; step = step % 8 + 1) {
+        const uint32_t n = std::min(step, n_tokens - pos);
+        batch.clear();
+        for (uint32_t i = 0; i < n; i++) {
+            batch.add(tokens[pos + i], pos + i, 0, true);
+        }
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode a step");
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            const float * logits_ith = llama_get_logits_ith(lctx, i);
+            ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+        }
+        pos += n;
+    }
+    return ret;
+}
+
+// LLAMA_ARCHS_LOGITS=<prefix>: write an architecture's CPU logits (one batch, then the steps of get_logits_steps) to
+// <prefix><arch>.f32, or compare with that file when it exists, so two builds or two settings (LLAMA_GDN_FUSE=0 and 1)
+// can be compared; false when they differ by more than float rounding
+static bool logits_dump_or_compare(const char * arch_name, const std::vector<float> & logits) {
+    const char * prefix = getenv("LLAMA_ARCHS_LOGITS");
+    if (prefix == nullptr) {
+        return true;
+    }
+    const std::string path = std::string(prefix) + arch_name + ".f32";
+
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        f = fopen(path.c_str(), "wb");
+        if (f == nullptr || fwrite(logits.data(), sizeof(float), logits.size(), f) != logits.size()) {
+            LOG_ERR("%s: cannot write %s\n", __func__, path.c_str());
+            if (f != nullptr) {
+                fclose(f);
+            }
+            return false;
+        }
+        fclose(f);
+        LOG_INF("%s: wrote %zu logits to %s\n", __func__, logits.size(), path.c_str());
+        return true;
+    }
+
+    std::vector<float> ref(logits.size());
+    const bool same_size = fread(ref.data(), sizeof(float), ref.size(), f) == ref.size() && fgetc(f) == EOF;
+    fclose(f);
+    if (!same_size) {
+        LOG_ERR("%s: %s holds a different number of logits\n", __func__, path.c_str());
+        return false;
+    }
+
+    double max_abs = 0.0;
+    size_t n_diff  = 0;
+    for (size_t i = 0; i < logits.size(); i++) {
+        max_abs = std::max(max_abs, (double) std::fabs(logits[i] - ref[i]));
+        n_diff += logits[i] != ref[i];
+    }
+    const double e = nmse(ref, logits);
+    LOG("%s: logits against %s: nmse %.3e, max abs diff %.3e, %zu of %zu differ\n",
+        arch_name, path.c_str(), e, max_abs, n_diff, logits.size());
+    return e <= 1e-8;
 }
 
 static bool check_causal_attn_toggle(
@@ -1302,6 +1382,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        if (!encode && getenv("LLAMA_ARCHS_LOGITS") != nullptr) {
+                            std::vector<float> logits_all = logits_cpu;
+                            const std::vector<float> logits_steps =
+                                get_logits_steps(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens);
+                            logits_all.insert(logits_all.end(), logits_steps.begin(), logits_steps.end());
+                            LOG("%s: one batch against steps of 1-8 tokens: nmse %.3e\n",
+                                llama_arch_name(arch), nmse(logits_cpu, logits_steps));
+                            if (!logits_dump_or_compare(llama_arch_name(arch), logits_all)) {
+                                test_ok = false;
+                            }
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
                         test_executed = true;

@@ -10085,6 +10085,112 @@ void ggml_compute_forward_ssm_conv(
     }
 }
 
+// ggml_compute_forward_gdn_conv
+
+// the same sums in the same order as ggml_ssm_conv, ggml_silu, and ggml_rms_norm then ggml_scale for the L2 norm
+static void ggml_compute_forward_gdn_conv_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cache = dst->src[0]; // {(d_conv - 1) * channels, n_rows}
+    const ggml_tensor * ids   = dst->src[1]; // {n_seqs}
+    const ggml_tensor * x     = dst->src[2]; // {channels, n_tokens, n_seqs}
+    const ggml_tensor * c     = dst->src[3]; // {d_conv, channels}
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_norm = ggml_get_op_params_i32(dst, 0);
+    const int64_t group  = ggml_get_op_params_i32(dst, 1);
+    const float   eps    = ggml_get_op_params_f32(dst, 2);
+    const int64_t K      = ggml_get_op_params_i32(dst, 3);
+
+    const int64_t d_conv   = c->ne[0];
+    const int64_t channels = c->ne[1];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_seqs   = x->ne[2];
+    const int64_t n_hist   = d_conv - 1;
+
+    // as build_gdn_l2_norm: rms_norm with eps/n, then a scale by 1/sqrt(n)
+    const float norm_eps   = eps / (float) group;
+    const float norm_scale = 1.0f / sqrtf((float) group);
+
+    float * out   = (float *) dst->data;
+    float * tails = out + channels * n_tokens * n_seqs;
+
+    // one group of channels per task, so a normalized group stays on one thread
+    const int64_t n_groups = (channels + group - 1) / group;
+
+    for (int64_t ig = ith; ig < n_groups; ig += nth) {
+        const int64_t ch0 = ig * group;
+        const int64_t ch1 = std::min(ch0 + group, channels);
+        const bool    norm = ch1 <= n_norm;
+
+        for (int64_t is = 0; is < n_seqs; ++is) {
+            const int32_t row  = ((const int32_t *) ids->data)[is];
+            const float * hist = (const float *) ((const char *) cache->data + row * cache->nb[1]);
+
+            // column j of history + x for channel ch
+            auto value = [&](int64_t ch, int64_t j) -> float {
+                if (j < n_hist) {
+                    return hist[ch * n_hist + j];
+                }
+                return *(const float *) ((const char *) x->data + ch * x->nb[0] + (j - n_hist) * x->nb[1] + is * x->nb[2]);
+            };
+
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                float * y = out + (is * n_tokens + it) * channels;
+                for (int64_t ch = ch0; ch < ch1; ++ch) {
+                    const float * w = (const float *) ((const char *) c->data + ch * c->nb[1]);
+                    float sumf = 0.0f;
+                    for (int64_t i0 = 0; i0 < d_conv; ++i0) {
+                        sumf += value(ch, it + i0) * w[i0];
+                    }
+                    y[ch] = sumf;
+                }
+                // groups start at multiples of the vector width, so this matches ggml_silu over the whole row
+                ggml_vec_silu_f32(ch1 - ch0, y + ch0, y + ch0);
+                if (norm) {
+                    ggml_float sum = 0.0;
+                    for (int64_t ch = ch0; ch < ch1; ++ch) {
+                        sum += (ggml_float) (y[ch] * y[ch]);
+                    }
+                    const float mean  = sum / group;
+                    const float scale = 1.0f / sqrtf(mean + norm_eps);
+                    for (int64_t ch = ch0; ch < ch1; ++ch) {
+                        y[ch] = (y[ch] * scale) * norm_scale;
+                    }
+                }
+            }
+
+            // slot k ends k tokens before the end of the ubatch
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t start = std::max<int64_t>(0, n_tokens - k);
+                float * tail = tails + (k * n_seqs + is) * n_hist * channels;
+                for (int64_t ch = ch0; ch < ch1; ++ch) {
+                    for (int64_t j = 0; j < n_hist; ++j) {
+                        tail[ch * n_hist + j] = value(ch, start + j);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_gdn_conv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gdn_conv_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_ssm_scan
 
 static void ggml_compute_forward_ssm_scan_f32(

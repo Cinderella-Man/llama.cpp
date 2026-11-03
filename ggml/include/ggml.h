@@ -590,6 +590,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_GDN_CONV,
 
         GGML_OP_UNARY,
 
@@ -2717,6 +2718,31 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // Gated DeltaNet conv window, one op for what ggml_get_rows + ggml_concat + ggml_ssm_conv + ggml_silu and an
+    // L2 norm per q and k head do: each sequence's history read from its cache row, the depthwise causal conv over
+    // history + x, SiLU, and the first n_norm channels L2-normalized in groups of `group` channels, as
+    // ggml_scale(ggml_rms_norm(x, eps/group), 1/sqrt(group)) does.
+    //
+    //   cache : [(d_conv - 1) * channels, n_rows], each row one history [d_conv - 1, channels], time fastest
+    //   ids   : [n_seqs] I32, the cache row of each sequence
+    //   x     : [channels, n_tokens, n_seqs], rows contiguous
+    //   c     : [d_conv, channels]
+    //
+    // the output packs the conv output [channels, n_tokens, n_seqs] followed by K new histories
+    // [d_conv - 1, channels, n_seqs], slot k ending k tokens before the end of the ubatch (window start
+    // max(0, n_tokens - k) of history + x), for the caller to copy into the cache; backends may write them
+    // there directly when they fuse that copy
+    GGML_API struct ggml_tensor * ggml_gdn_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            int                   n_norm,
+            int                   group,
+            float                 eps,
+            int                   K);
 
     // DSA lightning indexer
     //
