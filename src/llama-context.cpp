@@ -1933,13 +1933,14 @@ int32_t llama_context::pipe_init(int32_t n_slots, int32_t n_chunk_slots, int32_t
 
     // a recurrent state can't drop a tail: each slot writes the recurrent states of its tokens to its own state group,
     // and a token reads its source state from whichever group holds it, so a wrong guess leaves the state before it in
-    // place. The delta-net models (Qwen3.5/3.6, Qwen3-Next) write their states that way; others are refused
+    // place. The delta-net models (Qwen3.5/3.6, Qwen3-Next, Qwen3.8-Flash-Next with its n-gram conv history) write
+    // their states that way; others are refused
     llama_memory_recurrent * mem_recr = nullptr;
     if (llama_model_is_recurrent(&model) || llama_model_is_hybrid(&model)) {
         auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
         mem_recr = mem_hybrid ? mem_hybrid->get_mem_recr() : dynamic_cast<llama_memory_recurrent *>(memory.get());
         const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
-                             model.arch == LLM_ARCH_QWEN3NEXT;
+                             model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN4EXP;
         if (mem_recr == nullptr || !arch_ok || cparams.n_rs_seq != 0) {
             LLAMA_LOG_ERROR("%s: pipelined decoding of a recurrent model supports the delta-net models with "
                     "n_rs_seq 0 only (architecture %s, n_rs_seq %u)\n", __func__, llm_arch_name(model.arch), cparams.n_rs_seq);
@@ -2491,9 +2492,11 @@ void llama_context::pipe_protect_state(int32_t i_slot, llama_seq_id seq_id, llam
             continue;
         }
 
+        // the slot's own backend for the device (with LLAMA_PIPE_CHUNK_STREAM a chunk slot's runs on a stream of its
+        // own), so the copy is ordered after the slot's last write of the group and before its next one
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
         ggml_backend_t backend = nullptr;
-        for (auto * be : backend_ptrs) {
+        for (auto * be : pipe_slots[i_slot].backends) {
             if (ggml_backend_get_device(be) == dev) {
                 backend = be;
                 break;
