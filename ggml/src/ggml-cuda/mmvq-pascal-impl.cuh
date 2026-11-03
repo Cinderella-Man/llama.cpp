@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "mmvq-pascal-iq.cuh"
 
 // The device code of the Pascal matrix-vector products (mmvq-pascal.cu) that the persistent MoE kernel
 // (moe-persistent.cu) shares, so that both compile the same arithmetic: weight block layouts, loads, activation blocks
@@ -21,6 +22,9 @@ template <> struct mmvqp_traits<GGML_TYPE_Q6_K>   { static constexpr int bs = si
 template <> struct mmvqp_traits<GGML_TYPE_Q2_0>   { static constexpr int bs = sizeof(block_q2_0);   static constexpr int na = QK2_0 / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_IQ2_S>   { static constexpr int bs = sizeof(block_iq2_s);   static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = sizeof(block_iq3_xxs); static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_IQ2_XXS> { static constexpr int bs = sizeof(block_iq2_xxs); static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_IQ2_XS>  { static constexpr int bs = sizeof(block_iq2_xs);  static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_IQ3_S>   { static constexpr int bs = sizeof(block_iq3_s);   static constexpr int na = QK_K / QK8_1; };
 
 // Tuning switches of the grid types' kernels, set at compile time (-D); the defaults are the fastest of 11 variants on a
 // P106 (one-token expert products at Ornith-1.5-122B's shapes, 2026-10-27):
@@ -42,7 +46,8 @@ template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = s
 #define MMVQP_IQ_R 1
 #endif
 template <ggml_type type> constexpr __host__ __device__ bool mmvqp_grid_type() {
-    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
+    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+        type == GGML_TYPE_IQ3_S;
 }
 template <ggml_type type> constexpr __host__ __device__ int mmvqp_min_blocks() {
     return mmvqp_grid_type<type>() ? MMVQP_IQ_MIN_BLOCKS : 1;
@@ -51,12 +56,16 @@ template <ggml_type type> constexpr __host__ __device__ int mmvqp_min_blocks() {
 // Lookup tables of the grid types, copied into each block's shared memory by mmvqp_init_tabs (32-bit words): the grid
 // (IQ2_S: 1024 entries of 8 bytes, IQ3_XXS: 256 entries of 4 bytes), then for every sign pattern two words of byte
 // masks, 0xFF where a weight is negative, for its first and its last four weights (IQ2_S: the 256 sign bytes; IQ3_XXS:
-// the 128 7-bit patterns, whose eighth sign is their parity).
+// the 128 7-bit patterns, whose eighth sign is their parity). IQ2_XXS, IQ2_XS and IQ3_S keep only their grids
+// (IQ2_XXS 256 entries of 8 bytes, IQ2_XS 512 of 8, IQ3_S 512 of 4) and compute their masks in registers
+// (mmvq-pascal-iq.cuh).
 template <ggml_type type> constexpr __host__ __device__ int mmvqp_tab_grid_words() {
-    return type == GGML_TYPE_IQ2_S ? 2*1024 : type == GGML_TYPE_IQ3_XXS ? 256 : 0;
+    return type == GGML_TYPE_IQ2_S ? 2*1024 : type == GGML_TYPE_IQ3_XXS ? 256 :
+        type == GGML_TYPE_IQ2_XXS ? mmvqp_iq::GRID_WORDS_IQ2_XXS : type == GGML_TYPE_IQ2_XS ? mmvqp_iq::GRID_WORDS_IQ2_XS :
+        type == GGML_TYPE_IQ3_S ? mmvqp_iq::GRID_WORDS_IQ3_S : 0;
 }
 template <ggml_type type> constexpr __host__ __device__ int mmvqp_tab_words() {
-    return type == GGML_TYPE_IQ2_S ? 2*1024 + 2*256 : type == GGML_TYPE_IQ3_XXS ? 256 + 2*128 : 0;
+    return type == GGML_TYPE_IQ2_S ? 2*1024 + 2*256 : type == GGML_TYPE_IQ3_XXS ? 256 + 2*128 : mmvqp_tab_grid_words<type>();
 }
 
 // 4 sign bits -> 4 byte masks (bit j -> 0xFF in byte j)
@@ -87,6 +96,12 @@ static __device__ __forceinline__ void mmvqp_init_tabs(uint32_t * tab) {
             const uint32_t s8 = s | ((__popc(s) & 1) << 7); // ksigns_iq2xs[s]
             tab[G + 2*s + 0] = mmvqp_sign_bytes(s8 & 0xF);
             tab[G + 2*s + 1] = mmvqp_sign_bytes(s8 >> 4);
+        }
+    } else if constexpr (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_S) {
+        const uint32_t * grid = type == GGML_TYPE_IQ2_XXS ? (const uint32_t *) iq2xxs_grid :
+                                type == GGML_TYPE_IQ2_XS  ? (const uint32_t *) iq2xs_grid : iq3s_grid;
+        for (int i = tid; i < G; i += nth) {
+            tab[i] = grid[i];
         }
     }
     GGML_UNUSED_VARS(tab, tid, nth);
@@ -254,7 +269,7 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             }
             S = d8 * (float) sum;
         }
-        if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
+        if constexpr (type == GGML_TYPE_Q8_0 || mmvqp_grid_type<type>()) {
             a.d[b] = d8;
             a.s[b] = 0.0f;
         } else if constexpr (type == GGML_TYPE_Q4_0) {
@@ -570,6 +585,15 @@ static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvq
         } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
             static_assert(C == 1, "IQ3_XXS: one super-block per lane");
             acc = mmvqp_dot_iq3_xxs(w, a, 8*b, tab, acc);
+        } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+            static_assert(C == 1, "IQ2_XXS: one super-block per lane");
+            acc = mmvqp_iq::dot_iq2_xxs(w, a.u + 8*b, a.d + 8*b, tab, acc);
+        } else if constexpr (type == GGML_TYPE_IQ2_XS) {
+            static_assert(C == 1, "IQ2_XS: one super-block per lane");
+            acc = mmvqp_iq::dot_iq2_xs(w, a.u + 8*b, a.d + 8*b, tab, acc);
+        } else if constexpr (type == GGML_TYPE_IQ3_S) {
+            static_assert(C == 1, "IQ3_S: one super-block per lane");
+            acc = mmvqp_iq::dot_iq3_s(w, a.u + 8*b, a.d + 8*b, tab, acc);
         } else if constexpr (type == GGML_TYPE_Q4_K) {
             acc = mmvqp_dot_q4_K(w + o/4, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_Q5_K) {
@@ -658,6 +682,9 @@ static constexpr mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate)
             return gate ? mmvqp_shape{ 2, 2, true } : mmvqp_shape{ 1, 2, true, true };
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_S:
             return { MMVQP_IQ_R, 1, true };
         default:
             GGML_ABORT("fatal error");
