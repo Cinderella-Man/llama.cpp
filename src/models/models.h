@@ -2912,6 +2912,17 @@ struct llama_model_qwen4exp : public llama_model_base {
                         int64_t   channels,
                             int   il);
 
+        // the delta-net conv window as one ggml_gdn_conv: the history read from its cache row, conv, SiLU, the q and k
+        // heads L2-normalized, the new histories copied back; returns the conv output [channels, n_seq_tokens, n_seqs]
+        ggml_tensor * build_gdn_conv_at(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                    ggml_tensor * conv_kernel,
+                        int64_t   n_norm,
+                        int64_t   group,
+                            int   il);
+
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);
 

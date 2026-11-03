@@ -5,6 +5,17 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+
+// LLAMA_GDN_FUSE=0 builds the delta-net conv window and output norm as separate ops, as before C20 (Q438), so one
+// binary runs both arms; GGML_CUDA_GDN_FUSE=0 turns off the CUDA side (the state read in place, C19)
+static bool qwen4exp_gdn_fuse_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_GDN_FUSE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -711,6 +722,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    // the gate's producers go into the graph first, so rms_norm, mul, sigmoid and mul are consecutive nodes, which
+    // the CUDA backend runs as one launch (C20)
+    if (qwen4exp_gdn_fuse_enabled()) {
+        ggml_build_forward_expand(gf, gate);
+    }
+
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
@@ -1168,20 +1185,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+    const float eps_norm = hparams.f_norm_rms_eps;
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    // C20 (Q438): the conv window in one op, with the q and k heads already L2-normalized
+    const bool fuse_conv = qwen4exp_gdn_fuse_enabled() && conv_kernel->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous(conv_kernel) && conv_kernel_size >= 2;
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+    ggml_tensor * conv_qkv_mix = nullptr;
+    ggml_tensor * state        = nullptr;
+    if (fuse_conv) {
+        conv_qkv_mix = build_gdn_conv_at(inp, conv_states_all, qkv_mixed, conv_kernel,
+                head_k_dim * num_k_heads * 2, head_k_dim, il);
+        cb(conv_qkv_mix, "conv_output_silu", il);
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    } else {
+        ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
+                conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        conv_qkv_mix = conv_output_silu;
+    }
 
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
 
@@ -1208,11 +1243,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
-
-    const float eps_norm = hparams.f_norm_rms_eps;
-
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    if (!fuse_conv) {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
@@ -1447,6 +1481,66 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     }
 
     return conv_input;
+}
+
+// The conv window of build_conv_state_at, ggml_ssm_conv, ggml_silu and the q/k build_gdn_l2_norm in one op (C20, Q438):
+// the op reads each sequence's history from its cache row, as build_rs's getter, so there is no gather into a
+// temporary and no concat; it emits the same histories per rollback slot, which one copy writes back.
+ggml_tensor * llama_model_qwen4exp::graph::build_gdn_conv_at(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        x,
+        ggml_tensor *        conv_kernel,
+        int64_t              n_norm,
+        int64_t              group,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const auto     kv_head  = mctx_cur->get_head();
+    const uint32_t mem_size = mctx_cur->get_size();
+
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t channels     = conv_kernel->ne[1];
+    const int64_t state_cols   = conv_kernel->ne[0] - 1;
+    const int64_t row_total    = conv_states_all->ne[0];
+
+    GGML_ASSERT(state_cols * channels == row_total);
+    GGML_ASSERT(x->ne[0] == channels && x->ne[1] == n_seq_tokens && x->ne[2] == n_seqs);
+
+    // [TAG_RECURRENT_ROLLBACK_SPLITS] one history per rollback slot, as build_conv_state_at
+    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+
+    const float eps = hparams.f_norm_rms_eps;
+
+    ggml_tensor * out = build_rs(inp, conv_states_all, row_total, n_seqs,
+            [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+                return ggml_gdn_conv(ctx, states, ids, x, conv_kernel, (int) n_norm, (int) group, eps, (int) n_slots);
+            });
+    cb(out, "gdn_conv", il);
+
+    const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+
+    // all slots in one copy: slot s of the ubatch's cells is s * mem_size rows on
+    ggml_tensor * tails = ggml_view_3d(ctx0, out,
+            row_total, n_seqs, n_slots,
+            ggml_row_size(out->type, row_total),
+            ggml_row_size(out->type, row_total * n_seqs),
+            ggml_row_size(out->type, channels * n_seq_tokens * n_seqs));
+
+    ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
+            row_total, n_seqs, n_slots,
+            conv_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, tails, dst));
+
+    return ggml_view_3d(ctx0, out,
+            channels, n_seq_tokens, n_seqs,
+            ggml_row_size(out->type, channels),
+            ggml_row_size(out->type, channels * n_seq_tokens),
+            0);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
