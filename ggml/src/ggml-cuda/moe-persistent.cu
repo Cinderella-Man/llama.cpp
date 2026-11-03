@@ -281,19 +281,19 @@ static __device__ __forceinline__ void moep_topk(float (&wt)[NE / WARP_SIZE], fl
     }
 }
 
-// quantize_q8_1: lane iqs of a warp holds value iqs of block ib (global or shared memory)
+// quantize_q8_1: lane iqs of a warp holds value iqs of block ib (global or shared memory); the block sum is d times the
+// sum of the int8 codes (#31247)
 static __device__ __forceinline__ void moep_quantize_q8_1(const float xi, block_q8_1 * y, const int ib, const int iqs) {
     float amax = fabsf(xi);
-    float sum  = xi;
     amax = warp_reduce_max(amax);
-    sum  = warp_reduce_sum(sum);
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const int  sum = warp_reduce_sum((int) q);
     y[ib].qs[iqs] = q;
     if (iqs > 0) {
         return;
     }
-    y[ib].ds = make_half2(d, sum);
+    y[ib].ds = make_half2(d, d * sum);
 }
 
 // The rows of one warp of mul_mat_vec_q_pascal, as the per-op kernel computes them, with staged weight loads. The lane

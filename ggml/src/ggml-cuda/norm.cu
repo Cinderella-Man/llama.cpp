@@ -829,10 +829,10 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // quantization (GGML_CUDA_NORM_Q8, single-token decode).
 //   - The norm runs rms_norm_f32<block_size, 1, true, true>'s layout: one float4 per thread, the same partial sums and
 //     block reduction, the same scale and products, so dst is bit-identical to it.
-//   - Q8_1 block ib (32 values) is held by threads 8 ib .. 8 ib + 7. quantize_q8_1 reduces its maximum and sum over 32
-//     lanes with the xor offsets 16, 8, 4, 2, 1; lane 4 t + c here is component c of thread t, so offsets 16, 8, 4 are
-//     shuffles between threads (xor 4, 2, 1) and offsets 2, 1 combine components (c ^ 2, then c ^ 1). The sums are thus
-//     added in quantize_q8_1's order and the blocks are bit-identical to it.
+//   - Q8_1 block ib (32 values) is held by threads 8 ib .. 8 ib + 7. quantize_q8_1 reduces its maximum over 32 lanes
+//     with the xor offsets 16, 8, 4, 2, 1; lane 4 t + c here is component c of thread t, so offsets 16, 8, 4 are
+//     shuffles between threads (xor 4, 2, 1) and offsets 2, 1 combine components (c ^ 2, then c ^ 1). Its block sum is
+//     d times the sum of the 32 int8 codes (#31247), exact in any order. The blocks are thus bit-identical to it.
 //   - All inputs are read before the block reduction and all outputs written after it, by one block, so outputs may
 //     overlap the inputs (in-place residual adds).
 template <int block_size, bool do_add>
@@ -875,22 +875,18 @@ static __global__ void add_rms_norm_mul_q8_1_f32(
 
     const float v[4] = { r.x, r.y, r.z, r.w };
     float amax[4];
-    float sum[4];
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
         amax[c] = fabsf(v[c]);
-        sum[c]  = v[c];
     }
 #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1) {
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             amax[c] = fmaxf(amax[c], __shfl_xor_sync(0xffffffff, amax[c], offset, WARP_SIZE));
-            sum[c] += __shfl_xor_sync(0xffffffff, sum[c], offset, WARP_SIZE);
         }
     }
     const float amax_b = fmaxf(fmaxf(amax[0], amax[2]), fmaxf(amax[1], amax[3]));
-    const float sum_b  = (sum[0] + sum[2]) + (sum[1] + sum[3]);
 
     const float d = amax_b / 127.0f;
     char4 q;
@@ -899,10 +895,16 @@ static __global__ void add_rms_norm_mul_q8_1_f32(
     q.z = amax_b == 0.0f ? 0 : roundf(v[2] / d);
     q.w = amax_b == 0.0f ? 0 : roundf(v[3] / d);
 
+    int sum_q = int(q.x) + int(q.y) + int(q.z) + int(q.w);
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        sum_q += __shfl_xor_sync(0xffffffff, sum_q, offset, WARP_SIZE);
+    }
+
     block_q8_1 * y = q8 + tid / 8;
     *((char4 *) (y->qs + 4 * (tid % 8))) = q;
     if (tid % 8 == 0) {
-        y->ds = make_half2(d, sum_b);
+        y->ds = make_half2(d, d * sum_q);
     }
 }
 
