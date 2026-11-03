@@ -12222,12 +12222,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // BF16 products of 1 to 4 tokens at the shapes of Qwen3.8-Flash-Next's BF16 tensors (the hyper-connection
+    // BF16 products of 1 to 8 tokens at the shapes of Qwen3.8-Flash-Next's BF16 tensors (the hyper-connection
     // projections 320 -> 10240, 10240 -> 320 and 10240 -> 4, the indexer's 2560 -> 512, the recurrent layers'
     // 2560 -> 48), an odd row count, rows of 125 and 9 chunks of 8 weights, and a row width that is no multiple of 8
     // (left to mul_mat_vec_f); these reach every lane-group size of the Pascal BF16 kernel (mmvf-pascal.cu;
     // GGML_CUDA_MMVF_PASCAL=2 runs it on any GPU, GGML_CUDA_MMVF_PASCAL_NSM=5 with the P106-090's launch shapes)
-    for (int64_t n : { 1, 2, 3, 4 }) {
+    for (int64_t n = 1; n <= 8; ++n) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                 { 10240, 320 }, { 320, 10240 }, { 4, 10240 }, { 512, 2560 }, { 48, 2560 }, { 10241, 320 },
                 { 333, 1000 }, { 5, 72 }, { 64, 100 } }) {
@@ -12272,6 +12272,47 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q2_0, n));
         test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q2_0, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
         test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q2_0, GGML_TYPE_F32, 28, 10, true, 1024, n, 256));
+    }
+
+    // The k-column Pascal products (mmvq-pascal-kcol.cu) of 1 to 8 tokens: Qwen3.8-Flash-Next's dense shapes (the
+    // retyped hyper-connection projections 320 -> 10240 and 10240 -> 320 in Q8_0; attn_qkv, attn_gate and attn_q
+    // 2560 -> 10240, 6144 and 12288 in Q3_K and IQ4_XS; ssm_out 6144 -> 2560 in IQ4_XS and Q4_K; the shared expert's
+    // 640 -> 2560 and 2560 -> 640 in Q2_0; the output layer's 2560-wide rows in Q5_K and Q6_K, at 4096 rows), odd row
+    // counts, row widths that give each lane-group size and both staging modes, and rows that are views of wider rows
+    // (2-byte-aligned rows for Q3_K). GGML_CUDA_MMVQ_PASCAL=2 runs them on any GPU, GGML_CUDA_MMVQ_PASCAL_KCOL=2 also on
+    // every one-token product, GGML_CUDA_MMVQ_PASCAL_KCOL_R and _ITT force the other launch shapes.
+    {
+        struct kcol_case { ggml_type type; int64_t m, k, k_v; };
+        const std::vector<kcol_case> kcol_cases = {
+            { GGML_TYPE_Q8_0,   10240,   320,    0 }, { GGML_TYPE_Q8_0,     320, 10240,    0 },
+            { GGML_TYPE_Q8_0,     333,  2560,    0 }, { GGML_TYPE_Q8_0,     129,   192,    0 },
+            { GGML_TYPE_Q8_0,     256,   320,  384 },
+            { GGML_TYPE_Q2_0,    2560,   640,    0 }, { GGML_TYPE_Q2_0,     640,  2560,    0 },
+            { GGML_TYPE_Q2_0,     333,  1280,    0 }, { GGML_TYPE_Q2_0,     256,   640,  768 },
+            { GGML_TYPE_Q3_K,   10240,  2560,    0 }, { GGML_TYPE_Q3_K,    6144,  2560,    0 },
+            { GGML_TYPE_Q3_K,   12288,  2560,    0 }, { GGML_TYPE_Q3_K,     333,  1024,    0 },
+            { GGML_TYPE_Q3_K,     128,   256,    0 }, { GGML_TYPE_Q3_K,     256,  2560, 2816 },
+            { GGML_TYPE_IQ4_XS, 10240,  2560,    0 }, { GGML_TYPE_IQ4_XS,  2560,  6144,    0 },
+            { GGML_TYPE_IQ4_XS,   333,   768,    0 }, { GGML_TYPE_IQ4_XS,   256,  2560, 2816 },
+            { GGML_TYPE_Q4_K,    2560,  6144,    0 }, { GGML_TYPE_Q4_K,     333,  2560,    0 },
+            { GGML_TYPE_Q4_K,     128,  8192,    0 }, { GGML_TYPE_Q4_K,     256,  2560, 2816 },
+            { GGML_TYPE_Q5_K,    4096,  2560,    0 }, { GGML_TYPE_Q5_K,     333,  1280,    0 },
+            { GGML_TYPE_Q6_K,    4096,  2560,    0 }, { GGML_TYPE_Q6_K,     333,  1024,    0 },
+            { GGML_TYPE_Q6_K,     256,  2560, 2816 },
+        };
+        for (int64_t n = 1; n <= 8; ++n) {
+            for (const kcol_case & c : kcol_cases) {
+                test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, n, c.k, { 1, 1 }, { 1, 1 },
+                                                         { 0, 1, 2, 3 }, c.k_v));
+            }
+        }
+        // activations whose blocks sum past FP16's range
+        for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q2_0, GGML_TYPE_Q3_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K,
+                                GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+            for (int64_t n : { 1, 4, 8 }) {
+                test_cases.emplace_back(new test_mul_mat_large_act(type, 2560, n, 2560));
+            }
+        }
     }
     // all 512 experts, as the file has them
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, true, 512, 10,
@@ -13561,9 +13602,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // Qwen3.8-Flash-Next's BF16 products (hyper-connection projections, indexer, recurrent gates) at 1 to 4 tokens;
+    // Qwen3.8-Flash-Next's BF16 products (hyper-connection projections, indexer, recurrent gates) at 1 to 8 tokens;
     // compare the Pascal BF16 kernel (mmvf-pascal.cu) on and off with GGML_CUDA_MMVF_PASCAL
-    for (int64_t n : { 1, 2, 3, 4 }) {
+    for (int64_t n = 1; n <= 8; ++n) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                 { 10240, 320 }, { 320, 10240 }, { 4, 10240 }, { 512, 2560 }, { 48, 2560 } }) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
@@ -13592,6 +13633,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
+    // Qwen3.8-Flash-Next's dense quantized products at 1 to 8 tokens (a speculative-decoding verify): the retyped
+    // hyper-connection projections (Q8_0), attn_qkv, attn_gate and attn_q (Q3_K, IQ4_XS), ssm_out (IQ4_XS, Q4_K), the
+    // shared expert's down projection (Q2_0) and the output layer (Q5_K, the draft's Q6_K); compare the k-column kernels
+    // (mmvq-pascal-kcol.cu) on and off with GGML_CUDA_MMVQ_PASCAL_KCOL
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (auto [type, m, k] : std::vector<std::tuple<ggml_type, int64_t, int64_t>>{
+                { GGML_TYPE_Q8_0, 10240, 320 }, { GGML_TYPE_Q8_0, 320, 10240 },
+                { GGML_TYPE_Q3_K, 10240, 2560 }, { GGML_TYPE_Q3_K, 6144, 2560 }, { GGML_TYPE_Q3_K, 12288, 2560 },
+                { GGML_TYPE_IQ4_XS, 10240, 2560 }, { GGML_TYPE_IQ4_XS, 12288, 2560 }, { GGML_TYPE_IQ4_XS, 2560, 6144 },
+                { GGML_TYPE_Q4_K, 2560, 6144 }, { GGML_TYPE_Q2_0, 2560, 640 },
+                { GGML_TYPE_Q5_K, 248320, 2560 }, { GGML_TYPE_Q6_K, 248320, 2560 } }) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
         }
     }
 

@@ -26,7 +26,9 @@ static __device__ __forceinline__ float mmvfp_dot8(const uint4 w, const float4 a
 // stride_col_y4 float4 apart. dst, and bias if has_bias: T columns, stride_col_dst floats apart.
 // Lane sl of a group takes chunks sl, sl + G, ... of each of its R rows, so every weight load of a warp is a coalesced
 // 128-bit load; the activations of a chunk are loaded once for all R rows. Partial sums are reduced with shuffles in
-// the warp, then (G = 128) over the warps through shared memory, always in the same order.
+// the warp, then (G = 128) over the warps through shared memory, always in the same order; after the shuffles every lane
+// of a group holds all T * R sums, and lane lg writes those whose index t * R + i is lg modulo the group's lanes in the
+// warp, so a lane writes several outputs where T * R exceeds them.
 template <int G, int R, int T, bool has_bias>
 __launch_bounds__(MMVF_PASCAL_NT)
 static __global__ void mul_mat_vec_bf16_pascal(
@@ -37,7 +39,6 @@ static __global__ void mul_mat_vec_bf16_pascal(
     constexpr int GW   = G < warp ? G : warp;     // lanes of a group within one warp
     constexpr int WPG  = G > warp ? G / warp : 1; // warps per group
     static_assert(G == 8 || G == 32 || G == 128, "unsupported group size");
-    static_assert(T * R <= GW, "each lane writes at most one output");
 
     const int tid  = threadIdx.x;
     const int sl   = tid % G;
@@ -80,7 +81,6 @@ static __global__ void mul_mat_vec_bf16_pascal(
         yp += 2 * G;
     }
 
-    float v = 0.0f;
 #pragma unroll
     for (int t = 0; t < T; ++t) {
 #pragma unroll
@@ -89,38 +89,52 @@ static __global__ void mul_mat_vec_bf16_pascal(
             for (int off = GW / 2; off > 0; off >>= 1) {
                 acc[t][i] += __shfl_xor_sync(0xFFFFFFFF, acc[t][i], off, warp);
             }
-            if (lg == t * R + i) {
-                v = acc[t][i];
-            }
         }
     }
 
     if constexpr (WPG > 1) {
         __shared__ float buf[NW][T * R];
         const int wid = tid / warp;
-        if (lg < T * R) {
-            buf[wid][lg] = v;
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                if ((t * R + i) % GW == lg) {
+                    buf[wid][t * R + i] = acc[t][i];
+                }
+            }
         }
         __syncthreads();
         if (wid % WPG != 0) {
             return;
         }
 #pragma unroll
-        for (int k = 1; k < WPG; ++k) {
-            v += lg < T * R ? buf[wid + k][lg] : 0.0f;
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                if ((t * R + i) % GW == lg) {
+#pragma unroll
+                    for (int k = 1; k < WPG; ++k) {
+                        acc[t][i] += buf[wid + k][t * R + i];
+                    }
+                }
+            }
         }
     }
 
-    if (lg >= T * R) {
-        return;
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const int row = row0 + i;
+            if ((t * R + i) % GW != lg || row >= nrows) {
+                continue;
+            }
+            float v = acc[t][i];
+            if constexpr (has_bias) {
+                v += bias[t * stride_col_dst + row];
+            }
+            dst[t * stride_col_dst + row] = v;
+        }
     }
-    const int t   = lg / R;
-    const int row = row0 + lg % R;
-    if (row >= nrows) {
-        return;
-    }
-    if constexpr (has_bias) {
-        v += bias[t * stride_col_dst + row];
-    }
-    dst[t * stride_col_dst + row] = v;
 }
