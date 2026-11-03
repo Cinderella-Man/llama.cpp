@@ -13,6 +13,9 @@ struct ggml_cuda_gdn_mma_args {
     const float * state;
     float *       dst;
     float *       state_out;
+    // with state_ids, sequence s reads its initial state from row state_ids[s] of state (rows state_row_stride apart)
+    const int32_t * state_ids;
+    int64_t         state_row_stride;
 
     int64_t H;
     int64_t H_k;

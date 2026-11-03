@@ -148,13 +148,16 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     constexpr int                                  STATE_TILES = (D / 16) * (V / N);
     constexpr int                                  PER_WARP    = STATE_TILES / WARPS;
     static_assert(STATE_TILES % WARPS == 0, "state must divide across warps");
+    // the block reads its whole slice here, before it writes any of it at the end, so with state_ids the row
+    // may be one this block writes
+    const int64_t soff_in = a.state_ids ? (int64_t) a.state_ids[seq] * a.state_row_stride + (int64_t) h * D * D : soff;
     acc state[PER_WARP];
 #pragma unroll
     for (int j = 0; j < PER_WARP; ++j) {
         const int tile_index = warp + j * WARPS, r = (tile_index / (V / N)) * 16, c = (tile_index % (V / N)) * N;
 #pragma unroll
         for (int i = 0; i < acc::ne; ++i) {
-            state[j].x[i] = a.state[soff + (v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)];
+            state[j].x[i] = a.state[soff_in + (v0 + c + acc::get_j(i)) * D + r + acc::get_i(i)];
         }
     }
     auto read_qk = [&](int64_t t, float4 & q, float4 & k) {
