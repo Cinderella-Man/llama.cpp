@@ -12322,6 +12322,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, m, k, false, 1, 1, false,
                                                             true, false, false, { 1, 1 }));
     }
+    // gate/up grids just at and below 4 blocks per SM of a P106 (20 and 19 blocks at R = 2), where the Pascal kernel's
+    // rows per lane group change (Q612; GGML_CUDA_MMVQ_PASCAL_NSM=5 picks the P106's shapes on any GPU)
+    for (int64_t m : { 1280, 1216 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, m, 2560, false, 1, 1, false,
+                                                            false, true, false, { 1, 1 }));
+    }
 
     // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
     // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
