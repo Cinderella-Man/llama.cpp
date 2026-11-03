@@ -662,6 +662,9 @@ struct common_params {
     std::string pipe_store;              // continuation store for cont (common_pipe_store), empty = none
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t checkpoint_vram     = 0;     // newest context checkpoints of a slot kept in device memory; 0 = all on the host
+    bool    checkpoint_vram_sync = false; // move an older one to the host at once, not in the background
+    int32_t checkpoint_spread   = 0;     // context checkpoints at most N tokens apart inside a prompt, evicted by the smallest gap; 0 = off
     bool    checkpoint_tail2    = false; // two checkpoints at a prompt's end (4 + n_ubatch and 4 tokens before it), as stock
 
     // agent sessions: checkpoints while generating, at tokens that end a reasoning block or start a tool call
@@ -1347,6 +1350,13 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // (optional) the device store of the target's sequence that holds the target data's tensors
+    // (llama_state_seq_get_data_store): data_tgt is then the rest of the state, and size_dev the bytes on the devices;
+    // -1 = data_tgt is the whole state, on the host
+    int32_t store    = -1;
+    size_t  size_dev = 0;
+
+    // host bytes
     size_t size() const;
 
     bool empty() const;
@@ -1361,6 +1371,18 @@ struct common_prompt_checkpoint {
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
+
+    // the target data into the device store of seq_id; false (and no target data) if the store cannot hold it
+    bool update_tgt_store(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t store,
+            llama_state_seq_flags flags);
+
+    // the target data from its device store to the host; false (and no target data) if it fails
+    bool tgt_to_host(
+            llama_context * ctx,
+            llama_seq_id seq_id);
 
     void update_dft(
             llama_context * ctx,

@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 // roll back multiple sequences, then replay them in a single batch whose per-seq token count exceeds n_ubatch: each
@@ -487,6 +489,179 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// numbered device stores (llama_state_seq_get_data_store), which hold llama-server's context checkpoints on the devices
+// (--ctx-checkpoints-vram), against the host path that holds them otherwise:
+// - a state saved into a store and restored from it continues with the same logits, bit for bit, as the state saved and
+//   restored over the host; both follow the live continuation
+// - the store's host copy is the host blob, byte for byte, also when it is made on another thread while the context
+//   decodes (the server's background move to the host)
+// - two stores of one sequence keep their own states; a freed store, or a blob of another fill, restores nothing
+// the partial variant is the server's (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY: the recurrent state only, the positions
+// after the checkpoint removed from the rest)
+struct case_state_store : ctx_test {
+    explicit case_state_store(bool partial_) : partial(partial_) {}
+
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return partial ? "store_p" : "store"; }
+
+    const char * description() const override {
+        return partial ? "partial states in numbered device stores restore as from the host, copy to the host, stay apart"
+                       : "whole states in numbered device stores restore as from the host, copy to the host, stay apart";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prompt = 24;
+        constexpr llama_pos n_cont   = 6;
+
+        const llama_state_seq_flags flags = partial ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+        ctx_opts opts;
+        opts.n_ctx     = 256;
+        opts.n_seq_max = 1;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        llama_context * lctx = ctx.get();
+
+        using run_logits = std::vector<std::vector<float>>;
+
+        // decode [p0, p1) of seq 0 one token at a time, with the logits after each
+        const auto run_seq = [&](llama_pos p0, llama_pos p1, run_logits & out) {
+            out.clear();
+            for (llama_pos pos = p0; pos < p1; ++pos) {
+                std::vector<float> logits;
+                if (!decode_one(lctx, gen_token(n_vocab, 0, pos), pos, 0) || !get_current_logits(lctx, logits)) {
+                    return false;
+                }
+                out.push_back(std::move(logits));
+            }
+            return true;
+        };
+
+        const auto bitwise_equal = [](const run_logits & a, const run_logits & b) {
+            if (a.size() != b.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i].size() != b[i].size() || memcmp(a[i].data(), b[i].data(), a[i].size()*sizeof(float)) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const auto nmse = [](const run_logits & a, const run_logits & b) {
+            logits_diff diff;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                diff.add(a[i].data(), b[i].data(), std::min(a[i].size(), b[i].size()));
+            }
+            return diff.nmse();
+        };
+
+        // as the server restores a checkpoint at p: its state, then the positions from p on removed
+        const auto trim = [&](llama_pos p) {
+            return llama_memory_seq_rm(llama_get_memory(lctx), 0, p, -1);
+        };
+
+        const auto store_save = [&](int32_t store, std::vector<uint8_t> & meta) {
+            meta.resize(llama_state_seq_get_size_ext(lctx, 0, flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+            return llama_state_seq_get_data_store(lctx, meta.data(), meta.size(), 0, store, flags) == meta.size();
+        };
+
+        const auto store_load = [&](int32_t store, const std::vector<uint8_t> & meta) {
+            return llama_state_seq_set_data_store(lctx, meta.data(), meta.size(), 0, store, flags) == meta.size();
+        };
+
+        const auto store_copy = [&](int32_t store, const std::vector<uint8_t> & meta, std::vector<uint8_t> & out) {
+            out.resize(llama_state_seq_store_get_size_host(lctx, 0, store));
+            return !out.empty() &&
+                llama_state_seq_store_get_data_host(lctx, meta.data(), meta.size(), out.data(), out.size(), 0, store) == out.size();
+        };
+
+        CTX_REQUIRE(decode_gen(lctx, n_vocab, 0, 0, n_prompt), "prompt decode failed");
+
+        // the state at the prompt's end, on the host and in store 0
+        std::vector<uint8_t> host0;
+        std::vector<uint8_t> meta0;
+        CTX_REQUIRE(get_seq_state(lctx, 0, flags, host0), "host save failed");
+        CTX_REQUIRE(store_save(0, meta0), "store 0 save failed");
+        TLOG_INF("%s: host state %zu bytes, store blob %zu bytes, store %zu bytes\n", __func__,
+                host0.size(), meta0.size(), llama_state_seq_store_get_size_host(lctx, 0, 0) - meta0.size());
+
+        std::vector<uint8_t> copy0;
+        CTX_REQUIRE(store_copy(0, meta0, copy0), "host copy of store 0 failed");
+        CTX_REQUIRE(blobs_equal(host0, copy0), "the host copy of store 0 differs from the host state");
+
+        run_logits ref0;
+        run_logits from_host;
+        run_logits from_store;
+        CTX_REQUIRE(run_seq(n_prompt, n_prompt + n_cont, ref0), "reference decode failed");
+
+        CTX_REQUIRE(set_seq_state(lctx, 0, flags, host0) && trim(n_prompt), "host restore failed");
+        CTX_REQUIRE(run_seq(n_prompt, n_prompt + n_cont, from_host), "decode after the host restore failed");
+
+        CTX_REQUIRE(store_load(0, meta0) && trim(n_prompt), "store 0 restore failed");
+        CTX_REQUIRE(run_seq(n_prompt, n_prompt + n_cont, from_store), "decode after the store restore failed");
+
+        CTX_REQUIRE(bitwise_equal(from_host, from_store), "the store restore continues with other logits than the host restore");
+        TLOG_INF("%s: restore vs the live state, nmse = %.3e\n", __func__, nmse(ref0, from_store));
+        CTX_REQUIRE(nmse(ref0, from_store) <= NMSE_THRESHOLD, "the restored state does not follow the live one");
+
+        // the state after the continuation into store 1, while store 0 keeps the prompt's end
+        std::vector<uint8_t> host1;
+        std::vector<uint8_t> meta1;
+        CTX_REQUIRE(get_seq_state(lctx, 0, flags, host1), "host save 1 failed");
+        CTX_REQUIRE(store_save(1, meta1), "store 1 save failed");
+
+        run_logits ref1;
+        CTX_REQUIRE(run_seq(n_prompt + n_cont, n_prompt + 2*n_cont, ref1), "reference decode 1 failed");
+
+        // store 1's host copy on another thread, while the context restores store 0 and decodes from it
+        std::vector<uint8_t> copy1(llama_state_seq_store_get_size_host(lctx, 0, 1));
+        size_t n_copy1 = 0;
+        std::thread th([&]() {
+            n_copy1 = llama_state_seq_store_get_data_host(lctx, meta1.data(), meta1.size(), copy1.data(), copy1.size(), 0, 1);
+        });
+
+        run_logits again0;
+        const bool ok0 = store_load(0, meta0) && trim(n_prompt) && run_seq(n_prompt, n_prompt + n_cont, again0);
+        th.join();
+
+        CTX_REQUIRE(ok0, "store 0 restore after store 1 was filled failed");
+        CTX_REQUIRE(bitwise_equal(again0, from_store), "store 0 changed when store 1 was filled");
+        CTX_REQUIRE(n_copy1 > 0 && n_copy1 == copy1.size(), "host copy of store 1 on another thread failed");
+        CTX_REQUIRE(blobs_equal(host1, copy1), "the host copy of store 1 differs from the host state");
+
+        run_logits from1;
+        CTX_REQUIRE(store_load(1, meta1) && trim(n_prompt + n_cont), "store 1 restore failed");
+        CTX_REQUIRE(run_seq(n_prompt + n_cont, n_prompt + 2*n_cont, from1), "decode after the store 1 restore failed");
+        CTX_REQUIRE(nmse(ref1, from1) <= NMSE_THRESHOLD, "store 1 does not follow the live state");
+
+        // the host copy restores like the host state (the server's checkpoint after its move to the host)
+        run_logits from_copy;
+        CTX_REQUIRE(set_seq_state(lctx, 0, flags, copy0) && trim(n_prompt), "restore of the host copy failed");
+        CTX_REQUIRE(run_seq(n_prompt, n_prompt + n_cont, from_copy), "decode after the host copy restore failed");
+        CTX_REQUIRE(bitwise_equal(from_copy, from_host), "the host copy continues with other logits than the host state");
+
+        // a blob of another fill, or a freed store, restores nothing
+        CTX_REQUIRE(!store_load(1, meta0), "store 1 accepted the blob of store 0");
+        llama_state_seq_store_free(lctx, 0, 0);
+        CTX_REQUIRE(llama_state_seq_store_get_size_host(lctx, 0, 0) == 0, "a freed store still has a size");
+        CTX_REQUIRE(!store_load(0, meta0), "a freed store restored a state");
+
+        return case_result::pass();
+    }
+
+private:
+    bool partial;
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -494,6 +669,8 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_state_store>(false));
+    cases.push_back(std::make_unique<case_state_store>(true));
 
     return cases;
 }

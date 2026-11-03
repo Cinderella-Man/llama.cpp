@@ -1756,6 +1756,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-vram"}, "N",
+        string_format("keep the newest N context checkpoints of each slot in device memory, beside the layers they "
+            "belong to, so that saving and restoring one copies inside each GPU and they take no host memory; older "
+            "ones move to the host in the background (recurrent models; default: %d, 0 = all on the host)", params.checkpoint_vram),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints-vram must be non-negative");
+            }
+            params.checkpoint_vram = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_VRAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-vram-sync"},
+        "move a context checkpoint beyond --ctx-checkpoints-vram to the host at once, not in the background (default: off)",
+        [](common_params & params) {
+            params.checkpoint_vram_sync = true;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_VRAM_SYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-spread"}, "N",
+        string_format("context checkpoints at most N tokens apart inside a prompt: at the first message start N/2 or "
+            "more tokens after the previous checkpoint, or N tokens after it if no message starts, and a full list "
+            "drops the checkpoint whose removal leaves the smallest gap; so a client that edits its history far back "
+            "resumes near the edit (recurrent models; default: %d, 0 = off)", params.checkpoint_spread),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints-spread must be non-negative");
+            }
+            params.checkpoint_spread = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SPREAD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--checkpoint-tail2"},
         "two context checkpoints at the end of each prompt, 4 + n_ubatch and 4 tokens before it, as stock llama.cpp; "
         "by default a sliding-window model takes only the second, with its whole window ring, which also serves the first's restores",

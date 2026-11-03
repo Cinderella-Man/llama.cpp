@@ -958,6 +958,53 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Numbered device stores: as with LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, the state's tensor data is copied into device
+    // buffers of the tensors' own buffer types and dst holds the rest (size it with llama_state_seq_get_size_ext and
+    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE), but each (seq_id, store) pair keeps its own copy, so that several states of one
+    // sequence stay on the devices at once (e.g. a server's context checkpoints). Getting a state into a store replaces
+    // the state that store held. Returns 0 if the store's buffers could not be allocated: keep the state on the host.
+    LLAMA_API size_t llama_state_seq_get_data_store(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                         int32_t   store,
+           llama_state_seq_flags   flags);
+
+    // restores the state that llama_state_seq_get_data_store wrote into (seq_id of src, store); src is the blob it
+    // returned
+    LLAMA_API size_t llama_state_seq_set_data_store(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                         int32_t   store,
+           llama_state_seq_flags   flags);
+
+    // the size of a store's state in the host format (without LLAMA_STATE_SEQ_FLAGS_ON_DEVICE), 0 for an empty store
+    LLAMA_API size_t llama_state_seq_store_get_size_host(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t   store);
+
+    // writes a store's state in the host format: the bytes llama_state_seq_get_data_ext would have written without
+    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE when the store was filled; src is the blob that fill returned. It may run on
+    // another thread while ctx decodes, as long as nothing writes or frees this store meanwhile
+    LLAMA_API size_t llama_state_seq_store_get_data_host(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   src_size,
+                         uint8_t * dst,
+                          size_t   dst_size,
+                    llama_seq_id   seq_id,
+                         int32_t   store);
+
+    // frees a store's device buffers
+    LLAMA_API void llama_state_seq_store_free(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t   store);
+
     // llama_state_seq_save_file with state flags (e.g. LLAMA_STATE_SEQ_FLAGS_SWA_RING); llama_state_seq_load_file reads
     // either
     LLAMA_API size_t llama_state_seq_save_file_ext(

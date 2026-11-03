@@ -2501,6 +2501,9 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+
+    store    = -1;
+    size_dev = 0;
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2528,6 +2531,63 @@ void common_prompt_checkpoint::update_tgt(
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
+
+    store    = -1;
+    size_dev = 0;
+}
+
+bool common_prompt_checkpoint::update_tgt_store(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        int32_t store,
+        llama_state_seq_flags flags) {
+    this->store    = -1;
+    this->size_dev = 0;
+
+    data_tgt.clear();
+
+    if (ctx == nullptr) {
+        return true;
+    }
+
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+    data_tgt.resize(ckpt_size);
+
+    const size_t n = llama_state_seq_get_data_store(ctx, data_tgt.data(), ckpt_size, seq_id, store, flags);
+    if (n != ckpt_size) {
+        data_tgt.clear();
+        return false;
+    }
+
+    this->store    = store;
+    this->size_dev = llama_state_seq_store_get_size_host(ctx, seq_id, store) - ckpt_size;
+
+    return true;
+}
+
+bool common_prompt_checkpoint::tgt_to_host(
+        llama_context * ctx,
+        llama_seq_id seq_id) {
+    if (store < 0) {
+        return true;
+    }
+
+    std::vector<uint8_t> data(llama_state_seq_store_get_size_host(ctx, seq_id, store));
+
+    const size_t n = llama_state_seq_store_get_data_host(ctx, data_tgt.data(), data_tgt.size(), data.data(), data.size(), seq_id, store);
+
+    store    = -1;
+    size_dev = 0;
+
+    if (data.empty() || n != data.size()) {
+        data_tgt.clear();
+        return false;
+    }
+
+    data_tgt = std::move(data);
+
+    return true;
 }
 
 void common_prompt_checkpoint::update_dft(
@@ -2560,7 +2620,9 @@ bool common_prompt_checkpoint::load_tgt(
         return true;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    const size_t n = store >= 0 ?
+        llama_state_seq_set_data_store(ctx, data_tgt.data(), data_tgt.size(), seq_id, store, flags) :
+        llama_state_seq_set_data_ext  (ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     return n == data_tgt.size();
 }
 
@@ -2582,6 +2644,9 @@ bool common_prompt_checkpoint::load_dft(
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+
+    store    = -1;
+    size_dev = 0;
 }
 
 void common_prompt_checkpoint::clear_dft() {

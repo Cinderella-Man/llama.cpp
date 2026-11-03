@@ -15,6 +15,7 @@
 
 #include <array>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -42,6 +43,22 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+// a numbered device copy of one sequence state (llama_state_seq_get_data_store)
+struct llama_state_store {
+    // one context and buffer per buffer type, holding the copies
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs;
+
+    // the copies in the order the state wrote them, each with the size of the blob written before it: where its bytes go
+    // in the host format
+    std::vector<std::pair<ggml_tensor *, size_t>> pieces;
+
+    size_t size_meta = 0; // the blob returned with the store
+    size_t size_data = 0; // the bytes in the copies
+
+    // a copy of that blob: a restore or a host copy checks that it is given the blob of this fill
+    std::vector<uint8_t> meta;
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -174,6 +191,13 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    // numbered device stores (llama_state_seq_get_data_store)
+    size_t state_seq_get_data_store(llama_seq_id seq_id, int32_t store,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_set_data_store(llama_seq_id seq_id, int32_t store, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_store_get_size_host(llama_seq_id seq_id, int32_t store);
+    size_t state_seq_store_get_data_host(llama_seq_id seq_id, int32_t store, const uint8_t * src, size_t src_size, uint8_t * dst, size_t dst_size);
+    void   state_seq_store_free(llama_seq_id seq_id, int32_t store);
 
     bool state_load_file(
             const char * filepath,
@@ -537,6 +561,11 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // numbered device copies, by (seq_id, store); the mutex guards the map, not the stores (a store's reader on another
+    // thread and its writer are kept apart by the caller)
+    std::map<std::pair<llama_seq_id, int32_t>, llama_state_store> state_stores;
+    std::mutex state_stores_mtx;
 
     bool has_evaluated_once = false;
 
