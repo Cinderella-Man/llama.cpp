@@ -289,6 +289,10 @@ bool ggml_cuda_flash_attn_ext_pascal(ggml_backend_cuda_context & ctx, ggml_tenso
             !ggml_is_contiguous(dst)) {
         return false;
     }
+    // K/V read through kv_rows (src[5]): only the MMA kernel gathers rows
+    if (dst->src[5] != nullptr) {
+        return false;
+    }
     if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1)) {
         return false;
     }

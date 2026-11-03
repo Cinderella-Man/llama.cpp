@@ -577,6 +577,10 @@ bool ggml_cuda_fattn_tile_pascal_supported(const int device, const ggml_tensor *
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || K == nullptr || V == nullptr) {
         return false;
     }
+    // K/V read through kv_rows (src[5]): only the MMA kernel gathers rows
+    if (dst->src[5] != nullptr) {
+        return false;
+    }
     const int64_t D = Q->ne[0];
     if ((D != 128 && D != 256) || K->ne[0] != D || V->ne[0] != D) {
         return false;
