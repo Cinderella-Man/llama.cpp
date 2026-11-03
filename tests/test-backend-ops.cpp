@@ -8973,6 +8973,9 @@ struct test_kq_mask : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                // the harness's sentinels: left as they are, they hold what an earlier test left (NaN at times)
+                init_tensor_uniform(t);
             }
         }
     }
