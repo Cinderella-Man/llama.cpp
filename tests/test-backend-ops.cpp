@@ -4166,6 +4166,41 @@ struct test_add_add : public test_case {
     }
 };
 
+// the mean over the hyper-connection streams of a [n_embd, hc, T] residual, as qwen4exp and deepseek4 give a DFlash
+// drafter its layer inputs: strided row views of one tensor, a chain of ADDs and a SCALE
+struct test_hc_stream_mean : public test_case {
+    const std::array<int64_t, 3> ne; // n_embd, hc, T
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_STREAM_MEAN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_hc_stream_mean(std::array<int64_t, 3> ne = {64, 4, 5})
+        : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * acc = ggml_view_2d(ctx, x, ne[0], ne[2], x->nb[2], 0);
+        for (int64_t s = 1; s < ne[1]; ++s) {
+            acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, ne[0], ne[2], x->nb[2], s*x->nb[1]));
+        }
+
+        ggml_tensor * out = ggml_scale(ctx, acc, 1.0f / (float) ne[1]);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
 struct test_add_rms_norm : public test_case {
     const ggml_type type;
@@ -11584,6 +11619,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
     }
+    // Qwen3.8-Flash-Next: n_embd 2560, 4 streams; a token, a draft block, a micro-batch, -b 512
+    for (int64_t n_tokens : {1, 4, 64, 512}) {
+        test_cases.emplace_back(new test_hc_stream_mean({ 2560, 4, n_tokens }));
+    }
+    test_cases.emplace_back(new test_hc_stream_mean({ 64, 2, 7 }));
+    test_cases.emplace_back(new test_hc_stream_mean({ 1025, 3, 5 }));
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
