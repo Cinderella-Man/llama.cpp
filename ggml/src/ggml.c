@@ -1102,6 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "GDN_CONV",
 
     "UNARY",
 
@@ -1121,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KQ_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,6 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "gdn_conv(cache, ids, x, c)",
 
     "unary(x)",
 
@@ -1239,7 +1241,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kq_mask(c,t)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6544,6 +6546,54 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gdn_conv
+
+struct ggml_tensor * ggml_gdn_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cache,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        int                   n_norm,
+        int                   group,
+        float                 eps,
+        int                   K) {
+    GGML_ASSERT(cache->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type   == GGML_TYPE_I32);
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(c->type     == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(cache) && ggml_is_contiguous_rows(x) && ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_vector(ids) || ggml_nelements(ids) == 1);
+
+    const int64_t d_conv   = c->ne[0];
+    const int64_t channels = c->ne[1];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_seqs   = x->ne[2];
+
+    GGML_ASSERT(d_conv >= 2);
+    GGML_ASSERT(x->ne[0] == channels && x->ne[3] == 1);
+    GGML_ASSERT(cache->ne[0] == (d_conv - 1) * channels && cache->ne[2] == 1 && cache->ne[3] == 1);
+    GGML_ASSERT(ids->ne[0] == n_seqs);
+    GGML_ASSERT(group > 0 && n_norm >= 0 && n_norm % group == 0 && n_norm <= channels);
+    GGML_ASSERT(K >= 1);
+
+    const int64_t ne[4] = { channels, n_tokens * n_seqs + K * (d_conv - 1) * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    ggml_set_op_params_i32(result, 0, n_norm);
+    ggml_set_op_params_i32(result, 1, group);
+    ggml_set_op_params_f32(result, 2, eps);
+    ggml_set_op_params_i32(result, 3, K);
+
+    result->op     = GGML_OP_GDN_CONV;
+    result->src[0] = cache;
+    result->src[1] = ids;
+    result->src[2] = x;
+    result->src[3] = c;
 
     return result;
 }
