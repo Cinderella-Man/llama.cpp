@@ -7,6 +7,8 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct llama_head_shortlist;
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -62,6 +64,12 @@ struct llama_cparams {
 
     bool     screen_head;    // screened output head: exact logits only for the candidates of the model's output_screen
     uint32_t screen_head_m;  // number of candidates; 0 = the model's output_screen.top_m
+
+    // a draft's head over a shortlist of tokens (llama_head_shortlist_*), used while head_short_on; head_short_n is the
+    // number of further ids at the last change, so that a change rebuilds the graph
+    const llama_head_shortlist * head_short    = nullptr;
+    bool                         head_short_on = false;
+    uint32_t                     head_short_n  = 0;
 
     size_t moe_cache_size;
 

@@ -9,6 +9,16 @@
 // staging buffer size for direct I/O reads, 64MB works well for NVMe drives
 #define LLAMA_DIRECT_IO_BUFFER_SIZE (64 * 1024 * 1024)
 
+// number of pinned staging buffers for direct I/O uploads to a device
+#define LLAMA_DIRECT_IO_BUFFER_COUNT 4
+
+// The direct-I/O staging as set by LLAMA_DIO_STAGING=<count>x<MiB> (e.g. 2x16; either part may be left out: "x8",
+// "2"), else the defaults above: the size of each pinned upload buffer and of the bounce buffer of reads into host
+// memory, and the number of pinned upload buffers. On a small host the pinned staging (4 x 64 MiB by default) is
+// allocated again for every buffer a model loads, while earlier contexts already hold their own pinned buffers.
+size_t llama_direct_io_buffer_size();
+size_t llama_direct_io_buffer_count();
+
 struct llama_file;
 struct llama_mmap;
 struct llama_mlock;
