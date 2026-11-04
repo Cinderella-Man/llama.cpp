@@ -508,6 +508,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
+        // the hc streams cross a card boundary in cparams.hop_type (LLAMA_HOP_CAST; off by default)
+        res_hc = build_hop_cast(res_hc, il);
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
             cb(res->t_layer_inp[il], "layer_inp", il);

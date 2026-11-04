@@ -1181,6 +1181,13 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
+    // a card hop in cparams.hop_type (LLAMA_HOP_CAST): where cparams.hop_layer[il] marks the first layer after a card
+    // boundary, cur (the residual entering layer il, F32) is cast to hop_type on the card before the boundary and back
+    // to F32 on the card after it, so the scheduler copies the narrow tensor between the cards; otherwise cur as it is
+    ggml_tensor * build_hop_cast(
+             ggml_tensor * cur,
+                     int   il) const;
+
     // apply the activation-side transform of a Hadamard-folded weight, if any
     ggml_tensor * build_hadamard_input(
               ggml_tensor * w,

@@ -427,6 +427,72 @@ llama_context::llama_context(
         }
     }
 
+    // card-to-card hops: LLAMA_HOP_CAST=f16|bf16|q8_0 sends the residual across every boundary between two GPUs of a
+    // layer split in that type: cast on the card before the boundary, back to F32 on the card after it, so the
+    // scheduler copies the narrow tensor (Flash-Next: 40,960 B a token in F32, 20,480 in F16 or BF16, 10,880 in Q8_0).
+    // LLAMA_HOP_CAST_AT=<l1,l2,...> marks those layers instead (each the first layer after a boundary), e.g. a rig's
+    // boundaries in a run on fewer cards or on the CPU. Unset, empty, 0, off or f32: off. Only the architectures whose
+    // graph calls build_hop_cast use it (qwen4exp)
+    {
+        cparams.hop_type = GGML_TYPE_F32;
+        cparams.hop_layer.assign(hparams.n_layer(), false);
+
+        const char * LLAMA_HOP_CAST    = getenv("LLAMA_HOP_CAST");
+        const char * LLAMA_HOP_CAST_AT = getenv("LLAMA_HOP_CAST_AT");
+        if (LLAMA_HOP_CAST && *LLAMA_HOP_CAST && strcmp(LLAMA_HOP_CAST, "0") != 0 && strcmp(LLAMA_HOP_CAST, "off") != 0 &&
+                strcmp(LLAMA_HOP_CAST, "f32") != 0) {
+            if (strcmp(LLAMA_HOP_CAST, "f16") == 0) {
+                cparams.hop_type = GGML_TYPE_F16;
+            } else if (strcmp(LLAMA_HOP_CAST, "bf16") == 0) {
+                cparams.hop_type = GGML_TYPE_BF16;
+            } else if (strcmp(LLAMA_HOP_CAST, "q8_0") == 0) {
+                cparams.hop_type = GGML_TYPE_Q8_0;
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_HOP_CAST=%s is not f16, bf16 or q8_0: hops stay F32\n", __func__, LLAMA_HOP_CAST);
+            }
+        }
+
+        if (cparams.hop_type != GGML_TYPE_F32) {
+            const int n_layer_main = (int) hparams.n_layer();
+            if (LLAMA_HOP_CAST_AT && *LLAMA_HOP_CAST_AT) {
+                for (const char * p = LLAMA_HOP_CAST_AT; *p; ) {
+                    char * end = nullptr;
+                    const long il = strtol(p, &end, 10);
+                    if (end == p) {
+                        LLAMA_LOG_WARN("%s: LLAMA_HOP_CAST_AT: cannot read '%s'\n", __func__, p);
+                        break;
+                    }
+                    if (il > 0 && il < n_layer_main) {
+                        cparams.hop_layer[il] = true;
+                    } else {
+                        LLAMA_LOG_WARN("%s: LLAMA_HOP_CAST_AT: layer %ld is not in 1..%d\n", __func__, il, n_layer_main - 1);
+                    }
+                    p = *end == ',' ? end + 1 : end;
+                }
+            } else {
+                for (int il = 1; il < n_layer_main; ++il) {
+                    ggml_backend_dev_t dev_prev = model.dev_layer(il - 1);
+                    ggml_backend_dev_t dev      = model.dev_layer(il);
+                    if (dev != dev_prev && dev && dev_prev &&
+                            ggml_backend_dev_type(dev)      == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                            ggml_backend_dev_type(dev_prev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        cparams.hop_layer[il] = true;
+                    }
+                }
+            }
+
+            std::string at;
+            for (int il = 0; il < n_layer_main; ++il) {
+                if (cparams.hop_layer[il]) {
+                    at += (at.empty() ? "" : ",") + std::to_string(il);
+                }
+            }
+            LLAMA_LOG_INFO("%s: card hops in %s before layers %s (%s)\n", __func__, ggml_type_name(cparams.hop_type),
+                    at.empty() ? "none" : at.c_str(),
+                    LLAMA_HOP_CAST_AT && *LLAMA_HOP_CAST_AT ? "LLAMA_HOP_CAST_AT" : "the layer split");
+        }
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -3883,8 +3949,11 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_graph) const
         //   computes it once and copies it between devices, which is the transfer it exists to avoid; so does the staged
         //   input it is built from ("kq_stage"), or the scheduler uploads each part of the input separately
         const bool kq_dev = strcmp(name, "kq_mask") == 0 || strcmp(name, "kq_stage") == 0;
-        if ((ubatch.n_tokens < 32 || full_offload || kq_dev) && il != -1) {
-            if (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || kq_dev) {
+        // - a card hop's casts (LLAMA_HOP_CAST, build_hop_cast): the narrow cast on the card before the boundary (il is
+        //   that card's last layer), the cast back on the card after it, so the scheduler copies the narrow tensor
+        const bool hop = strcmp(name, "hop_narrow") == 0 || strcmp(name, "hop_wide") == 0;
+        if ((ubatch.n_tokens < 32 || full_offload || kq_dev || hop) && il != -1) {
+            if (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || kq_dev || hop) {
                 // the scheduler's own backends: a chunk slot's are not the context's with LLAMA_PIPE_CHUNK_STREAM
                 const auto & dev_layer = model.dev_layer(il);
                 for (int i = 0; i < ggml_backend_sched_get_n_backends(sched_graph); i++) {

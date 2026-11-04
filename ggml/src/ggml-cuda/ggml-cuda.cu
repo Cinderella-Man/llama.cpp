@@ -749,6 +749,189 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(g
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(ctx, device));
 }
 
+// ---- card hops: a staged copy between two cards without peer access (GGML_CUDA_HOP_STAGED) -------------------------
+//
+// Without peer access the driver stages a cudaMemcpyPeerAsync through host memory itself, both legs on the source
+// card's stream. GGML_CUDA_HOP_STAGED=1 makes the staging explicit, as upstream's host-staged all-reduce does: per
+// boundary (source card -> this card) a ring of pinned host slots; per chunk a D2H on the source card's stream into a
+// slot, an event, this card's stream waiting on it, the H2D, and an event that frees the slot. With two chunks the
+// second chunk's D2H (on the source card's link) overlaps the first chunk's H2D (on this card's link). Every copy the
+// scheduler makes between two CUDA cards takes this path while it is on; the bytes are copied exactly.
+//   GGML_CUDA_HOP_STAGED   0 (default): cudaMemcpyPeerAsync, as before; 1: the staged hop between cards without peer
+//                          access; 2: also between cards with peer access (for checks on boards that have it)
+//   GGML_CUDA_HOP_CHUNKS   chunks per hop, 1..16 (default 2); a hop larger than that many slots takes more chunks
+//   GGML_CUDA_HOP_SLOTS    host slots per boundary, 2..64 (default 4)
+//   GGML_CUDA_HOP_SLOT_KB  KiB per slot, 4..65536 (default 256): a boundary holds slots x KiB of pinned host memory,
+//                          allocated on its first hop (1 MiB by default, 8 MiB for nine cards)
+//   GGML_CUDA_HOP_STREAM   where the H2D runs: 0 on this card's compute stream; 1 (default) there for hops that fit
+//                          the ring (decode, verify passes) and on a copy stream of this card for larger ones (prompt
+//                          micro-batches), so that a slot frees once its H2D is done instead of after this card's
+//                          current work, and the source card's stream does not wait for it; 2 the copy stream always.
+//                          On the copy stream the H2D first waits on the scheduler's guard for the input copy it
+//                          writes (hop_guard), and this card's compute stream waits on the last H2D
+// A line per boundary is logged when its ring is made, and its counts when the context is freed.
+
+struct ggml_cuda_hop_ring {
+    int    dev_src     = -1; // the backends' (possibly virtual) devices
+    int    dev_dst     = -1;
+    int    n_chunks    = 2;
+    int    n_slots     = 4;
+    size_t slot_size   = 0;
+    int    stream_mode = 1;
+    char * host        = nullptr; // n_slots * slot_size bytes, pinned, portable
+
+    int next = 0; // the slot the next chunk fills
+
+    std::vector<cudaEvent_t> filled;  // on dev_src: the D2H into the slot is done
+    std::vector<cudaEvent_t> drained; // on dev_dst: the H2D out of the slot is done
+
+    cudaStream_t copy_stream = nullptr; // on dev_dst, made on first use
+    cudaEvent_t  copy_done   = nullptr; // on dev_dst: the copy stream's last H2D of a hop
+
+    int64_t n_hops = 0, n_bytes = 0, n_chunk_copies = 0, n_on_copy_stream = 0, n_guarded = 0;
+};
+
+static int ggml_cuda_hop_env(const char * name, int def, int lo, int hi) {
+    const char * env = getenv(name);
+    if (env == nullptr || *env == '\0') {
+        return def;
+    }
+    return std::min(std::max(atoi(env), lo), hi);
+}
+
+// whether a copy between two backends on different physical cards takes the staged hop
+static bool ggml_cuda_hop_staged_on(ggml_backend_cuda_context * ctx_dst, int dev_src, int src_physical, int dst_physical) {
+    if (ctx_dst->hop_staged < 0) {
+        ctx_dst->hop_staged = ggml_cuda_hop_env("GGML_CUDA_HOP_STAGED", 0, 0, 2);
+    }
+    if (ctx_dst->hop_staged == 0 || dev_src < 0 || dev_src >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    if (ctx_dst->hop_staged >= 2) {
+        return true;
+    }
+    if (ctx_dst->hop_peer[dev_src] == 0) {
+        int can = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dst_physical, src_physical));
+        ctx_dst->hop_peer[dev_src] = can ? 2 : 1;
+    }
+    return ctx_dst->hop_peer[dev_src] == 1;
+}
+
+static ggml_cuda_hop_ring * ggml_cuda_hop_ring_get(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst) {
+    ggml_cuda_hop_ring *& r = ctx_dst->hop_rings[ctx_src->device];
+    if (r != nullptr) {
+        return r;
+    }
+    r = new ggml_cuda_hop_ring;
+    r->dev_src     = ctx_src->device;
+    r->dev_dst     = ctx_dst->device;
+    r->n_chunks    = ggml_cuda_hop_env("GGML_CUDA_HOP_CHUNKS",  2,   1,    16);
+    r->n_slots     = ggml_cuda_hop_env("GGML_CUDA_HOP_SLOTS",   4,   2,    64);
+    r->slot_size   = (size_t) ggml_cuda_hop_env("GGML_CUDA_HOP_SLOT_KB", 256, 4, 65536) * 1024;
+    r->stream_mode = ggml_cuda_hop_env("GGML_CUDA_HOP_STREAM",  1,   0,     2);
+
+    ggml_cuda_set_device(r->dev_dst);
+    CUDA_CHECK(cudaHostAlloc((void **) &r->host, (size_t) r->n_slots * r->slot_size, cudaHostAllocPortable));
+    r->drained.resize(r->n_slots);
+    for (auto & e : r->drained) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventCreateWithFlags(&r->copy_done, cudaEventDisableTiming));
+    ggml_cuda_set_device(r->dev_src);
+    r->filled.resize(r->n_slots);
+    for (auto & e : r->filled) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
+
+    GGML_LOG_INFO("%s: card hop %s -> %s staged through %d pinned slots of %zu KiB, %d chunks, copy stream mode %d\n",
+            __func__, ctx_src->name.c_str(), ctx_dst->name.c_str(), r->n_slots, r->slot_size / 1024, r->n_chunks,
+            r->stream_mode);
+    return r;
+}
+
+// copies nbytes from src (on ctx_src's card) to dst (on ctx_dst's card) through the ring; afterwards ctx_dst's stream
+// is ordered after the copy, as the scheduler expects of cpy_tensor_async
+static void ggml_cuda_hop_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst,
+        ggml_cuda_hop_ring & r, char * dst, const char * src, const size_t nbytes) {
+    if (nbytes == 0) {
+        return;
+    }
+    size_t chunk = (nbytes + r.n_chunks - 1) / r.n_chunks;
+    chunk = std::min(GGML_PAD(chunk, 256), r.slot_size);
+    const size_t n = (nbytes + chunk - 1) / chunk;
+
+    const bool on_copy_stream = r.stream_mode == 2 || (r.stream_mode == 1 && n > (size_t) r.n_slots);
+
+    cudaStream_t s_src = ctx_src->stream();
+    cudaStream_t s_dst = ctx_dst->stream();
+    if (on_copy_stream) {
+        ggml_cuda_set_device(r.dev_dst);
+        if (r.copy_stream == nullptr) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&r.copy_stream, cudaStreamNonBlocking));
+        }
+        s_dst = r.copy_stream;
+        // the copy stream must not write the input copy while an earlier evaluation on this card still reads it: the
+        // scheduler made the compute stream wait on that guard just before this copy
+        if (ctx_dst->hop_guard != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(s_dst, ctx_dst->hop_guard, 0));
+            r.n_guarded++;
+        }
+        r.n_on_copy_stream++;
+    }
+    ctx_dst->hop_guard = nullptr;
+
+    for (size_t i = 0; i < n; ++i) {
+        const size_t off = i*chunk;
+        const size_t len = std::min(chunk, nbytes - off);
+        const int    s   = r.next;
+        r.next = (r.next + 1) % r.n_slots;
+        char * slot = r.host + (size_t) s*r.slot_size;
+
+        ggml_cuda_set_device(r.dev_src);
+        CUDA_CHECK(cudaStreamWaitEvent(s_src, r.drained[s], 0)); // the slot's previous H2D is done
+        CUDA_CHECK(cudaMemcpyAsync(slot, src + off, len, cudaMemcpyDeviceToHost, s_src));
+        CUDA_CHECK(cudaEventRecord(r.filled[s], s_src));
+
+        ggml_cuda_set_device(r.dev_dst);
+        CUDA_CHECK(cudaStreamWaitEvent(s_dst, r.filled[s], 0));
+        CUDA_CHECK(cudaMemcpyAsync(dst + off, slot, len, cudaMemcpyHostToDevice, s_dst));
+        CUDA_CHECK(cudaEventRecord(r.drained[s], s_dst));
+    }
+    if (on_copy_stream) {
+        CUDA_CHECK(cudaEventRecord(r.copy_done, s_dst));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), r.copy_done, 0));
+    }
+
+    r.n_hops++;
+    r.n_bytes += nbytes;
+    r.n_chunk_copies += n;
+}
+
+static void ggml_cuda_hop_ring_free(ggml_cuda_hop_ring * r, const std::string & name_dst) {
+    GGML_LOG_INFO("%s: card hop CUDA%d -> %s: %" PRId64 " staged hops, %.2f MiB, %" PRId64 " chunks, %" PRId64
+            " on the copy stream (%" PRId64 " behind the scheduler's guard)\n", __func__, r->dev_src, name_dst.c_str(),
+            r->n_hops, r->n_bytes / 1048576.0, r->n_chunk_copies, r->n_on_copy_stream, r->n_guarded);
+    // every chunk's H2D waited on its D2H, so the slots' last H2Ds end the ring's work
+    ggml_cuda_set_device(r->dev_dst);
+    for (cudaEvent_t e : r->drained) {
+        CUDA_CHECK(cudaEventSynchronize(e));
+        CUDA_CHECK(cudaEventDestroy(e));
+    }
+    if (r->copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(r->copy_stream));
+        CUDA_CHECK(cudaStreamDestroy(r->copy_stream));
+    }
+    CUDA_CHECK(cudaEventDestroy(r->copy_done));
+    ggml_cuda_set_device(r->dev_src);
+    for (cudaEvent_t e : r->filled) {
+        CUDA_CHECK(cudaEventSynchronize(e));
+        CUDA_CHECK(cudaEventDestroy(e));
+    }
+    CUDA_CHECK(cudaFreeHost(r->host));
+    delete r;
+}
+
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a CUDA error
 // this lock is used to ensure that no cuBLAS handle is destroyed while a graph is being captured
 
@@ -760,6 +943,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        if (hop_rings[i] != nullptr) {
+            ggml_cuda_hop_ring_free(hop_rings[i], name);
+            hop_rings[i] = nullptr;
+        }
+    }
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2956,6 +3145,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        } else if (ggml_cuda_hop_staged_on(cuda_ctx_dst, cuda_ctx_src->device, src_physical, dst_physical)) {
+            // GGML_CUDA_HOP_STAGED: through this boundary's pinned ring; the destination's stream is ordered after it
+            ggml_cuda_hop_ring * ring = ggml_cuda_hop_ring_get(cuda_ctx_src, cuda_ctx_dst);
+            ggml_cuda_hop_copy(cuda_ctx_src, cuda_ctx_dst, *ring, (char *) dst->data, (const char *) src->data, ggml_nbytes(dst));
+            return true;
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
@@ -2985,6 +3179,8 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    // the stream is idle: an earlier guard is no longer needed (a staged hop's copy stream is behind it already)
+    cuda_ctx->hop_guard = nullptr;
 
     GGML_UNUSED(backend);
 }
@@ -6323,6 +6519,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+    // a guard (ggml_backend_cuda_event_wait) holds only for the input copies made right after it
+    cuda_ctx->hop_guard = nullptr;
+
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_moe_persistent_begin_graph(*cuda_ctx);
 
@@ -6435,6 +6634,9 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
     if (ggml_backend_is_cuda(backend)) {
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
+        // the scheduler waits so before writing an input copy (ggml_backend_sched_copy_input): a staged hop on a copy
+        // stream (GGML_CUDA_HOP_STREAM) waits on the same event
+        cuda_ctx->hop_guard = (cudaEvent_t)event->context;
     } else {
 #if 0
         // untested

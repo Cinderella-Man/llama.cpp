@@ -11734,6 +11734,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+
+    // card hops (LLAMA_HOP_CAST): Flash-Next's four hc streams of 2,560 at a decoded token, a 4-token verify pass and
+    // a 512-token micro-batch, to and from each narrow type
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int64_t n_tokens : {1, 4, 512}) {
+            test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type, {2560, 4, n_tokens, 1}));
+            test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F32, {2560, 4, n_tokens, 1}));
+        }
+    }
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));

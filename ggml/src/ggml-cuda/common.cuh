@@ -1462,10 +1462,23 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// the manual staged hop between two cards without peer access (GGML_CUDA_HOP_STAGED; ggml-cuda.cu)
+struct ggml_cuda_hop_ring;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // card hops into this context's card (GGML_CUDA_HOP_STAGED, ggml_backend_cuda_cpy_tensor_async): the switch (-1:
+    // not read yet), per source device whether it has peer access to this card (0: not asked yet, 1: no, 2: yes) and
+    // its ring of pinned host slots (created on its first hop, freed with the context)
+    int                  hop_staged = -1;
+    unsigned char        hop_peer[GGML_CUDA_MAX_DEVICES]  = {};
+    ggml_cuda_hop_ring * hop_rings[GGML_CUDA_MAX_DEVICES] = {};
+    // the event the scheduler last made this card's stream wait on (ggml_backend_cuda_event_wait), which guards the
+    // input copy it writes next: a hop on a copy stream waits on it too. Cleared by each graph evaluation and sync
+    cudaEvent_t          hop_guard = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

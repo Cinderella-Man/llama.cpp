@@ -1830,6 +1830,26 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_hop_cast(
+         ggml_tensor * cur,
+                 int   il) const {
+    const ggml_type type = cparams.hop_type;
+    if (type == GGML_TYPE_F32 || il <= 0 || (size_t) il >= cparams.hop_layer.size() || !cparams.hop_layer[il] ||
+            cur->type != GGML_TYPE_F32 || cur->ne[0] % ggml_blck_size(type) != 0) {
+        return cur;
+    }
+
+    // the names pin the casts to the two cards (llama_context::graph_get_cb): the narrow one to layer il - 1's device,
+    // the wide one to layer il's
+    ggml_tensor * narrow = ggml_cast(ctx0, cur, type);
+    cb(narrow, "hop_narrow", il - 1);
+
+    ggml_tensor * wide = ggml_cast(ctx0, narrow, GGML_TYPE_F32);
+    cb(wide, "hop_wide", il);
+
+    return wide;
+}
+
 ggml_tensor * llm_graph_context::build_hadamard_input(
           ggml_tensor * w,
           ggml_tensor * cur) const {

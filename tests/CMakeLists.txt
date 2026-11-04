@@ -288,6 +288,9 @@ set_tests_properties(test-llama-context PROPERTIES
 
 llama_build(test-fusion.cpp)
 
+# the card-hop switches (LLAMA_HOP_CAST, GGML_CUDA_HOP_*): round trips on every backend; with -m, a model's logits per arm
+llama_build(test-hop-cast.cpp LINK llama)
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
