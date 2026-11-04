@@ -2,7 +2,8 @@
 
 // The k-column Pascal matrix products of mmvq-pascal-kcol.cu without ggml's headers, so that a standalone benchmark can
 // time the same code (bench/mmvq_pascal/src/kcol_mm.cuh in llms-on-crypto-mining-rigs is a copy). The weight layouts are
-// ggml's (block_q8_0, block_q2_0, block_q3_K, block_q4_K, block_q5_K, block_q6_K, block_iq4_xs), read as bytes.
+// ggml's (block_q8_0, block_q2_0, block_q3_K, block_q4_K, block_q5_K, block_q6_K, block_iq4_xs, block_q4_0, block_q5_0,
+// block_iq4_nl), read as bytes.
 //
 // What the kernels do (dst = x * y for k = 1 to 8 columns of y, the k tokens of a speculative-decoding verify):
 //   - Each weight is read from memory once per launch and decoded once into signed or unsigned int8 words, which are
@@ -12,10 +13,11 @@
 //     scale per 32 values, the scale stored as FP16), but into records laid out for these kernels: per column and per
 //     lane unit (the weights one lane takes per iteration), the int8 values (permuted where a type's decoding returns
 //     its weights in another order), the FP32 scales and the type's activation terms (the block sums for the K-quants'
-//     mins, the 16-value sums for Q3_K's and Q6_K's offsets), and padding so that the lanes of a quarter warp read
-//     different banks. Each block copies the records of its K tile into shared memory once with coalesced 128-bit
-//     loads, so the activation work per column is two 128-bit and one 64-bit shared load per 32 weights, shared by the
-//     R rows of a lane group, and no activation term is recomputed per row or per lane.
+//     mins, the 16-value sums for Q3_K's and Q6_K's offsets, the 32-value sums for Q4_0's and Q5_0's), and padding so
+//     that the lanes of a quarter warp read different banks. Each block copies the records of its K tile into shared
+//     memory once with coalesced 128-bit loads, so the activation work per column is two 128-bit and one 64-bit shared
+//     load per 32 weights, shared by the R rows of a lane group, and no activation term is recomputed per row or per
+//     lane.
 //   - A warp is cut into lane groups of L lanes (a power of two dividing the row's lane units, at most 32); a group owns
 //     R rows. Each iteration the weights of the next L units of the group's rows are staged in shared memory with
 //     coalesced 128-bit loads: by each lane group for its own rows where the segments are whole 16-byte units, else by
@@ -29,6 +31,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp16.h>
 
 #define KCOL_NT        128         // threads per block
@@ -44,16 +47,19 @@
 
 namespace kcol {
 
-enum ktype : int { KQ8_0 = 0, KQ2_0, KQ3_K, KQ4_K, KQ5_K, KQ6_K, KIQ4_XS, KTYPE_COUNT };
+enum ktype : int { KQ8_0 = 0, KQ2_0, KQ3_K, KQ4_K, KQ5_K, KQ6_K, KIQ4_XS, KQ4_0, KQ5_0, KIQ4_NL, KTYPE_COUNT };
 
 // What an activation record holds besides the int8 values and the FP32 scale d of each 32-value block:
 //   ACT_D:  nothing (the second float of each pair is 0);
 //   ACT_DS: S = d * the sum of the block's int8 values (the K-quants' mins);
 //   ACT_DH: two ints per block, the offset sums of its two halves (Q3_K: -4 f sum, Q6_K: -32 sum), the dp4a chains'
-//           initial values.
-enum act_kind { ACT_D = 0, ACT_DS = 1, ACT_DH = 2 };
-// The order of the int8 values in a block: as they come, IQ4_XS's lookup order, Q2_0's lookup order.
-enum act_perm { PERM_NONE = 0, PERM_IQ4 = 1, PERM_Q2 = 2 };
+//           initial values;
+//   ACT_DI: in place of the second float, one int: the offset times the block's sum (Q4_0: -8 sum, Q5_0: -16 sum), the
+//           dp4a chain's initial value.
+enum act_kind { ACT_D = 0, ACT_DS = 1, ACT_DH = 2, ACT_DI = 3 };
+// The order of the int8 values in a block: as they come, IQ4_XS's lookup order, Q2_0's lookup order, Q5_0's order
+// (word m holds values m, m + 8, m + 16, m + 24).
+enum act_perm { PERM_NONE = 0, PERM_IQ4 = 1, PERM_Q2 = 2, PERM_Q5 = 3 };
 
 // Per type: UB bytes and UW weights per lane unit (a lane's share of one iteration), AL the unit's alignment in the
 // staging buffer, the activation records' contents and order.
@@ -65,6 +71,13 @@ template <> struct traits<KQ4_K>   { static constexpr int UB = 144, UW = 256, AL
 template <> struct traits<KQ5_K>   { static constexpr int UB = 176, UW = 256, AL = 16, ACT = ACT_DS, PERM = PERM_NONE; };
 template <> struct traits<KQ6_K>   { static constexpr int UB = 210, UW = 256, AL = 2,  ACT = ACT_DH, PERM = PERM_NONE; };
 template <> struct traits<KIQ4_XS> { static constexpr int UB = 136, UW = 256, AL = 8,  ACT = ACT_D,  PERM = PERM_IQ4;  };
+// two 32-weight blocks per unit, as Q2_0's two 64-weight blocks, so that units stay 4-byte aligned
+template <> struct traits<KQ4_0>   { static constexpr int UB = 36,  UW = 64,  AL = 4,  ACT = ACT_DI, PERM = PERM_NONE; };
+template <> struct traits<KQ5_0>   { static constexpr int UB = 44,  UW = 64,  AL = 4,  ACT = ACT_DI, PERM = PERM_Q5;   };
+template <> struct traits<KIQ4_NL> { static constexpr int UB = 36,  UW = 64,  AL = 4,  ACT = ACT_D,  PERM = PERM_IQ4;  };
+
+// ACT_DI: the offset of the type's unsigned codes
+template <int T> constexpr __host__ __device__ int act_off() { return T == KQ4_0 ? -8 : T == KQ5_0 ? -16 : 0; }
 
 // Words of one activation record: the int8 values, (d, S) per block, the offset sums (ACT_DH), rounded up to a multiple
 // of 4 words that is an odd multiple of 4 (so that records a lane apart start 4 banks apart).
@@ -85,6 +98,9 @@ inline type_info info(const int t) {
         case KQ5_K:   return { traits<KQ5_K>::UB,   traits<KQ5_K>::UW,   traits<KQ5_K>::AL,   rec_words<KQ5_K>()   };
         case KQ6_K:   return { traits<KQ6_K>::UB,   traits<KQ6_K>::UW,   traits<KQ6_K>::AL,   rec_words<KQ6_K>()   };
         case KIQ4_XS: return { traits<KIQ4_XS>::UB, traits<KIQ4_XS>::UW, traits<KIQ4_XS>::AL, rec_words<KIQ4_XS>() };
+        case KQ4_0:   return { traits<KQ4_0>::UB,   traits<KQ4_0>::UW,   traits<KQ4_0>::AL,   rec_words<KQ4_0>()   };
+        case KQ5_0:   return { traits<KQ5_0>::UB,   traits<KQ5_0>::UW,   traits<KQ5_0>::AL,   rec_words<KQ5_0>()   };
+        case KIQ4_NL: return { traits<KIQ4_NL>::UB, traits<KIQ4_NL>::UW, traits<KIQ4_NL>::AL, rec_words<KIQ4_NL>() };
         default:      return { 0, 0, 0, 0 };
     }
 }
@@ -143,6 +159,15 @@ static KCOL_HD __forceinline__ float h2f_lo(const uint32_t w) {
 static KCOL_HD __forceinline__ float h2f_hi(const uint32_t w) {
     return h2f((unsigned short) (w >> 16));
 }
+static KCOL_HD __forceinline__ float u2f(const uint32_t u) {
+#ifdef __CUDA_ARCH__
+    return __uint_as_float(u);
+#else
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+#endif
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Activation records
@@ -161,6 +186,9 @@ static __host__ __device__ __forceinline__ int act_pos(const int i) {
         // 2k and 2k + 1
         const int r = i & 7;
         return 8 * (i >> 3) + 4 * (r & 1) + (r >> 1);
+    } else if constexpr (PERM == PERM_Q5) {
+        // Q5_0's decoding returns weights (m, m + 8, m + 16, m + 24) as word m
+        return 4 * (i & 7) + (i >> 3);
     } else {
         return i;
     }
@@ -220,7 +248,8 @@ static __global__ void quantize_records(const float * __restrict__ x, uint32_t *
         }
     } else if (lane == 0) {
         r[UW / 4 + 2 * b]     = __float_as_uint(d8);
-        r[UW / 4 + 2 * b + 1] = __float_as_uint(traits<T>::ACT == ACT_DS ? d8 * (float) s32 : 0.0f);
+        r[UW / 4 + 2 * b + 1] = traits<T>::ACT == ACT_DI ? (uint32_t) (act_off<T>() * s32) :
+            __float_as_uint(traits<T>::ACT == ACT_DS ? d8 * (float) s32 : 0.0f);
     }
 }
 
@@ -241,13 +270,16 @@ static KCOL_HD __forceinline__ void load_act(act_blk & a, const uint32_t * rec, 
     const uint4 q1 = ((const uint4 *) (rec + 8 * b))[1];
     a.u[0] = (int) q0.x; a.u[1] = (int) q0.y; a.u[2] = (int) q0.z; a.u[3] = (int) q0.w;
     a.u[4] = (int) q1.x; a.u[5] = (int) q1.y; a.u[6] = (int) q1.z; a.u[7] = (int) q1.w;
-    const float2 ds = *(const float2 *) (rec + UW / 4 + 2 * b);
-    a.d = ds.x;
-    a.s = ds.y;
+    const uint2 ds = *(const uint2 *) (rec + UW / 4 + 2 * b);
+    a.d = u2f(ds.x);
+    a.s = u2f(ds.y);
     if constexpr (traits<T>::ACT == ACT_DH) {
         const int2 h = *(const int2 *) (rec + UW / 4 + 2 * NAB + 2 * b);
         a.h0 = h.x;
         a.h1 = h.y;
+    } else if constexpr (traits<T>::ACT == ACT_DI) {
+        a.h0 = (int) ds.y;
+        a.h1 = 0;
     } else {
         a.h0 = 0;
         a.h1 = 0;
@@ -521,12 +553,21 @@ static KCOL_HD __forceinline__ void unit_q45_K(const unit_ptr (&wu)[R], const ui
     }
 }
 
+// The 8 indices of an IQ4_XS or IQ4_NL code word c (bytes 4k .. 4k + 3 of a 32-weight block's codes) looked up in
+// kvalues_iq4nl with __byte_perm: weights (4k, 4k + 16, 4k + 1, 4k + 17) as q[0], (4k + 2, 4k + 18, 4k + 3, 4k + 19)
+// as q[1] (act_pos<PERM_IQ4>'s order).
+static KCOL_HD __forceinline__ void iq4nl_words(const uint32_t c, int * q) {
+    constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u; // kvalues_iq4nl
+    const uint32_t sel = 0x32103210 | ((c & 0x88888888) >> 1);
+    q[0] = (int) prmt(prmt(t0, t1, c),       prmt(t2, t3, c),       sel);
+    q[1] = (int) prmt(prmt(t0, t1, c >> 16), prmt(t2, t3, c >> 16), sel >> 16);
+}
+
 // IQ4_XS: block ib takes code words 2 + 4 ib .. 2 + 4 ib + 3; each word's 8 indices are looked up in kvalues_iq4nl
 // with __byte_perm (two words of int8 values per code word, in act_pos<PERM_IQ4>'s order).
 template <int NC, int R>
 static KCOL_HD __forceinline__ void unit_iq4_xs(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                    float (&acc)[R][NC]) {
-    constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u; // kvalues_iq4nl
     float    d[R];
     uint32_t sh[R];
     uint32_t sl[R];
@@ -548,9 +589,7 @@ static KCOL_HD __forceinline__ void unit_iq4_xs(const unit_ptr (&wu)[R], const u
             unit_words<8, 4>(c, wu[i], 2 + 4 * ib);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const uint32_t sel = 0x32103210 | ((c[k] & 0x88888888) >> 1);
-                q[i][2 * k + 0] = (int) prmt(prmt(t0, t1, c[k]),       prmt(t2, t3, c[k]),       sel);
-                q[i][2 * k + 1] = (int) prmt(prmt(t0, t1, c[k] >> 16), prmt(t2, t3, c[k] >> 16), sel >> 16);
+                iq4nl_words(c[k], q[i] + 2 * k);
             }
             const int ls = (int) (((sl[i] >> (4 * ib)) & 0xF) | (((sh[i] >> (2 * ib)) & 3) << 4));
             dsc[i] = d[i] * (float) (ls - 32);
@@ -713,6 +752,126 @@ static KCOL_HD __forceinline__ void unit_q3_K(const unit_ptr (&wu)[R], const uin
     }
 }
 
+// Q4_0 (NL = false) and IQ4_NL (NL = true): two blocks of 18 bytes, as Q2_0's: d at bytes 0 and 18, 16 bytes of codes at
+// 2..17 and 20..35 as 4 code words each; weight j < 16 of a block is the low nibble of code byte j, weight j + 16 its
+// high nibble. Q4_0: the nibbles in place (weights 4k .. 4k + 3 and 4k + 16 .. 4k + 19 of code word k as words k and
+// k + 4), the offset -8 from the records (the dp4a chain starts at -8 times the block's activation sum); IQ4_NL: the
+// nibbles looked up in kvalues_iq4nl as IQ4_XS's.
+template <int NC, int R, bool NL>
+static KCOL_HD __forceinline__ void unit_q4_0(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+                                                 float (&acc)[R][NC]) {
+    constexpr int T = NL ? KIQ4_NL : KQ4_0;
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        int   q[R][8];
+        float d[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            uint32_t w[5];
+            uint32_t cw[4];
+            if (c == 0) {
+                unit_words<4, 5>(w, wu[i], 0);
+                d[i] = h2f_lo(w[0]);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    cw[k] = prmt(w[k], w[k + 1], 0x5432);
+                }
+            } else {
+                unit_words<4, 5>(w, wu[i], 4);
+                d[i] = h2f_hi(w[0]);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    cw[k] = w[k + 1];
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                if constexpr (NL) {
+                    iq4nl_words(cw[k], q[i] + 2 * k);
+                } else {
+                    q[i][k]     = (int) (cw[k] & 0x0F0F0F0F);
+                    q[i][k + 4] = (int) ((cw[k] >> 4) & 0x0F0F0F0F);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            act_blk a;
+            load_act<T>(a, act + j * cstride, c);
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                int isum = a.h0;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    isum = dp4a(q[i][k], a.u[k], isum);
+                }
+                acc[i][j] = fmaf((float) isum * d[i], a.d, acc[i][j]);
+            }
+        }
+    }
+}
+
+// Q5_0: two blocks of 22 bytes: d at bytes 0 and 22, the fifth bits qh at 2..5 and 24..27 (bit j: weight j), 16 bytes
+// of codes at 6..21 and 28..43 (nibbles as Q4_0's). Word m of a block's int8 values holds weights m, m + 8, m + 16,
+// m + 24 (act_pos<PERM_Q5>): their nibbles are the low and high nibbles of code bytes m and m + 8, which one
+// __byte_perm gathers, and their fifth bits are bits m, m + 8, m + 16, m + 24 of qh, which one shift and mask move to
+// bit 4 of each byte (as Q5_K's). The offset -16 comes from the records.
+template <int NC, int R>
+static KCOL_HD __forceinline__ void unit_q5_0(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+                                                 float (&acc)[R][NC]) {
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        int   q[R][8];
+        float d[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            uint32_t w[6];
+            uint32_t qh;
+            uint32_t cw[4];
+            if (c == 0) {
+                unit_words<4, 6>(w, wu[i], 0);
+                d[i] = h2f_lo(w[0]);
+                qh   = prmt(w[0], w[1], 0x5432);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    cw[k] = prmt(w[k + 1], w[k + 2], 0x5432);
+                }
+            } else {
+                unit_words<4, 6>(w, wu[i], 5);
+                d[i] = h2f_hi(w[0]);
+                qh   = w[1];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    cw[k] = w[k + 2];
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                // code bytes m, m + 8, m, m + 8: byte m % 4 of code words m / 4 and m / 4 + 2
+                const uint32_t b   = (uint32_t) (m & 3);
+                const uint32_t t   = prmt(cw[m >> 2], cw[(m >> 2) + 2], b | (b + 4) << 4 | b << 8 | (b + 4) << 12);
+                const uint32_t nib = (t & 0x00000F0F) | ((t >> 4) & 0x0F0F0000);
+                const uint32_t hb  = m <= 4 ? (qh << (4 - m)) & 0x10101010 : (qh >> (m - 4)) & 0x10101010;
+                q[i][m] = (int) (nib | hb);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            act_blk a;
+            load_act<KQ5_0>(a, act + j * cstride, c);
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                int isum = a.h0;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    isum = dp4a(q[i][k], a.u[k], isum);
+                }
+                acc[i][j] = fmaf((float) isum * d[i], a.d, acc[i][j]);
+            }
+        }
+    }
+}
+
 template <int T, int NC, int R>
 static KCOL_HD __forceinline__ void unit_dot(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
                                                 float (&acc)[R][NC]) {
@@ -728,8 +887,14 @@ static KCOL_HD __forceinline__ void unit_dot(const unit_ptr (&wu)[R], const uint
         unit_q45_K<NC, R, true>(wu, act, cstride, acc);
     } else if constexpr (T == KQ6_K) {
         unit_q6_K<NC, R>(wu, act, cstride, acc);
-    } else {
+    } else if constexpr (T == KIQ4_XS) {
         unit_iq4_xs<NC, R>(wu, act, cstride, acc);
+    } else if constexpr (T == KQ4_0) {
+        unit_q4_0<NC, R, false>(wu, act, cstride, acc);
+    } else if constexpr (T == KIQ4_NL) {
+        unit_q4_0<NC, R, true>(wu, act, cstride, acc);
+    } else {
+        unit_q5_0<NC, R>(wu, act, cstride, acc);
     }
 }
 

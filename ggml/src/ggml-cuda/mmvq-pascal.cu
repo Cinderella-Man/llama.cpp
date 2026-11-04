@@ -875,7 +875,8 @@ static bool mmvqp_stage_act() {
 // GGML_CUDA_MMVQ_PASCAL_Q2_0=G,P,T: Q2_0's launch shape, so that one binary measures the alternatives on a P106: G and P
 // rows per lane group (1 or 2) with and without a fused gate, and T where rows go whose segments can't be staged 16 bytes
 // at a time (K = 640): 0 direct loads, 1 tile staging (default), 2 tile staging wherever it fits. 0 or a missing field
-// keeps mmvqp_choose's value.
+// keeps the default (mmvqp_choose's value; with a fused gate, R = 1 for one token where R = 2 leaves fewer than 4 blocks
+// per SM).
 struct mmvqp_q2_0_cfg {
     int r_gate  = 0;
     int r_plain = 0;
@@ -894,6 +895,16 @@ static const mmvqp_q2_0_cfg & mmvqp_q2_0_config() {
         return c;
     }();
     return cfg;
+}
+
+// GGML_CUDA_MMVQ_PASCAL_NSM=n: the SM count Q2_0's gate/up launch shape is chosen for (0: the device's), e.g. 5 to run
+// the P106-090's shapes on another GPU
+static int mmvqp_nsm() {
+    static const int nsm = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_NSM");
+        return env ? atoi(env) : 0;
+    }();
+    return nsm > 0 ? nsm : ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
 }
 
 // GGML_CUDA_MMVQ_PASCAL_SKIP=q4_K,q6_K: weight types (ggml type names, comma-separated) left to mul_mat_vec_q, so that
@@ -977,6 +988,16 @@ bool ggml_cuda_mmvq_pascal(
     int lpr_log2 = 0;
     while (lpr_log2 < 5 && chunks % (2 << lpr_log2) == 0) {
         lpr_log2++;
+    }
+    // Q2_0 with a fused gate, one token: R = 1 where R = 2 leaves fewer than 4 blocks per SM (Q612; the shared expert's
+    // 2560 -> 640 gate/up in its own launch, 10 blocks on a P106: 7.78 against 10.98 us in R16)
+    if (type == GGML_TYPE_Q2_0 && gate && ncols_dst == 1 && s.R == 2 && mmvqp_q2_0_config().r_gate == 0) {
+        const int64_t rows_per_block = MMVQ_PASCAL_NWARPS * (WARP_SIZE >> lpr_log2) * 2;
+        const int64_t nblocks = (nrows_x + rows_per_block - 1) / rows_per_block * (nchannels_dst + (fusion.shared_up ? 1 : 0)) *
+            nsamples_dst;
+        if (nblocks < 4 * mmvqp_nsm()) {
+            s.R = 1;
+        }
     }
 
     // every chunk load must be aligned as the kernel assumes: staged segments to 16 bytes, direct chunks to their size

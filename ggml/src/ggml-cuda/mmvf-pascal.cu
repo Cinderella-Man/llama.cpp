@@ -16,8 +16,13 @@
 //     per group still leaves too few blocks, G grows so that a few rows are spread over more lanes (K = 2,560 with
 //     48 rows: 128 lanes). At 2 tokens and R = 4 a P106 runs the 320- and 10,240-wide projections as fast as at one
 //     (R16); at 3 and 4 tokens the earlier rule's R = 2 cost 1.2-1.5x.
+//   - 3 and 4 tokens (Q611, from R16's sweep on a P106): at most 32 lanes from the width, and a grid short of blocks
+//     gets more lanes before fewer rows. At R = 2 the 10,240-wide rows ran 50.7 / 58.5 us at G = 32 against
+//     59.4 / 70.0 at G = 128 (3 / 4 tokens; the 4 warps of a 32-lane block read the same activations), and the
+//     2,560 x 48 alpha and beta 4.4 / 4.9 at G = 128, R = 2 against 5.6 / 7.3 at R = 1.
 // On the P106-090 (5 SMs) this gives Flash-Next's 320 x 10,240 projections G = 8, R = 4 (160 blocks), 10,240 x 320
-// G = 128, R = 4 (80 blocks), 10,240 x 4 G = 128, R = 1 and 2,560 x 512 G = 32, R = 4.
+// G = 128, R = 4 (80 blocks; at 3-4 tokens G = 32, R = 4, 20 blocks), 10,240 x 4 G = 128, R = 1, 2,560 x 512 G = 32,
+// R = 4 and 2,560 x 48 G = 128, R = 1 (at 3-4 tokens R = 2).
 
 #define MMVF_PASCAL_MAX_COLS 8
 
@@ -81,12 +86,19 @@ static void mmvfp_pick_shape(const int nchunks, const int nrows, const int ncols
         R = forced[1];
         return;
     }
+    const int target = 4 * nsm;
+    // 3 and 4 tokens: at most 32 lanes from the width, and a short grid gets more lanes before fewer rows
+    const bool mid = ncols_dst == 3 || ncols_dst == 4;
     G = 8;
-    while (G < 128 && nchunks > 16 * G) {
+    while (G < (mid ? 32 : 128) && nchunks > 16 * G) {
         G *= 4;
     }
-    const int target = 4 * nsm;
     R = rmax;
+    if (mid) {
+        while (G < 128 && mmvfp_blocks(nrows, G, R) < target && nchunks >= 8 * G) {
+            G *= 4;
+        }
+    }
     while (R > 1 && mmvfp_blocks(nrows, G, R) < target) {
         R /= 2;
     }
