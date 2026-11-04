@@ -2895,10 +2895,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         sel = ggml_cast(ctx0, sel, GGML_TYPE_I32);
         cb(sel, "ffn_moe_tier_sel", il);
 
-        ggml_tensor * hot_out  = build_exps(cur, up_exps,  gate_exps,  down_exps,  gate_up_exps,  up_exps_s,  gate_exps_s,  down_exps_s,
+        // MUL_MAT_ID wants an expert at most once per token (CUDA's kernels group a token's columns by expert), and each
+        // tier reads its slot 0 for every pick of the other tier: so each slot runs as a column of its own with one
+        // expert, its input the token's repeated (or, weighted before the FFN, the slot's own)
+        const int64_t n_cols = n_expert_used*n_tokens;
+        ggml_tensor * cur_cols = cur->ne[1] == 1 ? ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1) : cur;
+        cur_cols = ggml_reshape_3d(ctx0, cur_cols, n_embd, 1, n_cols);
+        ids_hot  = ggml_reshape_2d(ctx0, ids_hot,  1, n_cols);
+        ids_cold = ggml_reshape_2d(ctx0, ids_cold, 1, n_cols);
+
+        ggml_tensor * hot_out  = build_exps(cur_cols, up_exps,  gate_exps,  down_exps,  gate_up_exps,  up_exps_s,  gate_exps_s,  down_exps_s,
                                             ids_hot, nullptr);
-        ggml_tensor * cold_out = build_exps(cur, cold->up, cold->gate, cold->down, cold->gate_up, cold->up_s, cold->gate_s, cold->down_s,
+        ggml_tensor * cold_out = build_exps(cur_cols, cold->up, cold->gate, cold->down, cold->gate_up, cold->up_s, cold->gate_s, cold->down_s,
                                             ids_cold, nullptr);
+        hot_out  = ggml_reshape_3d(ctx0, hot_out,  hot_out->ne[0],  n_expert_used, n_tokens);
+        cold_out = ggml_reshape_3d(ctx0, cold_out, cold_out->ne[0], n_expert_used, n_tokens);
 
         // a select, so the dropped outputs never enter the sum
         experts = ggml_get_rows(ctx0, ggml_concat(ctx0, hot_out, cold_out, 1), sel); // [n_embd, n_expert_used, n_tokens]
