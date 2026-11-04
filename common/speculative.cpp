@@ -33,6 +33,122 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+void common_speculative_lattice_info(common_speculative_draft_info & info, const float * lattice, size_t row_stride,
+        int32_t n_pos, int32_t top_k, const std::vector<int32_t> & walk) {
+    info.lattice = true;
+    info.ids .assign(n_pos, {});
+    info.p   .assign(n_pos, {});
+    info.pick.assign(n_pos, -1);
+    info.kept.assign(n_pos, 0.0f);
+
+    const int32_t k_keep = std::max(1, std::min(info.k_max, top_k));
+
+    std::vector<double>  prob((size_t) top_k * top_k); // this position's conditional rows
+    std::vector<double>  marg(top_k), marg_prev(top_k);
+    std::vector<int32_t> keep, keep_prev, order(top_k);
+
+    for (int32_t i = 0; i < n_pos; ++i) {
+        const float * row    = lattice + (size_t) i * row_stride;
+        const float * scores = row + top_k;
+        const int32_t n_rows = i == 0 ? 1 : top_k; // the first position scores from the anchor alone
+
+        for (int32_t a = 0; a < n_rows; ++a) {
+            const float * s = scores + (size_t) a * top_k;
+            const float   m = *std::max_element(s, s + top_k);
+            double sum = 0.0;
+            for (int32_t b = 0; b < top_k; ++b) {
+                prob[(size_t) a * top_k + b] = std::exp((double) s[b] - m);
+                sum += prob[(size_t) a * top_k + b];
+            }
+            for (int32_t b = 0; b < top_k; ++b) {
+                prob[(size_t) a * top_k + b] /= sum;
+            }
+        }
+
+        // the selector's marginal at this position: the anchor's row, then the previous marginal through the rows
+        for (int32_t b = 0; b < top_k; ++b) {
+            if (i == 0) {
+                marg[b] = prob[b];
+            } else {
+                double m = 0.0;
+                for (int32_t a = 0; a < top_k; ++a) {
+                    m += marg_prev[a] * prob[(size_t) a * top_k + b];
+                }
+                marg[b] = m;
+            }
+        }
+
+        // keep the k_keep highest marginals, and the walked candidate if it is not among them
+        for (int32_t b = 0; b < top_k; ++b) {
+            order[b] = b;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t x, int32_t y) { return marg[x] > marg[y]; });
+        keep.assign(order.begin(), order.begin() + k_keep);
+        const int32_t w = i < (int32_t) walk.size() ? walk[i] : -1;
+        if (w >= 0 && w < top_k && std::find(keep.begin(), keep.end(), w) == keep.end()) {
+            keep.push_back(w);
+        }
+
+        auto & ids = info.ids[i];
+        auto & p   = info.p[i];
+        double kept = 0.0;
+        for (size_t j = 0; j < keep.size(); ++j) {
+            ids.push_back((llama_token) row[keep[j]]);
+            kept += marg[keep[j]];
+            if (keep[j] == w) {
+                info.pick[i] = (int32_t) j;
+            }
+        }
+        info.kept[i] = (float) kept;
+
+        if (i == 0) {
+            for (const int32_t b : keep) {
+                p.push_back((float) prob[b]);
+            }
+        } else {
+            for (const int32_t a : keep_prev) {
+                for (const int32_t b : keep) {
+                    p.push_back((float) prob[(size_t) a * top_k + b]);
+                }
+            }
+        }
+
+        keep_prev = keep;
+        marg_prev = marg;
+    }
+}
+
+// one drafted position of a sequential drafter (or DFlash without a selector) into info: the top k_max of its
+// candidates, and the drafted token among them
+static void spec_info_add_marginal(common_speculative_draft_info * info, const std::string & type,
+        const llama_token_data_array * cur_p, llama_token id) {
+    if (info == nullptr || cur_p == nullptr) {
+        return;
+    }
+    info->type    = type;
+    info->lattice = false;
+
+    auto & ids = info->ids.emplace_back();
+    auto & p   = info->p.emplace_back();
+    int32_t pick = -1;
+    const size_t n = std::min((size_t) std::max(1, info->k_max), cur_p->size);
+    for (size_t k = 0; k < n; ++k) {
+        ids.push_back(cur_p->data[k].id);
+        p.push_back(cur_p->data[k].p);
+        if (cur_p->data[k].id == id) {
+            pick = (int32_t) k;
+        }
+    }
+    for (size_t k = n; pick < 0 && k < cur_p->size; ++k) {
+        if (cur_p->data[k].id == id) {
+            ids.push_back(id);
+            p.push_back(cur_p->data[k].p);
+            pick = (int32_t) ids.size() - 1;
+        }
+    }
+    info->pick.push_back(pick);
+}
+
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
 static void spec_retune(
@@ -434,6 +550,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
@@ -884,6 +1001,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
 
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
@@ -1345,7 +1463,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            // LLAMA_SPEC_DUMP's full block: DFlash2 decodes the whole trained block, and drafts only n_max of it
+            const bool    full_block     = is_dflash2 && dp.info && dp.info->full_block;
+            const int32_t n_block_tokens = is_lilicorr ? block_size :
+                full_block ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1402,6 +1523,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 std::vector<float>   probs;
                 std::vector<int32_t> sorted_idx;
+                std::vector<int32_t> walk; // the candidate index taken at each position, for dp.info
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
@@ -1411,6 +1533,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
+                    if (i > params.n_max) {
+                        // past the draft (a full block for dp.info): the drafter's greedy walk only
+                        walk.push_back(predecessor);
+                        continue;
+                    }
                     if (params.p_min > 0.0f || sample) {
                         // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                         probs.resize(top_k);
@@ -1451,6 +1578,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                    if (dp.info) {
+                        walk.push_back(predecessor);
+                    }
+                }
+
+                if (dp.info && is_dflash2) {
+                    dp.info->type = common_speculative_type_to_str(type);
+                    common_speculative_lattice_info(*dp.info, lattice + (size_t) (beg + 1) * n_embd_dec, n_embd_dec,
+                            n_block_tokens - 1, selector_top_k, walk);
                 }
 
                 if (result.size() < (size_t) params.n_min) {
@@ -1489,6 +1625,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                    spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -1512,6 +1649,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                    spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
                 }
             }
 
@@ -2010,6 +2148,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
