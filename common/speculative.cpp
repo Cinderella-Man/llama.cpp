@@ -1939,6 +1939,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool     embd_cache_on       = false;
     uint64_t embd_cache_n_rounds = 0;
 
+    // the draft's hidden rows kept on its layer's card between a step's passes (LLAMA_DRAFT_H_CARRY, Q961)
+    bool h_carry_on = false;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -2016,6 +2019,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         short_init();
         embd_cache_init();
+        h_carry_init();
+    }
+
+    // LLAMA_DRAFT_H_CARRY=1: each drafting pass after a step's first reads its h from the previous pass's output on the
+    // draft layer's card, and no drafting pass copies its h to the host (40 KB a row for Flash-Next's 4 x 2,560 values)
+    void h_carry_init() {
+        const char * s = getenv("LLAMA_DRAFT_H_CARRY");
+        if (s == nullptr || atoi(s) == 0) {
+            return;
+        }
+        if (chain_heads || is_mem_shared) {
+            SPC_WRN("%s", "LLAMA_DRAFT_H_CARRY: not for drafts with chained heads or the target's memory: off\n");
+            return;
+        }
+        if (!llama_nextn_carry_init(this->params.ctx_dft)) {
+            SPC_WRN("%s", "no hidden-row carry for this draft: its passes copy their rows through the host\n");
+            return;
+        }
+        h_carry_on = true;
+        SPC_INF("%s", "draft hidden rows: a step's drafting passes keep them on the device\n");
     }
 
     // LLAMA_DRAFT_EMBD_CACHE=<rows>[,<max tokens>]: batches of up to max tokens (default 16: the draft passes and the
@@ -2374,6 +2397,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            // the first pass reads the target's row from the host, the later ones the previous pass's on the device
+            if (h_carry_on) {
+                llama_set_nextn_carry(ctx_dft, i > 0, true);
+            }
+
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -2393,7 +2421,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                // with the carry the row stayed on the device: the batch's state embedding is set but not read
+                const float * h_row = h_carry_on ? pending_h[seq_id].data() : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2470,6 +2499,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (short_on) {
             llama_set_head_shortlist(ctx_dft, false); // the catch-up decodes produce no logits
+        }
+
+        if (h_carry_on) {
+            llama_set_nextn_carry(ctx_dft, false, false); // the catch-up decodes read the target's rows
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

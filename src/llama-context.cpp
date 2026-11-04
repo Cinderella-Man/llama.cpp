@@ -1880,17 +1880,7 @@ void llama_context::set_head_shortlist(bool value) {
     cparams.head_short_on = value && head_short != nullptr;
 }
 
-bool llama_context::embd_cache_init(uint32_t n_rows, uint32_t max_tokens) {
-    if (model.arch != LLM_ARCH_QWEN4EXP) {
-        LLAMA_LOG_ERROR("%s: only the qwen4exp MTP draft reads its token rows from a row cache\n", __func__);
-        return false;
-    }
-    const ggml_tensor * tok_embd = model.tok_embd;
-    if (tok_embd == nullptr || tok_embd->buffer == nullptr) {
-        LLAMA_LOG_ERROR("%s: the model has no token embeddings in a buffer\n", __func__);
-        return false;
-    }
-
+bool llama_context::mtp_layer_device(ggml_backend_dev_t & dev, ggml_backend_t & backend) const {
     // the card that runs the draft's layer: where its first weight is
     const ggml_tensor * w = nullptr;
     for (const auto & layer : model.layers) {
@@ -1903,10 +1893,10 @@ bool llama_context::embd_cache_init(uint32_t n_rows, uint32_t max_tokens) {
         LLAMA_LOG_ERROR("%s: the model has no MTP layer in a buffer\n", __func__);
         return false;
     }
-    ggml_backend_dev_t dev = ggml_backend_buffer_is_host(w->buffer) ?
+    dev = ggml_backend_buffer_is_host(w->buffer) ?
             ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) :
             ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
-    ggml_backend_t backend = nullptr;
+    backend = nullptr;
     for (const auto & b : backends) {
         if (dev != nullptr && ggml_backend_get_device(b.get()) == dev) {
             backend = b.get();
@@ -1915,6 +1905,69 @@ bool llama_context::embd_cache_init(uint32_t n_rows, uint32_t max_tokens) {
     }
     if (backend == nullptr) {
         LLAMA_LOG_ERROR("%s: no backend of this context runs the MTP layer's device\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+bool llama_context::nextn_carry_init() {
+    if (model.arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_ERROR("%s: only the qwen4exp MTP draft keeps its hidden rows on the device\n", __func__);
+        return false;
+    }
+    ggml_backend_dev_t dev     = nullptr;
+    ggml_backend_t     backend = nullptr;
+    if (!mtp_layer_device(dev, backend)) {
+        return false;
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    nextn_carry_ctx.reset(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_2d(nextn_carry_ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), cparams.n_seq_max);
+    ggml_set_name(t, "nextn_carry");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    nextn_carry_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(nextn_carry_ctx.get(), buft));
+    if (!nextn_carry_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the hidden rows' carry in %s\n", __func__, ggml_backend_buft_name(buft));
+        nextn_carry_ctx.reset();
+        return false;
+    }
+    // placed like weights: the ops that read and write it run where it is
+    ggml_backend_buffer_set_usage(nextn_carry_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_clear(nextn_carry_buf.get(), 0);
+
+    cparams.nextn_carry     = t;
+    cparams.nextn_carry_in  = false;
+    cparams.nextn_carry_out = false;
+
+    LLAMA_LOG_INFO("%s: draft hidden rows kept on the device: %u rows of %u F32 (%.2f MiB) in %s\n", __func__,
+            cparams.n_seq_max, model.hparams.n_embd_out(),
+            ggml_backend_buffer_get_size(nextn_carry_buf.get()) / 1024.0 / 1024.0, ggml_backend_buft_name(buft));
+
+    return true;
+}
+
+void llama_context::set_nextn_carry(bool in, bool out) {
+    // a change rebuilds the graph (llm_graph_params::allow_reuse)
+    cparams.nextn_carry_in  = in  && cparams.nextn_carry != nullptr;
+    cparams.nextn_carry_out = out && cparams.nextn_carry != nullptr;
+}
+
+bool llama_context::embd_cache_init(uint32_t n_rows, uint32_t max_tokens) {
+    if (model.arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_ERROR("%s: only the qwen4exp MTP draft reads its token rows from a row cache\n", __func__);
+        return false;
+    }
+    const ggml_tensor * tok_embd = model.tok_embd;
+    if (tok_embd == nullptr || tok_embd->buffer == nullptr) {
+        LLAMA_LOG_ERROR("%s: the model has no token embeddings in a buffer\n", __func__);
+        return false;
+    }
+
+    ggml_backend_dev_t dev     = nullptr;
+    ggml_backend_t     backend = nullptr;
+    if (!mtp_layer_device(dev, backend)) {
         return false;
     }
 
@@ -3612,6 +3665,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+
+        // a draft pass that keeps its hidden rows on the device for the next pass (set_nextn_carry): no copy to the host
+        if (cparams.nextn_carry && cparams.nextn_carry_out) {
+            t_h_nextn = nullptr;
+        }
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -6339,6 +6397,14 @@ bool llama_embd_cache_init(llama_context * ctx, uint32_t n_rows, uint32_t max_to
 
 bool llama_embd_cache_stats(const llama_context * ctx, uint64_t * n_hit, uint64_t * n_miss, uint64_t * n_plain) {
     return ctx->embd_cache_stats(n_hit, n_miss, n_plain);
+}
+
+bool llama_nextn_carry_init(llama_context * ctx) {
+    return ctx->nextn_carry_init();
+}
+
+void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {
+    ctx->set_nextn_carry(in, out);
 }
 
 bool llama_head_bound_init(llama_context * ctx) {

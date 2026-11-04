@@ -173,6 +173,11 @@ public:
     // batch's slots in it, which the context prepared for this micro-batch
     const llama_embd_cache * row_cache = nullptr;
 
+    // a draft's hidden rows on its layer's card (cparams.nextn_carry): with carry_in the graph reads each token's h
+    // from its sequence's row (h is then not an input), with carry_out it writes each output's row there
+    ggml_tensor * carry_in  = nullptr; // I32 [n_batch]:   the tokens' sequences
+    ggml_tensor * carry_out = nullptr; // I32 [n_outputs]: the outputs' sequences
+
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
 };
@@ -984,6 +989,8 @@ struct llm_graph_params {
             cparams.head_short_on           == other.cparams.head_short_on           &&
             cparams.head_short_n            == other.cparams.head_short_n            &&
             cparams.embd_cache_on           == other.cparams.embd_cache_on           &&
+            cparams.nextn_carry_in          == other.cparams.nextn_carry_in          &&
+            cparams.nextn_carry_out         == other.cparams.nextn_carry_out         &&
             cparams.moe_tail                == other.cparams.moe_tail                &&
             cparams.moe_tail_p              == other.cparams.moe_tail_p              &&
             cparams.moe_tail_w              == other.cparams.moe_tail_w              &&

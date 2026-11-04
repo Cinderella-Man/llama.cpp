@@ -198,6 +198,14 @@ LLAMA_API bool llama_embd_cache_init (struct llama_context * ctx, uint32_t n_row
 // tokens read from the cache, of them copied from the table first, and batches that read the table; false without one
 LLAMA_API bool llama_embd_cache_stats(const struct llama_context * ctx, uint64_t * n_hit, uint64_t * n_miss, uint64_t * n_plain);
 
+// A draft context's hidden rows kept on the card that runs its layer between passes (Q961): one row per sequence. While
+// in is set, a decode's tokens take their h from their sequence's row instead of the batch's state embedding (which
+// must still be set, and is not read); while out is set, a decode writes each output's h to its sequence's row and
+// copies none to the host (llama_get_embeddings_nextn_ith then has nothing new). So a step's drafting passes send no
+// hidden row over the bus. Supported by the qwen4exp MTP draft; false without an MTP layer.
+LLAMA_API bool llama_nextn_carry_init(struct llama_context * ctx);
+LLAMA_API void llama_set_nextn_carry (struct llama_context * ctx, bool in, bool out);
+
 // The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
 // logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
 // -INFINITY; llama_head_bound_ith(i) is then at least every left-out logit the full head would have computed (Cauchy-

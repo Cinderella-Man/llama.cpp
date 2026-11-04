@@ -171,6 +171,13 @@ struct llama_context {
     bool embd_cache_init(uint32_t n_rows, uint32_t max_tokens);
     bool embd_cache_stats(uint64_t * n_hit, uint64_t * n_miss, uint64_t * n_plain) const;
 
+    // the (draft) context's hidden rows kept on its layer's card between passes (llama_nextn_carry_init)
+    bool nextn_carry_init();
+    void set_nextn_carry(bool in, bool out);
+
+    // the device of the MTP layer's weights and this context's backend for it
+    bool mtp_layer_device(ggml_backend_dev_t & dev, ggml_backend_t & backend) const;
+
     // fewer routed experts on confident tokens (llama_set_moe_tail)
     void     set_moe_tail(bool on, float p, float w, bool renorm, bool hist);
     uint64_t moe_tail_counts(uint64_t * counts, int32_t n_counts) const;
@@ -593,6 +600,10 @@ private:
 
     // the output head's shortlist (head_shortlist_init), referenced by cparams.head_short
     std::unique_ptr<llama_head_shortlist> head_short;
+
+    // the hidden rows' carry on the layer's card (nextn_carry_init), referenced by cparams.nextn_carry
+    ggml_context_ptr        nextn_carry_ctx;
+    ggml_backend_buffer_ptr nextn_carry_buf;
 
     // the token embedding rows on the layer's card (embd_cache_init), referenced by cparams.embd_cache, and the backend
     // that runs the graphs reading them
