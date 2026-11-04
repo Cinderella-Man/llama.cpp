@@ -1383,8 +1383,8 @@ struct llm_graph_context {
     // neither count
     ggml_tensor * build_inp_route_once(int64_t n_tokens_layer) const;
 
-    // the selection scores [n_expert, n_tokens] masked to -inf outside the experts of each token's block leader (its
-    // top n_expert_used of the same scores), so that the router's top-k picks among those only
+    // the experts of each token's block leader (its top n_expert_used of the same scores), ordered by the token's own
+    // selection scores: I32 [n_expert_used, n_tokens], in place of the router's top-k
     ggml_tensor * build_moe_route_once(
              ggml_tensor * selection_probs,
              ggml_tensor * lead,

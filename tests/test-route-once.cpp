@@ -48,8 +48,8 @@ struct args_t {
 
 static const int N_UBATCH = 64;
 
-// the router's tensors of one decode, by MoE layer: probabilities [n_expert, n_rows], the full argsort (its first
-// n_used entries are the experts read), the normalized weights [n_used, n_rows]
+// the router's tensors of one decode, by MoE layer: probabilities [n_expert, n_rows], the experts read in slot order
+// [n_used, n_rows] (ffn_moe_topk), the normalized weights [n_used, n_rows]
 struct layer_capture {
     int64_t n_expert = 0;
     int64_t n_rows   = 0;
@@ -77,13 +77,13 @@ static int layer_of(const char * name, const char * prefix) {
 static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * c = (capture_t *) user_data;
     const int il_p = layer_of(t->name, "ffn_moe_probs-");
-    const int il_a = layer_of(t->name, "ffn_moe_argsort-");
+    const int il_a = layer_of(t->name, "ffn_moe_topk-");
     const int il_w = layer_of(t->name, "ffn_moe_weights_norm-");
     const bool want = c->on && (il_p >= 0 || il_a >= 0 || il_w >= 0);
     if (ask || !want) {
         return ask ? want : true;
     }
-    if (!ggml_is_contiguous(t)) {
+    if (il_a < 0 && !ggml_is_contiguous(t)) {
         fprintf(stderr, "%s is not contiguous\n", t->name);
         exit(1);
     }
@@ -94,9 +94,16 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         L.probs.resize(ggml_nelements(t));
         ggml_backend_tensor_get(t, L.probs.data(), 0, ggml_nbytes(t));
     } else if (il_a >= 0) {
+        // the experts read, [n_used, n_rows]: the router's a view of its sort (rows n_expert apart)
         auto & L = c->layers[il_a];
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
         L.order.resize(ggml_nelements(t));
-        ggml_backend_tensor_get(t, L.order.data(), 0, ggml_nbytes(t));
+        for (int64_t r = 0; r < t->ne[1]; ++r) {
+            for (int64_t e = 0; e < t->ne[0]; ++e) {
+                memcpy(&L.order[r*t->ne[0] + e], raw.data() + r*t->nb[1] + e*t->nb[0], sizeof(int32_t));
+            }
+        }
     } else {
         auto & L = c->layers[il_w];
         L.n_used = t->ne[0];
@@ -190,7 +197,7 @@ static std::vector<int32_t> top_k_of(const float * p, int64_t n_expert, int64_t 
 static void check_layer(const layer_capture & L, const std::vector<int32_t> & lead, route_check & rc) {
     const int64_t n_exp  = L.n_expert;
     const int64_t n_used = L.n_used;
-    if ((int64_t) lead.size() != L.n_rows || (int64_t) L.order.size() != n_exp*L.n_rows ||
+    if ((int64_t) lead.size() != L.n_rows || (int64_t) L.order.size() != n_used*L.n_rows ||
             (int64_t) L.weights.size() != n_used*L.n_rows || n_used <= 0) {
         fprintf(stderr, "capture shape: rows %lld, leaders %zu, order %zu, weights %zu, used %lld\n",
                 (long long) L.n_rows, lead.size(), L.order.size(), L.weights.size(), (long long) n_used);
@@ -199,7 +206,7 @@ static void check_layer(const layer_capture & L, const std::vector<int32_t> & le
     }
     for (int64_t r = 0; r < L.n_rows; ++r) {
         const float   * p   = L.probs.data() + r*n_exp;
-        const int32_t * ids = L.order.data() + r*n_exp;
+        const int32_t * ids = L.order.data() + r*n_used;
         const float   * w   = L.weights.data() + r*n_used;
 
         std::vector<int32_t> got(ids, ids + n_used);

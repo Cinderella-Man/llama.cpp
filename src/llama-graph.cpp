@@ -2680,7 +2680,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // of its first token only; a layer of one token has nothing to share, and a micro-batch of more than
     // cparams.moe_route_once_max tokens (when set) routes as usual. Not with expert groups (their mask comes first) or
     // GroveMoE's index rescaling, nor with experts chosen by the caller
-    ggml_tensor * selection_free  = nullptr; // the router's own scores, for the histogram's independent routing
+    ggml_tensor * selected_route  = nullptr; // the experts route once picks
     bool          route_once_hist = false;
     if (cparams.moe_route_once > 0 && selected_experts_in == nullptr && n_tokens > 1 && n_expert_used > 0 &&
             (cparams.moe_route_once_max == 0 || this->n_tokens <= (int64_t) cparams.moe_route_once_max) &&
@@ -2690,14 +2690,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             route_once_hist = cparams.moe_route_once_hist && (n_tokens == this->n_tokens || n_tokens == n_outputs);
         } else if (ggml_tensor * lead = build_inp_route_once(n_tokens)) {
             route_once_hist = cparams.moe_route_once_hist;
-            selection_free  = selection_probs;
-            selection_probs = build_moe_route_once(selection_probs, lead, n_expert_used, il);
+            selected_route  = build_moe_route_once(selection_probs, lead, n_expert_used, il);
         }
     }
 
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
-    if (selected_experts == nullptr) {
+    if (selected_experts == nullptr && selected_route != nullptr) {
+        selected_experts = selected_route;
+    } else if (selected_experts == nullptr) {
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
@@ -2765,8 +2766,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, read);
 
         ggml_tensor * free_ids = read;
-        if (selection_free != nullptr) {
-            free_ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, selection_free, n_expert_used));
+        if (selected_route != nullptr) {
+            free_ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, selection_probs, n_expert_used));
             cb(free_ids, "ffn_moe_route_free", il);
             ggml_set_output(free_ids);
             ggml_build_forward_expand(gf, free_ids);
@@ -3094,20 +3095,21 @@ ggml_tensor * llm_graph_context::build_moe_route_once(
     ggml_tensor * lead_probs = ggml_get_rows(ctx0, selection_probs, lead); // [n_expert, n_tokens]
     cb(lead_probs, "ffn_moe_route_lead_probs", il);
 
-    ggml_tensor * lead_top = ggml_argsort_top_k(ctx0, lead_probs, n_expert_used); // [n_expert_used, n_tokens]
+    ggml_tensor * lead_top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, lead_probs, n_expert_used)); // [n_used, n_tok]
     cb(lead_top, "ffn_moe_route_lead_topk", il);
 
-    // the token's own scores at those experts, -inf at every other: its top-k is then its own order of the block's
-    // experts, and its weights (taken from the unmasked probabilities, then normalized) its own
-    ggml_tensor * sel3 = ggml_reshape_3d(ctx0, selection_probs, 1, n_exp, n_tok);
-    ggml_tensor * own  = ggml_get_rows(ctx0, sel3, lead_top); // [1, n_expert_used, n_tokens]
+    // the token's own scores at those experts and their order: its own order of the block's experts (its weights
+    // come from its own probabilities). A leader's row is already sorted, and a sort of n_expert_used values leaves it
+    // as it is, so a block of one token reads exactly the router's top-k in the router's order
+    ggml_tensor * own = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, selection_probs, 1, n_exp, n_tok), lead_top);
+    own = ggml_reshape_2d(ctx0, own, n_expert_used, n_tok); // [n_expert_used, n_tokens]
     cb(own, "ffn_moe_route_own", il);
 
-    ggml_tensor * masked = ggml_set_rows(ctx0, ggml_fill(ctx0, sel3, -INFINITY), own, lead_top); // [1, n_exp, n_tok]
-    masked = ggml_reshape_2d(ctx0, masked, n_exp, n_tok);
-    cb(masked, "ffn_moe_route_masked", il);
+    ggml_tensor * order = ggml_argsort(ctx0, own, GGML_SORT_ORDER_DESC); // [n_expert_used, n_tokens]
+    cb(order, "ffn_moe_route_order", il);
 
-    return masked;
+    ggml_tensor * selected = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lead_top, 1, n_expert_used, n_tok), order);
+    return ggml_reshape_2d(ctx0, selected, n_expert_used, n_tok); // I32 [n_expert_used, n_tokens]
 }
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(
