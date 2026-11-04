@@ -73,6 +73,12 @@ struct llama_cparams {
 
     size_t moe_cache_size;
 
+    // card-to-card hops (LLAMA_HOP_CAST, off by default): the residual crosses each marked layer boundary as hop_type,
+    // cast on the card before the boundary and back to F32 on the card after it (llm_graph_context::build_hop_cast);
+    // hop_layer[il] marks the first layer after a boundary. GGML_TYPE_F32: off
+    enum ggml_type    hop_type = GGML_TYPE_F32;
+    std::vector<bool> hop_layer; // [n_layer()]
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 
