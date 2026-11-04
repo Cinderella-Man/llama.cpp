@@ -1788,6 +1788,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SPREAD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-share"},
+        "a slot and the copies of its prompt (the prompt cache's entries with --cache-ram, child slots) share its host "
+        "context checkpoints instead of copying each one, as upstream #30137: the same states, at most one copy in host "
+        "memory (no effect with --cache-ram 0 and one completion per request; default: off)",
+        [](common_params & params) {
+            params.checkpoint_share = true;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SHARE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--checkpoint-tail2"},
         "two context checkpoints at the end of each prompt, 4 + n_ubatch and 4 tokens before it, as stock llama.cpp; "
         "by default a sliding-window model takes only the second, with its whole window ring, which also serves the first's restores",

@@ -2578,7 +2578,7 @@ bool common_prompt_checkpoint::tgt_to_host(
         return true;
     }
 
-    std::vector<uint8_t> data(llama_state_seq_store_get_size_host(ctx, seq_id, store));
+    common_state_data data(llama_state_seq_store_get_size_host(ctx, seq_id, store));
 
     const size_t n = llama_state_seq_store_get_data_host(ctx, data_tgt.data(), data_tgt.size(), data.data(), data.size(), seq_id, store);
 
