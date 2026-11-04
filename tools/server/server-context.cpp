@@ -87,12 +87,17 @@ static common_speculative_output_limits server_output_limits(const common_params
 //   LLAMA_SPEC_DRAFT_KEEP=<n>  every draft is cut to its first n drafted tokens (default: no cut), so that forced
 //                              tokens get the rest of the width: --spec-draft-n-max 4 with n = 2 verifies 3 tokens
 //                              outside tool calls and up to 5 inside. A fixed cut, so exact
+//   LLAMA_SPEC_KEEP_DRAWS=1    token-by-token rejection keeps its random draws used across a checkpoint replay, as
+//                              block verification always does (Q808): without it the step after a replay (a draft
+//                              longer than a recurrent target's rollback snapshots, or a target that cannot remove a
+//                              partial sequence) draws the uniforms of the step it replays, conditioned on its outcome
 struct server_spec_verify {
     bool    block       = false;
     bool    force       = false;
     int32_t force_chars = 64;
     int32_t force_max   = -1;
     int32_t keep        = -1;
+    bool    keep_draws  = false;
 
     static server_spec_verify & get() {
         static server_spec_verify v;
@@ -133,11 +138,15 @@ struct server_spec_verify {
         read_int("LLAMA_SPEC_FORCE_CHARS", 1, v.force_chars);
         read_int("LLAMA_SPEC_FORCE_MAX",   0, v.force_max);
         read_int("LLAMA_SPEC_DRAFT_KEEP",  0, v.keep);
+        on = 0;
+        if (read_int("LLAMA_SPEC_KEEP_DRAWS", 0, on)) {
+            v.keep_draws = on != 0;
+        }
 
-        if (v.block || v.any_draft()) {
+        if (v.block || v.any_draft() || v.keep_draws) {
             LOG_INF("speculative verification: block verification %s, grammar-forced tokens %s (%d characters, at most "
-                    "%d a step), drafts cut to %d tokens\n", v.block ? "on" : "off", v.force ? "on" : "off",
-                    v.force_chars, v.force_max, v.keep);
+                    "%d a step), drafts cut to %d tokens, draws kept across a replay %s\n", v.block ? "on" : "off",
+                    v.force ? "on" : "off", v.force_chars, v.force_max, v.keep, v.block || v.keep_draws ? "on" : "off");
         }
     }
 };
@@ -6314,8 +6323,8 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        if (server_spec_verify::get().block) {
-                            // the uniforms this step used stay used, or the next step would draw them again
+                        if (server_spec_verify::get().block || server_spec_verify::get().keep_draws) {
+                            // the draws this step used stay used, or the next step would draw them again (Q808)
                             common_sampler_copy_keep_rng(smpl_save.get(), slot.smpl.get());
                         } else {
                             common_sampler_copy(smpl_save.get(), slot.smpl.get());
