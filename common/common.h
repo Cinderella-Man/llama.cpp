@@ -799,6 +799,8 @@ struct common_params {
     bool show_statistics        = false; // show imatrix statistics per tensor
     bool activation_statistics  = false; // generate data to calculate activation based statistics
     bool parse_special          = false; // whether to parse special tokens during imatrix tokenization
+    std::string imat_span_mask;          // per-token classes: also write one imatrix per class (<out>.span<c>.gguf)
+    std::string imat_span_dump;          // write the tokenized input (id and piece of every token) and exit
 
     // cvector-generator params
     int n_pca_batch = 100;

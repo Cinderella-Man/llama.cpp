@@ -29,7 +29,7 @@ static void print_usage(int, char ** argv) {
             "       -m model.gguf -f some-text.txt [-o imatrix.gguf] [--output-format {gguf,dat}] [--no-ppl] \\\n"
             "       [--process-output] [--nextn] [--model-draft draft.gguf] [--chunk 123] [--save-frequency 0] \\\n"
             "       [--output-frequency 10] [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] \\\n"
-            "       [--parse-special] [--show-statistics] [...]\n" , argv[0]);
+            "       [--parse-special] [--show-statistics] [--span-mask classes.txt | --span-dump tokens.tsv] [...]\n" , argv[0]);
     LOG("\n");
 }
 
@@ -77,7 +77,13 @@ public:
     const std::unordered_map<std::string, Stats> & get_mstats() const { return m_stats; }
     void set_n_layer_nextn(int32_t n_layer_nextn) { m_n_layer_nextn = n_layer_nextn; }
     int32_t get_n_layer_nextn() const { return m_n_layer_nextn; }
+    // span classes (--span-mask): every collected row also goes to the matrix of its token's class
+    bool load_span_mask(const std::string & fname, const std::vector<llama_token> & tokens);
+    bool has_span_mask() const { return !m_span.empty(); }
+    void set_span_batch(int64_t offset, int64_t n_tokens);
+    void save_span_imatrix();
 private:
+    void collect_span(const struct ggml_tensor * t, const char * data, const std::string & wname);
     std::unordered_map<std::string, Stats>  m_stats;
     common_params                           m_params;
     std::mutex                              m_mutex;
@@ -87,6 +93,13 @@ private:
     int32_t                                 m_n_layer_nextn = 0;
     std::vector<char>                       m_src1_data;
     std::vector<char>                       m_ids; // the expert ids from ggml_mul_mat_id
+    std::vector<uint8_t>                                m_span;         // the class of every token of the input
+    std::vector<std::unordered_map<std::string, Stats>> m_span_stats;   // one matrix per class
+    std::vector<int64_t>                                m_span_tokens;  // tokens of each class processed
+    std::set<std::string>                               m_span_skipped; // tensors whose rows are not the batch's tokens
+    int64_t                                             m_span_off = 0; // the batch's first token, as an index into m_span
+    int64_t                                             m_span_n   = 0; // the batch's tokens
+    int32_t                                             m_span_saving = -1; // the class save_imatrix writes (-1: none)
     int32_t e_chunk_size() const {
         return m_chunk_size > 0 ? m_chunk_size : m_params.n_ctx / m_params.n_parallel;
     }
@@ -756,7 +769,182 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
     }
 
+    if (!m_span.empty()) {
+        collect_span(t, data, wname);
+    }
+
     return true;
+}
+
+// The span classes' matrices: the same sums as above, each row added to the matrix of its token's class, in the same
+// order, so a mask that puts every token in one class gives that class the usual matrix bit for bit. The rows of a
+// MUL_MAT_ID are the batch's tokens (src1 [cols, n_expert_used, n_tokens]); a MUL_MAT's are when src1->ne[1] is the
+// batch size, and a tensor whose rows are not is left out of the class matrices (once, with a warning).
+void IMatrixCollector::collect_span(const struct ggml_tensor * t, const char * data, const std::string & wname) {
+    const struct ggml_tensor * src0 = t->src[0];
+    const struct ggml_tensor * src1 = t->src[1];
+    const int64_t ne0 = src1->ne[0];
+    const size_t n_cls = m_span_stats.size();
+    const uint8_t * cls = m_span.data() + m_span_off;
+
+    std::vector<Stats *> ent(n_cls);
+
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        const struct ggml_tensor * ids = t->src[2];
+        const int64_t n_as = src0->ne[2];
+        const int64_t n_ids = ids->ne[0];
+        const int64_t n_tokens = src1->ne[2];
+
+        if (n_tokens != m_span_n) {
+            LOG_ERR("%s: %s has %d token rows in a batch of %d tokens, so its rows cannot be given their tokens' classes\n",
+                __func__, wname.c_str(), (int) n_tokens, (int) m_span_n);
+            exit(1);
+        }
+        for (size_t c = 0; c < n_cls; ++c) {
+            Stats & e = m_span_stats[c][wname];
+            if (e.values.empty()) {
+                e.activations.resize(ne0*n_as, 0);
+                e.values.resize(ne0*n_as, 0);
+                e.counts.resize(n_as, 0);
+            } else if (e.values.size() != (size_t) (ne0*n_as)) {
+                LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int) e.values.size(), (int) (ne0*n_as));
+                exit(1);
+            }
+            ent[c] = &e;
+        }
+        // m_ids holds this tensor's expert ids (copied above)
+        for (int64_t idx = 0; idx < n_ids; ++idx) {
+            for (int64_t row = 0; row < n_tokens; ++row) {
+                const int32_t ex = *(const int32_t *) (m_ids.data() + row * ids->nb[1] + idx * ids->nb[0]);
+                const int64_t i11 = idx % src1->ne[1];
+                const float * x = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
+                Stats & e = *ent[cls[row]];
+                float * acc = e.values.data() + ex * ne0;
+                float * act = e.activations.data() + ex * ne0;
+
+                e.counts[ex]++;
+                for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
+                for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+            }
+        }
+        return;
+    }
+
+    if (src1->ne[1] != m_span_n) {
+        if (m_span_skipped.insert(wname).second) {
+            LOG_WRN("%s: %s has %d rows in a batch of %d tokens: left out of the span matrices\n",
+                __func__, wname.c_str(), (int) src1->ne[1], (int) m_span_n);
+        }
+        return;
+    }
+    const int64_t n_mat = src0->ne[2] * src0->ne[3];
+    for (size_t c = 0; c < n_cls; ++c) {
+        Stats & e = m_span_stats[c][wname];
+        if (e.values.empty()) {
+            e.activations.resize(ne0 * n_mat, 0);
+            e.values.resize(ne0 * n_mat, 0);
+            e.counts.resize(1, 0);
+        } else if (e.values.size() != (size_t) (ne0 * n_mat)) {
+            LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int) e.values.size(), (int) (ne0 * n_mat));
+            exit(1);
+        }
+        ent[c] = &e;
+    }
+    std::vector<int64_t> n_rows(n_cls, 0);
+    for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+            const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
+            for (int64_t row = 0; row < src1->ne[1]; ++row) {
+                const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+                Stats & e = *ent[cls[row]];
+                float * acc = e.values.data() + mat_id * ne0;
+                float * act = e.activations.data() + mat_id * ne0;
+                for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
+                for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+                n_rows[cls[row]]++;
+            }
+        }
+    }
+    for (size_t c = 0; c < n_cls; ++c) {
+        ent[c]->counts[0] += n_rows[c] / n_mat;
+    }
+}
+
+bool IMatrixCollector::load_span_mask(const std::string & fname, const std::vector<llama_token> & tokens) {
+    std::ifstream in(fname);
+    if (!in) {
+        LOG_ERR("%s: cannot open %s\n", __func__, fname.c_str());
+        return false;
+    }
+    std::vector<uint8_t> span;
+    span.reserve(tokens.size());
+    int n_declared = 0;
+    int max_cls = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) { continue; }
+        if (line[0] == '#') {
+            sscanf(line.c_str(), "#classes %d", &n_declared);
+            continue;
+        }
+        long long id = -1;
+        int c = -1;
+        if (sscanf(line.c_str(), "%lld %d", &id, &c) != 2 || c < 0 || c > 255) {
+            LOG_ERR("%s: %s: bad line %zu: '%s'\n", __func__, fname.c_str(), span.size() + 1, line.c_str());
+            return false;
+        }
+        const size_t i = span.size();
+        if (i >= tokens.size() || id != tokens[i]) {
+            LOG_ERR("%s: %s: token %zu is %lld, the input's is %d: the mask was made from another tokenization "
+                "(same model and --parse-special?)\n", __func__, fname.c_str(), i, id, i < tokens.size() ? tokens[i] : -1);
+            return false;
+        }
+        span.push_back((uint8_t) c);
+        max_cls = std::max(max_cls, c);
+    }
+    if (span.size() != tokens.size()) {
+        LOG_ERR("%s: %s has %zu tokens, the input %zu\n", __func__, fname.c_str(), span.size(), tokens.size());
+        return false;
+    }
+    if (n_declared != 0 && n_declared <= max_cls) {
+        LOG_ERR("%s: %s declares %d classes and uses class %d\n", __func__, fname.c_str(), n_declared, max_cls);
+        return false;
+    }
+    const int n_cls = std::max(n_declared, max_cls + 1);
+    std::vector<int64_t> n_of(n_cls, 0);
+    for (const uint8_t c : span) { n_of[c]++; }
+    LOG_INF("%s: %s: %zu tokens in %d classes:", __func__, fname.c_str(), span.size(), n_cls);
+    for (int c = 0; c < n_cls; ++c) { LOG(" %d: %lld", c, (long long) n_of[c]); }
+    LOG("\n");
+
+    m_span = std::move(span);
+    m_span_stats.assign(n_cls, {});
+    m_span_tokens.assign(n_cls, 0);
+    return true;
+}
+
+void IMatrixCollector::set_span_batch(int64_t offset, int64_t n_tokens) {
+    GGML_ASSERT(offset >= 0 && offset + n_tokens <= (int64_t) m_span.size());
+    m_span_off = offset;
+    m_span_n   = n_tokens;
+    for (int64_t i = 0; i < n_tokens; ++i) { m_span_tokens[m_span[offset + i]]++; }
+}
+
+// <output>.span<c>.gguf for every class, written by save_imatrix from the class's matrix
+void IMatrixCollector::save_span_imatrix() {
+    const std::string out_file = m_params.out_file;
+    std::string stem = out_file;
+    if (string_ends_with(stem, ".gguf")) { stem.resize(stem.size() - 5); }
+    for (size_t c = 0; c < m_span_stats.size(); ++c) {
+        m_params.out_file = stem + ".span" + std::to_string(c) + ".gguf";
+        std::swap(m_stats, m_span_stats[c]);
+        m_span_saving = (int32_t) c;
+        save_imatrix();
+        LOG_INF("%s: class %zu (%lld tokens processed) -> %s\n", __func__, c, (long long) m_span_tokens[c], m_params.out_file.c_str());
+        std::swap(m_stats, m_span_stats[c]);
+    }
+    m_span_saving = -1;
+    m_params.out_file = out_file;
 }
 
 void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
@@ -956,6 +1144,12 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
         gguf_set_val_u32(ctx_gguf, LLM_KV_IMATRIX_CHUNK_SIZE, e_chunk_size());
         // Write how many of the top layers are NextN layers, so statistics can tell them apart
         if (m_n_layer_nextn > 0) { gguf_set_val_u32(ctx_gguf, LLM_KV_IMATRIX_N_LAYER_NEXTN, m_n_layer_nextn); }
+        // A span class's matrix (--span-mask): the class, the mask file and how many of its tokens were processed
+        if (m_span_saving >= 0) {
+            gguf_set_val_u32(ctx_gguf, "imatrix.span.class", (uint32_t) m_span_saving);
+            gguf_set_val_str(ctx_gguf, "imatrix.span.mask", m_params.imat_span_mask.c_str());
+            gguf_set_val_u64(ctx_gguf, "imatrix.span.tokens", (uint64_t) m_span_tokens[m_span_saving]);
+        }
         // Define the schema for the tensor statistics (for use in quantize.cpp)
         const char * stats_schema[] = {
             "sum_sq", "mean", "elements", "std_deviation", "skewness", "kurtosis", "gain", "h_norm", "l2_dist", "cossim", "pearson", "covariance"
@@ -1438,6 +1632,12 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
 
+    // the span mask indexes the whole tokenized input, before the chunks --chunk skips
+    if (!params.imat_span_mask.empty() && !g_collector.load_span_mask(params.imat_span_mask, tokens)) {
+        return false;
+    }
+    const int64_t span_base = params.i_chunk > 0 ? (int64_t) params.i_chunk * n_ctx : 0;
+
     if (params.i_chunk > 0) {
         if (size_t((params.i_chunk + 2)*n_ctx) >= tokens.size()) {
             LOG_ERR("%s: there will be not enough tokens left after removing %d chunks\n", __func__, params.i_chunk);
@@ -1527,6 +1727,11 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
                 // restore the original token in case it was set to BOS
                 tokens[seq_start] = token_org;
+            }
+
+            if (g_collector.has_span_mask()) {
+                // one sequence per batch (checked in main): the batch is tokens [batch_start, batch_start + batch_size)
+                g_collector.set_span_batch(span_base + batch_start, batch_size);
             }
 
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
@@ -1817,6 +2022,45 @@ static bool show_statistics(const common_params & params) {
     return true;
 }
 
+// --span-dump: the input tokenized as compute_imatrix tokenizes it, one '<index>\t<token id>\t<hex bytes of the piece>'
+// line per token after a '#' header; a span finder rebuilds the text from the pieces and writes the --span-mask file
+static bool span_dump(const common_params & params) {
+    if (params.prompt.empty()) {
+        LOG_ERR("%s: --span-dump needs the input text (-f)\n", __func__);
+        return false;
+    }
+    llama_backend_init();
+    llama_model_params mparams = llama_model_default_params();
+    mparams.vocab_only = true;
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    if (model == nullptr) {
+        LOG_ERR("%s: failed to load the vocabulary of %s\n", __func__, params.model.path.c_str());
+        return false;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const std::vector<llama_token> tokens = common_tokenize(vocab, params.prompt, true, params.parse_special);
+
+    FILE * f = fopen(params.imat_span_dump.c_str(), "w");
+    if (f == nullptr) {
+        LOG_ERR("%s: cannot write %s\n", __func__, params.imat_span_dump.c_str());
+        llama_model_free(model);
+        return false;
+    }
+    fprintf(f, "#span-dump\ttokens\t%zu\tparse_special\t%d\tadd_bos\t%d\n", tokens.size(), params.parse_special ? 1 : 0,
+        llama_vocab_get_add_bos(vocab) ? 1 : 0);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const std::string piece = common_token_to_piece(vocab, tokens[i], true);
+        fprintf(f, "%zu\t%d\t", i, tokens[i]);
+        for (const char ch : piece) { fprintf(f, "%02x", (unsigned) (uint8_t) ch); }
+        fprintf(f, "\n");
+    }
+    const bool ok = fclose(f) == 0;
+    LOG_INF("%s: %zu tokens -> %s\n", __func__, tokens.size(), params.imat_span_dump.c_str());
+    llama_model_free(model);
+    llama_backend_free();
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -1837,6 +2081,10 @@ int main(int argc, char ** argv) {
     if (use_draft) {
         params.load_mtp = true;
         params.speculative.draft.n_max = 0; // keep trunk's context identical to a plain run
+    }
+
+    if (!params.imat_span_dump.empty()) {
+        return span_dump(params) ? 0 : 1;
     }
 
     // set_params before show_statistics so load_imatrix has valid n_ctx/n_parallel
@@ -1870,6 +2118,19 @@ int main(int argc, char ** argv) {
         params.n_ctx      = n_kv;
 
         params.n_batch = std::min(params.n_batch, n_kv);
+
+        // a row's token is its index in the decode's batch only with one sequence per batch, decoded in one ubatch
+        if (!params.imat_span_mask.empty()) {
+            if (n_seq > 1 || params.n_ubatch < params.n_batch) {
+                LOG_ERR("%s: '--span-mask' needs one sequence per batch and the batch in one ubatch: set '--batch-size' "
+                    "to at most '--ctx-size' (%d) and '--ubatch-size' to at least '--batch-size' (%d)\n", __func__, n_ctx, params.n_batch);
+                return 1;
+            }
+            if (params.imat_dat > 0 || params.prompt.empty()) {
+                LOG_ERR("%s: '--span-mask' needs an input text (-f) and the GGUF output format\n", __func__);
+                return 1;
+            }
+        }
     }
 
     g_collector.set_params(params);
@@ -2039,6 +2300,7 @@ int main(int argc, char ** argv) {
     if (!compute_imatrix(ctx, params, n_ctx, nextn.get())) { return 1; }
 
     g_collector.save_imatrix();
+    if (g_collector.has_span_mask()) { g_collector.save_span_imatrix(); }
 
     LOG("\n");
     llama_perf_context_print(ctx);
