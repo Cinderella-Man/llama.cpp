@@ -12,12 +12,15 @@
 // Takes the arguments of ggml_cuda_mmvq_pascal and returns true if it ran the product; false leaves it to
 // ggml_cuda_mmvq_pascal and mul_mat_vec_q. It runs where the Pascal kernels are active (GGML_CUDA_MMVQ_PASCAL) and Q2_0
 // is not skipped (GGML_CUDA_MMVQ_PASCAL_SKIP).
-// GGML_CUDA_MMVQ_PASCAL_MTOK=E,CAP,RB,G (missing fields and 0 keep the defaults):
+// GGML_CUDA_MMVQ_PASCAL_MTOK=E,CAP,RB,G,T (missing fields and 0 keep the defaults, except T):
 //   E   1 on (default), 0 off: 2-4 tokens go to mul_mat_vec_q_pascal_mc, 5-8 to llama.cpp's mul_mat_vec_q_moe
 //   CAP entries per group, 1-8 (default: the token count); 1 reads each expert once per (token, slot) entry, as the
 //       other kernels do, so that one binary measures what the sharing gains
 //   RB  row blocks per block (default 4 where an expert has 8 or more of them, else 1)
 //   G   1: a fused gate/up loads its weights directly instead of staging them through shared memory (default 0)
+//   T   a product without a gate whose row segments aren't whole 16-byte units (the down projection, K = 640: 180-byte
+//       rows): 1 (default) stages each warp's rows as one tile where the tiles fit, else loads them directly; 0 always
+//       loads them directly. Before Q825 such products were declined (the tile check also asked for 16-byte rows).
 //
 // Since Q713 the same for the grid types IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and for IQ1_M (mmvq-pascal-mtok-iq.cuh), the
 // routed experts of Swift-1.5's IQ files: a grid type's result is bit-identical to the one-token Pascal kernel's; IQ1_M has

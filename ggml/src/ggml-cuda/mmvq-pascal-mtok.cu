@@ -27,8 +27,9 @@
 //     no shuffling of bytes.
 //   - Lane groups, blocks per lane (2) and weight staging are those of the one-token kernel (mmvq-pascal.cu): gate/up
 //     (K = 2,560) 4 lanes per row, row segments staged through shared memory with 128-bit loads; down (K = 640, 180-byte
-//     rows) one lane per row, each warp staging its 32 rows at once. One row per lane group: the accumulators of up to 8
-//     tokens take the registers that the one-token kernel gives a second row.
+//     rows) one lane per row, each warp staging its 32 rows at once (Q825), or loading them directly where its tiles
+//     can't be staged. One row per lane group: the accumulators of up to 8 tokens take the registers that the one-token
+//     kernel gives a second row.
 //   - Each Q2_0 code word is looked up once (4 __byte_perm, 3 shifts per 16 weights) into int8 words and multiplied by
 //     every token of the group (4 dp4a per 16 weights per token); the one-token kernel repeats the lookups per token.
 //   - A block loops over rb consecutive row blocks of its expert, so the group search and the activation staging serve
@@ -474,24 +475,26 @@ static void mtok_launch(const int ntm, const mtok_args & p, const ggml_cuda_mm_f
     }
 }
 
-// GGML_CUDA_MMVQ_PASCAL_MTOK=E,CAP,RB,G (see mmvq-pascal-mtok.cuh)
+// GGML_CUDA_MMVQ_PASCAL_MTOK=E,CAP,RB,G,T (see mmvq-pascal-mtok.cuh)
 struct mtok_cfg {
     bool on          = true;
     int  cap         = 0;
     int  rb          = 0;
     bool gate_direct = false;
+    bool tile        = true;
 };
 
 static const mtok_cfg & mtok_config() {
     static const mtok_cfg cfg = [] {
         mtok_cfg c;
         const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_MTOK");
-        int v[4] = { 1, 0, 0, 0 };
-        const int n = env ? sscanf(env, "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) : 0;
+        int v[5] = { 1, 0, 0, 0, 1 };
+        const int n = env ? sscanf(env, "%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4]) : 0;
         c.on          = n < 1 || v[0] != 0;
         c.cap         = n >= 2 && v[1] >= 1 && v[1] <= MMVQP_MTOK_MAX_COLS ? v[1] : 0;
         c.rb          = n >= 3 && v[2] >= 1 ? v[2] : 0;
         c.gate_direct = n >= 4 && v[3] == 1;
+        c.tile        = n < 5 || v[4] != 0;
         return c;
     }();
     return cfg;
@@ -718,7 +721,7 @@ bool ggml_cuda_mmvq_pascal_mtok(
     }
 
     // the staging of the one-token kernel: segments where they are whole 16-byte units, else (no gate) warp tiles of
-    // contiguous rows, else (gate) direct loads
+    // contiguous rows, else direct loads
     const int64_t row_bytes = stride_row_x * bs;
     const auto x_aligned = [&](const int64_t al) {
         return mtok_aligned(vx, al) && mtok_aligned(fusion.gate, al) && mtok_aligned(fusion.shared_up, al) &&
@@ -729,9 +732,12 @@ bool ggml_cuda_mmvq_pascal_mtok(
         return false;
     }
     const bool    seg_ok  = (MTOK_WB << lpr_log2) % 16 == 0 && x_aligned(16);
+    // warp tiles (as mmvqp_stage_tile checks them in mmvq-pascal.cu): each warp's rows start at a 16-byte boundary and
+    // every matrix ends at one, whatever the row width (Q825: K = 640's 180-byte rows, the routed down projection)
     const int64_t wbytes  = (int64_t) (WARP_SIZE >> lpr_log2) * row_bytes;
-    const bool    tile_ok = !gate && stride_row_x == blocks && wbytes % 16 == 0 && (nrows_x * row_bytes) % 16 == 0 &&
-        x_aligned(16) && MMVQP_MTOK_NWARPS * wbytes <= 48 * 1024;
+    const bool    tile_ok = !gate && mtok_config().tile && stride_row_x == blocks && wbytes % 16 == 0 &&
+        (nrows_x * row_bytes) % 16 == 0 && mtok_aligned(vx, 16) && (stride_channel_x * bs) % 16 == 0 &&
+        (stride_sample_x * bs) % 16 == 0 && MMVQP_MTOK_NWARPS * wbytes <= 48 * 1024;
     int st;
     if (gate) {
         st = seg_ok && !mtok_config().gate_direct ? MTOK_SEG : MTOK_DIRECT;
@@ -740,7 +746,7 @@ bool ggml_cuda_mmvq_pascal_mtok(
     } else if (tile_ok) {
         st = MTOK_TILE;
     } else {
-        return false;
+        st = MTOK_DIRECT;
     }
 
     // the kernel keeps the offsets of each member's activations and outputs in an int
@@ -808,8 +814,10 @@ bool ggml_cuda_mmvq_pascal_mtok(
         }
     } else if (st == MTOK_SEG) {
         mtok_launch<false, MTOK_SEG>(ntm, p, fusion, grid, smem, stream);
-    } else {
+    } else if (st == MTOK_TILE) {
         mtok_launch<false, MTOK_TILE>(ntm, p, fusion, grid, smem, stream);
+    } else {
+        mtok_launch<false, MTOK_DIRECT>(ntm, p, fusion, grid, smem, stream);
     }
     return true;
 }
