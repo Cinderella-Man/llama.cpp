@@ -15,10 +15,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
+#include <stdexcept>
 #include <map>
 #include <random>
 #include <cinttypes>
@@ -147,6 +151,220 @@ static void spec_info_add_marginal(common_speculative_draft_info * info, const s
         }
     }
     info->pick.push_back(pick);
+}
+
+//
+// the draft length chosen per step (LLAMA_SPEC_ADAPT, see speculative.h)
+//
+
+// numbers separated by commas, semicolons or white space; '#' starts a comment that runs to the end of the line
+static std::vector<double> spec_adapt_numbers(const std::string & s, const char * name) {
+    std::vector<double> out;
+    std::string tok;
+    bool comment = false;
+    auto flush = [&]() {
+        if (tok.empty()) {
+            return;
+        }
+        char * end = nullptr;
+        const double v = std::strtod(tok.c_str(), &end);
+        if (end == tok.c_str() || *end != '\0' || !std::isfinite(v)) {
+            throw std::invalid_argument(string_format("%s: '%s' is not a number", name, tok.c_str()));
+        }
+        out.push_back(v);
+        tok.clear();
+    };
+    for (const char c : s) {
+        if (c == '\n') {
+            comment = false;
+        }
+        if (comment) {
+            continue;
+        }
+        if (c == '#') {
+            comment = true;
+            flush();
+        } else if (c == ',' || c == ';' || std::isspace((unsigned char) c)) {
+            flush();
+        } else {
+            tok.push_back(c);
+        }
+    }
+    flush();
+    return out;
+}
+
+static double spec_adapt_env_number(const char * name, double def, double lo, double hi) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    const auto x = spec_adapt_numbers(v, name);
+    if (x.size() != 1 || !(x[0] >= lo && x[0] <= hi)) {
+        throw std::invalid_argument(string_format("%s: '%s' is not one number in [%g, %g]", name, v, lo, hi));
+    }
+    return x[0];
+}
+
+common_spec_adapt_params common_spec_adapt_params_from_env() {
+    common_spec_adapt_params p;
+
+    {
+        const char * v = getenv("LLAMA_SPEC_ADAPT");
+        p.enabled = v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }
+    if (const char * v = getenv("LLAMA_SPEC_ADAPT_COST"); v != nullptr && *v != '\0') {
+        std::string text = v;
+        std::ifstream f(v);
+        if (f.good()) {
+            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        p.cost_ms = spec_adapt_numbers(text, "LLAMA_SPEC_ADAPT_COST");
+        if (p.cost_ms.empty()) {
+            throw std::invalid_argument("LLAMA_SPEC_ADAPT_COST: no values");
+        }
+        for (const double c : p.cost_ms) {
+            if (!(c > 0.0)) {
+                throw std::invalid_argument("LLAMA_SPEC_ADAPT_COST: every T(k) must be > 0 ms");
+            }
+        }
+    }
+    if (const char * v = getenv("LLAMA_SPEC_ADAPT_WIDTHS"); v != nullptr && *v != '\0') {
+        p.widths.clear();
+        for (const double w : spec_adapt_numbers(v, "LLAMA_SPEC_ADAPT_WIDTHS")) {
+            if (!(w >= 1.0 && w <= 4096.0) || w != std::floor(w)) {
+                throw std::invalid_argument("LLAMA_SPEC_ADAPT_WIDTHS: widths are whole numbers >= 1");
+            }
+            p.widths.push_back((int32_t) w);
+        }
+    }
+    p.draft_ms = spec_adapt_env_number("LLAMA_SPEC_ADAPT_DRAFT_MS", p.draft_ms, 0.0, 1e6);
+    if (const char * v = getenv("LLAMA_SPEC_ADAPT_S"); v != nullptr && *v != '\0') {
+        if (std::strcmp(v, "run") == 0) {
+            p.s_mode = common_spec_adapt_params::S_RUN;
+        } else if (std::strcmp(v, "step") == 0) {
+            p.s_mode = common_spec_adapt_params::S_STEP;
+        } else {
+            p.s_mode  = common_spec_adapt_params::S_FIXED;
+            p.s_fixed = spec_adapt_env_number("LLAMA_SPEC_ADAPT_S", 1.0, 1e-3, 1e3);
+        }
+    }
+    p.s0    = spec_adapt_env_number("LLAMA_SPEC_ADAPT_S0",    p.s0,    1e-3, 1e3);
+    p.ema   = spec_adapt_env_number("LLAMA_SPEC_ADAPT_EMA",   p.ema,   1e-6, 1.0);
+    p.scale = spec_adapt_env_number("LLAMA_SPEC_ADAPT_SCALE", p.scale, 1e-3, 1e3);
+    if (const char * v = getenv("LLAMA_SPEC_ADAPT_LOG"); v != nullptr) {
+        p.log = v;
+    }
+
+    return p;
+}
+
+double common_spec_adapt_cost(const common_spec_adapt_params & params, int32_t k) {
+    const auto & t = params.cost_ms;
+    GGML_ASSERT(!t.empty() && k >= 1);
+    const int32_t n = (int32_t) t.size();
+    if (k <= n) {
+        return t[k - 1];
+    }
+    // past the table: its last slope (one value alone: every extra token a whole pass)
+    const double slope = n >= 2 ? t[n - 1] - t[n - 2] : t[0];
+    return t[n - 1] + (double) (k - n) * slope;
+}
+
+std::vector<int32_t> common_spec_adapt_lengths(const common_spec_adapt_params & params, int32_t n_max) {
+    std::vector<int32_t> out = { 0 };
+    for (const int32_t w : params.widths) {
+        out.push_back(std::max(0, std::min(w - 1, std::max(0, n_max))));
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params & params,
+        const std::vector<int32_t> & lengths, const std::vector<float> & p, double s_run) {
+    const double t1 = common_spec_adapt_cost(params, 1);
+
+    auto s_of = [&](const common_spec_adapt_choice & c) {
+        switch (params.s_mode) {
+            case common_spec_adapt_params::S_STEP: return c.e_tau * t1 / c.cost_ms;
+            case common_spec_adapt_params::S_RUN:  return s_run;
+            default:                               return params.s_fixed;
+        }
+    };
+
+    common_spec_adapt_choice ch;
+    ch.n_keep  = 0;
+    ch.e_tau   = 1.0;
+    ch.cost_ms = params.draft_ms + t1;
+    ch.s       = s_of(ch);
+
+    double path = 1.0; // P at n_keep
+    for (const int32_t len : lengths) {
+        if (len <= ch.n_keep) {
+            continue;
+        }
+        if (len > (int32_t) p.size()) {
+            break;
+        }
+
+        // the added positions' path probabilities against what verifying them costs
+        double gain = 0.0;
+        double pp   = path;
+        for (int32_t i = ch.n_keep; i < len; ++i) {
+            pp   *= std::max(0.0, std::min(1.0, (double) p[i]));
+            gain += pp;
+        }
+        const double dt = common_spec_adapt_cost(params, len + 1) - common_spec_adapt_cost(params, ch.n_keep + 1);
+
+        if (!(gain > params.scale * ch.s * dt / t1)) {
+            break;
+        }
+
+        ch.n_keep   = len;
+        ch.e_tau   += gain;
+        ch.cost_ms += dt;
+        ch.s        = s_of(ch);
+        path        = pp;
+    }
+
+    return ch;
+}
+
+void common_spec_adapt_state::init(const common_spec_adapt_params & params) {
+    tok  = params.s0;
+    cost = common_spec_adapt_cost(params, 1);
+}
+
+void common_spec_adapt_state::update(const common_spec_adapt_params & params, int32_t n_keep, int32_t n_acc) {
+    if (cost <= 0.0) {
+        init(params);
+    }
+    const double a = params.ema;
+    tok  = (1.0 - a) * tok  + a * (1.0 + (double) n_acc);
+    cost = (1.0 - a) * cost + a * (params.draft_ms + common_spec_adapt_cost(params, n_keep + 1));
+}
+
+double common_spec_adapt_state::s(const common_spec_adapt_params & params) const {
+    if (cost <= 0.0) {
+        return params.s0;
+    }
+    return common_spec_adapt_cost(params, 1) * tok / cost;
+}
+
+// the drafter's probability of the drafted token id among its candidates, into dp.result_p when it is set
+static void spec_push_p(const common_speculative_draft_params & dp, const llama_token_data_array * cur_p, llama_token id) {
+    if (dp.result_p == nullptr) {
+        return;
+    }
+    float p = 0.0f;
+    for (size_t k = 0; k < cur_p->size; ++k) {
+        if (cur_p->data[k].id == id) {
+            p = cur_p->data[k].p;
+            break;
+        }
+    }
+    dp.result_p->push_back(p);
 }
 
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
@@ -551,6 +769,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 result.push_back(id);
                 spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
+                spec_push_p(dp, cur_p, id);
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
@@ -1002,6 +1221,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
                 spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
+                spec_push_p(dp, cur_p, id);
 
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
@@ -1538,7 +1758,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         walk.push_back(predecessor);
                         continue;
                     }
-                    if (params.p_min > 0.0f || sample) {
+                    if (params.p_min > 0.0f || sample || dp.result_p) {
                         // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                         probs.resize(top_k);
                         float sum = 0.0f;
@@ -1580,6 +1800,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                     if (dp.info) {
                         walk.push_back(predecessor);
+                    }
+                    if (dp.result_p) {
+                        // the selector's softmax over its candidates at the one taken
+                        dp.result_p->push_back(probs[predecessor]);
                     }
                 }
 
@@ -1626,6 +1850,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                     spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
+                    spec_push_p(dp, cur_p, id);
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -1650,6 +1875,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
                     spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
+                    spec_push_p(dp, cur_p, id);
                 }
             }
 
@@ -2149,6 +2375,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
                 spec_info_add_marginal(dp.info, common_speculative_type_to_str(type), cur_p, id);
+                spec_push_p(dp, cur_p, id);
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
@@ -3349,6 +3576,13 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // a drafter's probabilities belong to its own draft: drop what an earlier one left with an empty draft
+        for (auto & dp : dparams) {
+            if (dp.drafting && dp.result_p) {
+                dp.result_p->clear();
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -3366,6 +3600,11 @@ void common_speculative_draft(common_speculative * spec) {
 
             auto & result = *dp.result;
 
+            // at most one probability per drafted token (a drafter that cleared a short draft leaves none)
+            if (dp.result_p && dp.result_p->size() > result.size()) {
+                dp.result_p->resize(result.size());
+            }
+
             // a new draft has been sampled
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
@@ -3378,6 +3617,9 @@ void common_speculative_draft(common_speculative * spec) {
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {
                             dp.result_q->resize(dp.n_max);
+                        }
+                        if (dp.result_p && (int) dp.result_p->size() > dp.n_max) {
+                            dp.result_p->resize(dp.n_max);
                         }
                     }
                 }

@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <thread>
 #include "base64.hpp"
 #include "server-chat.h"
@@ -257,6 +258,98 @@ static int32_t spec_dump_ngram(const llama_tokens & ctx, llama_token last, int32
     return best;
 }
 
+// LLAMA_SPEC_ADAPT=1: the draft length chosen per step from the drafter's own probabilities and a table of verify
+// costs (common_spec_adapt_choose in common/speculative.h, whose comment gives the rule; the other LLAMA_SPEC_ADAPT_*
+// variables are listed at common_spec_adapt_params_from_env). After each draft the longest prefix that pays for its
+// verification is kept, at one of a few verify widths. Speculation stays exact: only the number of drafted tokens
+// verified changes.
+//   LLAMA_SPEC_ADAPT_LOG=<file>  one JSON line per drafted step, after a header line per server start; it works with
+//                                the switch off too (the rule's choice is then recorded, not applied)
+// Off by default: with neither variable set nothing below runs and the drafters compute no probabilities.
+struct server_spec_adapt {
+    common_spec_adapt_params params;
+    std::vector<int32_t>     lengths;     // the drafted-token counts allowed
+    int32_t                  n_max   = 0;
+    bool                     active  = false; // switched on, or logging
+    FILE *                   f       = nullptr;
+    int64_t                  run     = 0; // the server start in microseconds: tells apart runs appended to one file
+    uint64_t                 n_steps = 0;
+
+    static server_spec_adapt & get() {
+        static server_spec_adapt a;
+        return a;
+    }
+
+    static bool on() { return get().active; }
+
+    // at the server's start, once the drafters are known; throws on a malformed variable or an unwritable log
+    static void init(int32_t n_max) {
+        auto & a = get();
+        if (a.f) {
+            fclose(a.f);
+            a.f = nullptr;
+        }
+        a.params  = common_spec_adapt_params_from_env();
+        a.n_max   = n_max;
+        a.lengths = common_spec_adapt_lengths(a.params, n_max);
+        a.active  = a.params.enabled || !a.params.log.empty();
+        if (!a.active) {
+            return;
+        }
+        a.run = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+        std::vector<double> t;
+        std::vector<int32_t> widths;
+        for (const int32_t d : a.lengths) {
+            widths.push_back(d + 1);
+        }
+        for (int32_t k = 1; k <= std::max(1, n_max) + 1; ++k) {
+            t.push_back(common_spec_adapt_cost(a.params, k));
+        }
+        const char * s_mode = a.params.s_mode == common_spec_adapt_params::S_RUN ? "run" :
+                              a.params.s_mode == common_spec_adapt_params::S_STEP ? "step" : "fixed";
+
+        if (!a.params.log.empty()) {
+            a.f = fopen(a.params.log.c_str(), "a");
+            if (a.f == nullptr) {
+                throw std::runtime_error(string_format("cannot open '%s' for appending", a.params.log.c_str()));
+            }
+            const json hdr = {
+                {"hdr",      1},
+                {"run",      a.run},
+                {"enabled",  a.params.enabled},
+                {"n_max",    n_max},
+                {"widths",   widths},
+                {"cost_ms",  t},
+                {"draft_ms", a.params.draft_ms},
+                {"s_mode",   s_mode},
+                {"s_fixed",  a.params.s_fixed},
+                {"s0",       a.params.s0},
+                {"ema",      a.params.ema},
+                {"scale",    a.params.scale},
+            };
+            const std::string s = hdr.dump();
+            fputs(s.c_str(), a.f);
+            fputc('\n', a.f);
+            fflush(a.f);
+        }
+
+        std::string w;
+        for (const int32_t k : widths) {
+            w += string_format("%s%d", w.empty() ? "" : ",", k);
+        }
+        LOG_INF("LLAMA_SPEC_ADAPT: %s; verify widths %s (n_max %d), T(1) %.1f ms, T(%d) %.1f ms, draft %.1f ms, S %s, "
+                "scale %.3f%s%s\n", a.params.enabled ? "on" : "off (log only)", w.c_str(), n_max, t.front(),
+                (int) t.size(), t.back(), a.params.draft_ms, s_mode, a.params.scale,
+                a.f ? ", log " : "", a.f ? a.params.log.c_str() : "");
+    }
+};
+
+static double spec_adapt_round(double x) {
+    return std::round(x * 1e5) / 1e5;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -423,6 +516,24 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
     common_speculative_draft_info spec_info; // the drafter's candidates, for LLAMA_SPEC_DUMP
+
+    // LLAMA_SPEC_ADAPT (see server_spec_adapt): the drafter's probability of each token of spec_draft, the running
+    // speed-up (kept across tasks), the drafted step waiting for its accepted length, and the steps of this task by
+    // the drafted tokens kept
+    std::vector<float> spec_draft_p;
+    common_spec_adapt_state spec_adapt_state;
+    struct {
+        bool    pending = false;
+        int32_t n_draft = 0; // drafted
+        int32_t n_rule  = 0; // what the rule keeps (the drafted count when the drafter gave no probabilities)
+        int32_t n_keep  = 0; // verified
+        double  s       = 0.0;
+        double  e_tau   = 1.0;
+        double  cost_ms = 0.0;
+        int64_t pos     = 0;
+        std::vector<float> p;
+    } spec_adapt_step;
+    std::vector<int32_t> spec_adapt_hist;
 
     // --ctx-checkpoints-spread: where the last prompt batch stopped for a checkpoint inside the prompt, which the next
     // batch takes before it is decoded
@@ -604,6 +715,9 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_p.clear();
+            spec_adapt_step.pending = false;
+            spec_adapt_hist.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -1023,6 +1137,23 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        if (server_spec_adapt::on() && !spec_adapt_hist.empty()) {
+            const auto & a = server_spec_adapt::get();
+            std::string widths;
+            int64_t n_steps = 0;
+            int64_t n_kept  = 0;
+            for (size_t d = 0; d < spec_adapt_hist.size(); ++d) {
+                if (spec_adapt_hist[d] > 0) {
+                    widths  += string_format("%s%zu: %d", widths.empty() ? "" : ", ", d + 1, spec_adapt_hist[d]);
+                    n_steps += spec_adapt_hist[d];
+                    n_kept  += (int64_t) d * spec_adapt_hist[d];
+                }
+            }
+            SLT_INF(*this, "adaptive draft (%s) = %" PRId64 " drafted steps, %.2f drafted tokens verified per step, "
+                    "steps by verify width (%s), running S %.3f\n", a.params.enabled ? "on" : "log only", n_steps,
+                    n_steps > 0 ? (double) n_kept / n_steps : 0.0, widths.c_str(), spec_adapt_state.s(a.params));
+        }
+
         common_speculative_print_stats(spec);
     }
 
@@ -1177,6 +1308,94 @@ static void spec_dump_step(const server_slot & slot, llama_context * ctx_tgt, co
     fputs(s.c_str(), d.f);
     fputc('\n', d.f);
     fflush(d.f);
+}
+
+// LLAMA_SPEC_ADAPT: a drafted step is done, with n_acc of its verified drafted tokens accepted: the running speed-up,
+// this task's counts and the log line
+static void spec_adapt_finish(server_slot & slot, int32_t n_acc) {
+    auto & a  = server_spec_adapt::get();
+    auto & st = slot.spec_adapt_step;
+    if (!st.pending) {
+        return;
+    }
+    st.pending = false;
+
+    slot.spec_adapt_state.update(a.params, st.n_keep, n_acc);
+    if ((int32_t) slot.spec_adapt_hist.size() <= st.n_keep) {
+        slot.spec_adapt_hist.resize(st.n_keep + 1, 0);
+    }
+    slot.spec_adapt_hist[st.n_keep]++;
+
+    if (a.f == nullptr) {
+        return;
+    }
+    const json line = {
+        {"run",     a.run},
+        {"step",    a.n_steps++},
+        {"task",    slot.task ? slot.task->id : -1},
+        {"slot",    slot.id},
+        {"pos",     st.pos},     // the position of the token the draft continues
+        {"on",      a.params.enabled},
+        {"n_draft", st.n_draft}, // drafted
+        {"n_rule",  st.n_rule},  // what the rule keeps
+        {"n_keep",  st.n_keep},  // verified: n_rule when on, n_draft when off
+        {"p",       st.p},       // the drafter's probability of each drafted token given the drafted prefix
+        {"s",       st.s},       // the S the rule used (its last test)
+        {"e_tau",   st.e_tau},   // E(n_rule)
+        {"cost_ms", st.cost_ms}, // C(n_rule)
+        {"n_acc",   n_acc},      // accepted of the n_keep verified
+        {"s_next",  slot.spec_adapt_state.s(a.params)},
+    };
+    const std::string s = line.dump(); // numbers and fixed names only
+    fputs(s.c_str(), a.f);
+    fputc('\n', a.f);
+    fflush(a.f);
+}
+
+// LLAMA_SPEC_ADAPT: what the rule keeps of a new draft; with the switch on the draft (and its candidates for
+// rejection sampling) is cut to it. A draft cut to nothing ends its step here, as a one-token step.
+static void spec_adapt_choose(server_slot & slot) {
+    const auto & a  = server_spec_adapt::get();
+    auto       & st = slot.spec_adapt_step;
+
+    st.pending = false;
+
+    const int32_t n_draft = (int32_t) slot.spec_draft.size();
+    if (n_draft == 0) {
+        return;
+    }
+
+    st.pending = true;
+    st.n_draft = n_draft;
+    st.pos     = slot.prompt.tokens.pos_next();
+    st.p       = slot.spec_draft_p;
+
+    const double s_run = slot.spec_adapt_state.s(a.params);
+    if ((int32_t) slot.spec_draft_p.size() == n_draft) {
+        const auto ch = common_spec_adapt_choose(a.params, a.lengths, slot.spec_draft_p, s_run);
+        st.n_rule  = ch.n_keep;
+        st.s       = ch.s;
+        st.e_tau   = ch.e_tau;
+        st.cost_ms = ch.cost_ms;
+    } else {
+        // a drafter without probabilities (the n-gram ones): its draft stays as it is
+        st.n_rule  = n_draft;
+        st.s       = s_run;
+        st.e_tau   = 0.0;
+        st.cost_ms = 0.0;
+    }
+    st.n_keep = a.params.enabled ? st.n_rule : n_draft;
+
+    if (st.n_keep < n_draft) {
+        slot.spec_draft.resize(st.n_keep);
+        if (!slot.spec_draft_q.empty()) {
+            slot.spec_draft_q.resize(st.n_keep);
+        }
+    }
+
+    if (st.n_keep == 0) {
+        spec_adapt_finish(slot, 0);
+    }
 }
 
 // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
@@ -2039,6 +2258,16 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        // LLAMA_SPEC_ADAPT: read once here, so that a malformed value stops the server at its start
+        if (spec) {
+            try {
+                server_spec_adapt::init(common_speculative_n_max(spec.get()));
+            } catch (const std::exception & e) {
+                SRV_ERR("LLAMA_SPEC_ADAPT: %s\n", e.what());
+                return false;
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -5171,6 +5400,9 @@ private:
                             slot.spec_info.full_block = server_spec_dump::get().full_block;
                         }
 
+                        const bool spec_adapt = server_spec_adapt::on();
+                        slot.spec_draft_p.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -5182,6 +5414,7 @@ private:
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
                             /* .info     = */ spec_dump ? &slot.spec_info : nullptr,
+                            /* .result_p = */ spec_adapt ? &slot.spec_draft_p : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -5201,6 +5434,11 @@ private:
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
+
+            // LLAMA_SPEC_ADAPT: verify only the prefix of the draft that pays (or record it, with the switch off)
+            if (server_spec_adapt::on()) {
+                spec_adapt_choose(slot);
+            }
 
             slot.stats.n_draft_tokens += draft.size();
 
@@ -6427,6 +6665,10 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            if (slot.spec_adapt_step.pending) {
+                spec_adapt_finish(slot, (int32_t) n_accepted);
+            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {

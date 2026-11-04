@@ -95,6 +95,74 @@ struct common_speculative_draft_info {
 void common_speculative_lattice_info(common_speculative_draft_info & info, const float * lattice, size_t row_stride,
         int32_t n_pos, int32_t top_k, const std::vector<int32_t> & walk);
 
+// The draft length chosen per step (llama-server's LLAMA_SPEC_ADAPT). After drafting, keep the longest prefix of the
+// draft that pays for its verification, judged from the drafter's own probabilities and a table of what a k-token
+// verify pass costs. With p_i the drafter's probability of drafted token i given the drafted prefix, the path
+// probability P_j = p_1 ... p_j is the chance that drafted token j is accepted, and a step that verifies d drafted
+// tokens yields E(d) = 1 + P_1 + ... + P_d tokens for C(d) = draft_ms + T(d + 1) ms. Going from d to a longer
+// allowed length d' pays when
+//     P_{d+1} + ... + P_{d'}  >  scale * S * (T(d' + 1) - T(d + 1)) / T(1),
+// i.e. when the added positions' mean path probability exceeds r * S, r the marginal cost of one more verified token
+// as a fraction of a one-token pass and S the speed-up over one-token decoding that the extra cost must keep up. The
+// rule walks the allowed lengths upwards and stops at the first that does not pay. S is either the chain's own
+// (STEP: E(d) * T(1) / C(d), which maximizes this step's tokens per ms), a running average of the modelled speed-up
+// of the steps so far (RUN, the default: the long-run optimum), or a fixed value (FIXED).
+struct common_spec_adapt_params {
+    enum s_mode_t { S_STEP, S_RUN, S_FIXED };
+
+    bool enabled = false; // trim drafts by the rule; false: drafts unchanged (the log, if set, still records them)
+
+    // T(k) in ms for k = 1, 2, ...: one verify pass of k tokens; past the table's end, the last slope. The default is
+    // Flash-Next on nine P106 cards, Miner Llama v3's base (wall ms of llama-bench passes, Q583)
+    std::vector<double> cost_ms = { 136.0, 185.8, 244.6, 305.4, 359.9 };
+
+    // the verify widths allowed (drafted tokens + 1), each clamped to n_max + 1, so CUDA graphs stay cached
+    std::vector<int32_t> widths = { 1, 3, 5, 9, 17 };
+
+    double   draft_ms = 20.0;   // a step's cost besides the verify pass (the draft pass, sampling)
+    s_mode_t s_mode   = S_RUN;
+    double   s_fixed  = 1.0;    // S_FIXED: the speed-up
+    double   s0       = 1.0;    // S_RUN: the running speed-up before the first step
+    double   ema      = 1.0/32; // S_RUN: the weight of the latest step
+    double   scale    = 1.0;    // multiplies the threshold (> 1 for a drafter more confident than it is right)
+    std::string log;            // a file for one JSON line per drafted step (empty: none)
+};
+
+// parse LLAMA_SPEC_ADAPT (1: enable), LLAMA_SPEC_ADAPT_COST (T(k) in ms as a comma list, or a file of them, one per
+// line or comma separated, '#' comments), LLAMA_SPEC_ADAPT_WIDTHS, LLAMA_SPEC_ADAPT_DRAFT_MS, LLAMA_SPEC_ADAPT_S
+// (run, step or a number), LLAMA_SPEC_ADAPT_S0, LLAMA_SPEC_ADAPT_EMA, LLAMA_SPEC_ADAPT_SCALE, LLAMA_SPEC_ADAPT_LOG;
+// throws std::invalid_argument on a malformed value
+common_spec_adapt_params common_spec_adapt_params_from_env();
+
+// T(k) in ms, k >= 1
+double common_spec_adapt_cost(const common_spec_adapt_params & params, int32_t k);
+
+// the drafted-token counts allowed under n_max: every width - 1, clamped to [0, n_max], sorted and unique, 0 included
+std::vector<int32_t> common_spec_adapt_lengths(const common_spec_adapt_params & params, int32_t n_max);
+
+struct common_spec_adapt_choice {
+    int32_t n_keep  = 0;   // drafted tokens to verify
+    double  s       = 0.0; // the S of the last test made (S_STEP: of the chain at n_keep)
+    double  e_tau   = 1.0; // E(n_keep)
+    double  cost_ms = 0.0; // C(n_keep)
+};
+
+// the rule above. p: the drafter's conditional probability of each drafted token; lengths: from
+// common_spec_adapt_lengths, of which those <= p.size() are candidates; s_run: S for S_RUN
+common_spec_adapt_choice common_spec_adapt_choose(const common_spec_adapt_params & params,
+        const std::vector<int32_t> & lengths, const std::vector<float> & p, double s_run);
+
+// S_RUN's running speed-up: exponential averages of the tokens a step yields and of its modelled cost
+struct common_spec_adapt_state {
+    double tok  = 0.0;
+    double cost = 0.0;
+
+    void   init(const common_spec_adapt_params & params);
+    // a step that verified n_keep drafted tokens and accepted n_acc of them
+    void   update(const common_spec_adapt_params & params, int32_t n_keep, int32_t n_acc);
+    double s(const common_spec_adapt_params & params) const;
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -124,6 +192,11 @@ struct common_speculative_draft_params {
 
     // when set, the implementation that drafts records its candidates here (see common_speculative_draft_info)
     common_speculative_draft_info * info = nullptr;
+
+    // when set, the drafter's probability of each drafted token given the drafted prefix, one per token of result
+    // (DFlash2: the selector's softmax over its candidates; the others: their sampler's top 10); drafters without
+    // probabilities (the n-gram ones) leave it shorter than result
+    std::vector<float> * result_p = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
