@@ -201,4 +201,164 @@ static MMVQP_IQ_HD __forceinline__ float dot_iq3_s(const uint32_t * w, const int
     return fmaf(h2f_lo(w[0]), sumf, acc);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Several tokens (Q713): the k-column products (mmvq-pascal-kcol-impl.cuh) and the multi-token expert kernels
+// (mmvq-pascal-mtok.cu) decode each 32-weight block once into 8 words of signed int8 weights and multiply them by every
+// token's activations, one dp4a per 4 weights and token (the one-token functions above spend two: sum(g * u) and
+// sum((g & m) * u)). The grid bytes are 1..127, so a negative weight is (g ^ 0xFF) + 1 byte by byte with no carry. The
+// integer sums are those of the one-token functions exactly, so a token's result can be bit-identical to theirs.
+// IQ2_S and IQ3_XXS (whose one-token functions are in mmvq-pascal-impl.cuh) and IQ1_M (no one-token Pascal kernel)
+// are decoded here too:
+//   IQ2_S,   82 bytes: d 0-1; qs 2-33, an 8-bit grid index per 8 weights; signs 34-65, a byte per 8 weights; qh 66-73,
+//            per 32 weights the 2 high index bits of its four groups (1024 grid entries of 8 bytes); scales 74-81, two
+//            4-bit scales per 32 weights. Weights = d * (0.5 + scale) / 4 * grid * sign.
+//   IQ3_XXS, 98 bytes: d 0-1; 64 index bytes at 2-65, one per 4 weights (256 grid entries of 4 bytes); 66-97, per 32
+//            weights a word of four 7-bit sign patterns and a 4-bit scale on top. Weights = d * (0.5 + scale) / 2 * grid * sign.
+//   IQ1_M,   56 bytes: qs 0-31, the low 8 bits of a grid index per 8 weights; qh 32-47, per 8 weights a nibble: 3 high
+//            index bits and the sign of its delta (2048 entries of 8 values -1, 0, 1); scales 48-55, four 16-bit words
+//            holding two 3-bit scales per 32 weights in bits 0-11 and the FP16 d in their top nibbles.
+//            Weights = d * (2 scale + 1) * (grid + delta), delta = +-1/8. Its grid is ggml's iq1s_grid_gpu (grid + 1
+//            as nibbles: weights 0..3 in the low nibbles of bytes 0..3, 4..7 in the high nibbles), looked up with
+//            __byte_perm into 8 (grid + delta) = 8 grid +- 1, which fits an int8: the weights of a group come out in the
+//            order (0, 4, 1, 5), (2, 6, 3, 7), so its activations are staged in that order (act_perm_iq1).
+
+enum gtype : int { G_IQ2_XXS = 0, G_IQ2_XS, G_IQ2_S, G_IQ3_XXS, G_IQ3_S, G_IQ1_M };
+
+// Per type: bytes per super-block, the grid's 32-bit words (in shared memory), the words of a super-block the decoding
+// reads (from its first byte; mmvqp_lds_h's count for the 2-byte-aligned types), and the factor of d.
+template <int G> struct gtraits;
+template <> struct gtraits<G_IQ2_XXS> { static constexpr int BS = 66,  GW = GRID_WORDS_IQ2_XXS, NW = 17; };
+template <> struct gtraits<G_IQ2_XS>  { static constexpr int BS = 74,  GW = GRID_WORDS_IQ2_XS,  NW = 19; };
+template <> struct gtraits<G_IQ2_S>   { static constexpr int BS = 82,  GW = 2*1024,             NW = 21; };
+template <> struct gtraits<G_IQ3_XXS> { static constexpr int BS = 98,  GW = 256,                NW = 25; };
+template <> struct gtraits<G_IQ3_S>   { static constexpr int BS = 110, GW = GRID_WORDS_IQ3_S,   NW = 28; };
+template <> struct gtraits<G_IQ1_M>   { static constexpr int BS = 56,  GW = 2048,               NW = 14; };
+
+// The FP32 factor of a super-block: dd = factor * d, as the one-token functions form it (0.125f * d, 0.25f * d, d).
+template <int G>
+static MMVQP_IQ_HD __forceinline__ float sblock_scale(const uint32_t * w) {
+    if constexpr (G == G_IQ1_M) {
+        const uint32_t s01 = w[12];
+        const uint32_t s23 = w[13];
+        const uint32_t h   = ((s01 & 0xffff) >> 12) | ((s01 >> 24) & 0x00F0) | (((s23 & 0xffff) >> 4) & 0x0F00) |
+            ((s23 >> 16) & 0xF000);
+        return 0.125f * h2f_lo(h);
+    } else if constexpr (G == G_IQ3_S) {
+        return h2f_lo(w[0]);
+    } else if constexpr (G == G_IQ3_XXS) {
+        return 0.25f * h2f_lo(w[0]);
+    } else {
+        return 0.125f * h2f_lo(w[0]);
+    }
+}
+
+// Grid bytes g (each 1..127) of 4 weights with the signs of 4 bits s4 (bit j: weight j negative) applied.
+static MMVQP_IQ_HD __forceinline__ int signed4(const uint32_t g, const uint32_t s4) {
+    const uint32_t b = (s4 * 0x00204081u) & 0x01010101u; // 1 in byte j where weight j is negative
+    return (int) ((g ^ (b * 0xFFu)) + b);
+}
+static MMVQP_IQ_HD __forceinline__ void signed8(const uint32_t g0, const uint32_t g1, const uint32_t s8, int * q) {
+    q[0] = signed4(g0, s8 & 0xF);
+    q[1] = signed4(g1, s8 >> 4);
+}
+static MMVQP_IQ_HD __forceinline__ uint32_t parity7(const uint32_t s7) {
+    return s7 | ((popc(s7) & 1) << 7);
+}
+
+// Block ib (weights 32 ib .. 32 ib + 31) of a super-block held as words w: q[0..3] the int8 weights 0..15 (q[2l],
+// q[2l + 1] the 8 weights of group l; IQ1_M in the order (0, 4, 1, 5), (2, 6, 3, 7) of each group), q[4..7] weights
+// 16..31; ls0, ls1 the odd integer scales of the two halves (equal where the type has one scale per 32 weights). The
+// block's dot product with activations u (int8, d8) is d8 * (ls0 * sum(q[0..3] * u[0..3]) + ls1 * sum(q[4..7] * u[4..7]))
+// times sblock_scale; IQ1_M's q are 8 times the weights (the 1/8 is in its sblock_scale).
+template <int G>
+static MMVQP_IQ_HD __forceinline__ void decode32(const uint32_t * w, const int ib, const uint32_t * grid, int * q,
+                                                 int & ls0, int & ls1) {
+    if constexpr (G == G_IQ2_XXS) {
+        const uint32_t qi  = word_at(w, 2 + 8*ib);
+        const uint32_t aux = word_at(w, 6 + 8*ib);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            uint32_t g0, g1;
+            grid8(grid, (qi >> (8*l)) & 0xff, g0, g1);
+            signed8(g0, g1, parity7((aux >> (7*l)) & 0x7f), q + 2*l);
+        }
+        ls0 = 2*(int) (aux >> 28) + 1;
+        ls1 = ls0;
+    } else if constexpr (G == G_IQ2_XS) {
+        const uint32_t q0 = word_at(w, 2 + 8*ib);
+        const uint32_t q1 = word_at(w, 6 + 8*ib);
+        const uint32_t sc = (word_at(w, 66 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t e = ((l < 2 ? q0 : q1) >> (16*(l & 1))) & 0xffff;
+            uint32_t g0, g1;
+            grid8(grid, e & 511, g0, g1);
+            signed8(g0, g1, parity7(e >> 9), q + 2*l);
+        }
+        ls0 = 2*(int) (sc & 0xF) + 1;
+        ls1 = 2*(int) (sc >> 4) + 1;
+    } else if constexpr (G == G_IQ2_S) {
+        const uint32_t qs = word_at(w, 2 + 4*ib);
+        const uint32_t sg = word_at(w, 34 + 4*ib);
+        const uint32_t qh = (word_at(w, 66 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+        const uint32_t sc = (word_at(w, 74 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            uint32_t g0, g1;
+            grid8(grid, ((qs >> (8*l)) & 0xff) | (((qh >> (2*l)) & 3) << 8), g0, g1);
+            signed8(g0, g1, (sg >> (8*l)) & 0xff, q + 2*l);
+        }
+        ls0 = 2*(int) (sc & 0xF) + 1;
+        ls1 = 2*(int) (sc >> 4) + 1;
+    } else if constexpr (G == G_IQ3_XXS) {
+        const uint32_t q0  = word_at(w, 2 + 8*ib);
+        const uint32_t q1  = word_at(w, 6 + 8*ib);
+        const uint32_t aux = word_at(w, 66 + 4*ib);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qq = (l < 2 ? q0 : q1) >> (16*(l & 1));
+            signed8(grid[qq & 0xff], grid[(qq >> 8) & 0xff], parity7((aux >> (7*l)) & 0x7f), q + 2*l);
+        }
+        ls0 = 2*(int) (aux >> 28) + 1;
+        ls1 = ls0;
+    } else if constexpr (G == G_IQ3_S) {
+        const uint32_t q0     = word_at(w, 2 + 8*ib);
+        const uint32_t q1     = word_at(w, 6 + 8*ib);
+        const uint32_t qh     = (word_at(w, 66 + 4*(ib/4)) >> (8*(ib%4))) & 0xff;
+        const uint32_t sg     = word_at(w, 74 + 4*ib);
+        const uint32_t scales = word_at(w, 106);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qq = (l < 2 ? q0 : q1) >> (16*(l & 1));
+            const uint32_t i0 = (qq & 0xff)        | (((qh >> (2*l))     & 1) << 8);
+            const uint32_t i1 = ((qq >> 8) & 0xff) | (((qh >> (2*l + 1)) & 1) << 8);
+            signed8(grid[i0], grid[i1], (sg >> (8*l)) & 0xff, q + 2*l);
+        }
+        ls0 = 2*(int) ((scales >> (4*ib)) & 0xF) + 1;
+        ls1 = ls0;
+    } else { // G_IQ1_M
+        // 8 (grid + delta) by grid + 1 (the index): delta +1/8 -> -7, 1, 9; delta -1/8 -> -9, -1, 7
+        constexpr uint32_t t_pos = 0x000901F9u;
+        constexpr uint32_t t_neg = 0x0007FFF7u;
+        const uint32_t qs = w[ib];
+        const uint32_t qh = (w[8 + ib/2] >> (16*(ib & 1))) & 0xffff; // bytes 32 + 2 ib, 33 + 2 ib
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t qhl = (qh >> (4*l)) & 0xF;
+            const uint32_t gg  = grid[((qs >> (8*l)) & 0xff) | ((qhl & 7) << 8)];
+            const uint32_t t   = (qhl & 8) ? t_neg : t_pos;
+            q[2*l + 0] = (int) prmt(t, t, gg);       // weights 0, 4, 1, 5 of the group
+            q[2*l + 1] = (int) prmt(t, t, gg >> 16); // weights 2, 6, 3, 7
+        }
+        const uint32_t sc = ((w[12 + ib/4] >> (16*((ib/2) & 1))) & 0xffff) >> (6*(ib%2)); // 16-bit scale word ib / 2
+        ls0 = 2*(int) (sc & 7) + 1;
+        ls1 = 2*(int) ((sc >> 3) & 7) + 1;
+    }
+}
+
+// IQ1_M's activation order: the position of value i (0..31) of a 32-value block.
+static __host__ __device__ __forceinline__ int act_perm_iq1(const int i) {
+    return 8*(i >> 3) + 2*(i & 3) + ((i >> 2) & 1);
+}
+
 } // namespace mmvqp_iq
