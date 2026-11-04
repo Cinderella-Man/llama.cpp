@@ -10,6 +10,9 @@ namespace {
 constexpr int FTP_NCOLS2   = 8; // query heads per KV head in one block (the GQA group)
 constexpr int FTP_NWARPS   = 4;
 constexpr int FTP_NTHREADS = FTP_NWARPS*WARP_SIZE;
+#ifndef FTP_MIN_BLOCKS
+#define FTP_MIN_BLOCKS 3 // blocks per SM the compiler keeps registers for (__launch_bounds__)
+#endif
 
 // T: keys per softmax tile; DC: head dimensions per staged K chunk; TV: keys per staged V chunk.
 template <int D> struct ftp_config;
@@ -118,7 +121,7 @@ __constant__ int ftp_fault_dev = 0;
 // keys x the warp's 8 columns over its half (128 FMAs per 12 float4 loads instead of 64 per 8), and lane l and l ^ 16
 // then swap the partial sums of each other's columns, which leaves the same layout as without the split.
 template <int D, ggml_type type_K, ggml_type type_V, bool split>
-__launch_bounds__(FTP_NTHREADS, 3)
+__launch_bounds__(FTP_NTHREADS, FTP_MIN_BLOCKS)
 static __global__ void flash_attn_tile_pascal(
         const char * Q_ptr,
         const char * K_ptr,

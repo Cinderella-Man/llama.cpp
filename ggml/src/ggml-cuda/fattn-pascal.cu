@@ -10,6 +10,9 @@ namespace {
 constexpr int FAP_D    = 128; // head size of K and V
 constexpr int FAP_G    = 8;   // query heads per KV head
 constexpr int FAP_NW   = 4;   // warps per block, one KV head each
+#ifndef FAP_MIN_BLOCKS
+#define FAP_MIN_BLOCKS 3 // blocks per SM the compiler keeps registers for (__launch_bounds__)
+#endif
 constexpr int FAP_TILE = 32;  // keys per softmax tile (one mask value per lane)
 constexpr int FAP_MAX_COUNTERS = 64;
 constexpr int FAP_PART   = FAP_D + 4; // floats per partial: FAP_D outputs, the maximum and the sum, padded to 16 bytes
@@ -59,7 +62,7 @@ static __device__ __forceinline__ float fap_transpose_reduce(float v[32]) {
     return v[0];
 }
 
-__launch_bounds__(FAP_NW*WARP_SIZE, 3)
+__launch_bounds__(FAP_NW*WARP_SIZE, FAP_MIN_BLOCKS)
 static __global__ void flash_attn_ext_pascal_f16(const fap_args a) {
     const int lane = threadIdx.x;
     const int g    = blockIdx.y*FAP_NW + threadIdx.y; // KV head

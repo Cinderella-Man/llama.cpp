@@ -40,6 +40,9 @@
 #define KCOL_NT        128         // threads per block
 #define KCOL_NW        4           // warps per block
 #define KCOL_MAX_COLS  8
+#ifndef KCOL_MIN_BLOCKS
+#define KCOL_MIN_BLOCKS 2         // blocks per SM the compiler keeps registers for (__launch_bounds__)
+#endif
 #define KCOL_SMEM_MAX  (48 * 1024) // a block's shared memory without opting in to more
 
 // KCOL_HD: how the decoding is compiled (device code here; bench/mmvq_pascal/verify/kcol_unit_check.cu also builds it
@@ -1034,7 +1037,7 @@ inline __host__ __device__ int stage_bytes(const int UB, const int lpr_log2, con
 // Grid: (row blocks, 1, 1), KCOL_NT threads; dynamic shared memory: the activation tile (NC columns of itt * L
 // records), then the 4 warps' staging buffers, then (grid types and IQ1_M) the type's grid.
 template <int T, int NC, int R>
-__launch_bounds__(KCOL_NT, 2)
+__launch_bounds__(KCOL_NT, KCOL_MIN_BLOCKS)
 static __global__ void mul_mat_kcol(const args p) {
     constexpr int UB = traits<T>::UB;
     constexpr int AL = traits<T>::AL;
