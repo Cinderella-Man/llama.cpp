@@ -21,6 +21,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <new>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -1633,11 +1634,32 @@ void llm_graph_result::reset() {
     fused_nodes.clear();
     hdmd_inputs.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    if (meta_size != buf_compute_meta_size) {
+        uint8_t * buffer = static_cast<uint8_t *>(std::calloc(1, meta_size));
+        if (!buffer) {
+            throw std::bad_alloc();
+        }
+        // LLAMA_GRAPH_META_CALLOC=0 writes the whole buffer once, as the std::vector before #31274 did, so that every
+        // page is resident (for host-memory A/B runs on one binary); 1 (default, as #31274) leaves unused pages alone
+        static const bool meta_calloc = [] {
+            const char * env = getenv("LLAMA_GRAPH_META_CALLOC");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (!meta_calloc) {
+            // one write per page through a volatile pointer: a memset of calloc's memory may be optimized away
+            volatile uint8_t * p = buffer;
+            for (size_t i = 0; i < meta_size; i += 4096) {
+                p[i] = 0;
+            }
+        }
+        buf_compute_meta.reset(buffer);
+        buf_compute_meta_size = meta_size;
+    }
 
     ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute_meta.size(),
-        /*.mem_buffer =*/ buf_compute_meta.data(),
+        /*.mem_size   =*/ buf_compute_meta_size,
+        /*.mem_buffer =*/ buf_compute_meta.get(),
         /*.no_alloc   =*/ true,
     };
 

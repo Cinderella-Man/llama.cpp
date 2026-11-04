@@ -329,7 +329,7 @@ public:
     llama_pipe_drafter * get_pipe_drafter() const { return pipe_drafter.get(); }
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(uint32_t n_tokens = 0);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -492,10 +492,38 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Small batches also get one arena per token count, so speculative verify batches of varying
+    // size keep their own CUDA graphs instead of re-capturing one graph at every size change.
+    std::vector<std::pair<uint32_t, llm_graph_result_ptr>> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // [TAG_SCHED_PER_SIZE] wip: with LLAMA_SCHED_PER_SIZE=1 the arenas of batches of up to 8 tokens get their own
+    // scheduler, so alternating batch sizes (the MTP catch-up and draft steps) keep their graphs allocated and reuse
+    // them, instead of rebuilding and re-splitting one graph in the shared scheduler at every size change
+    struct sched_small_entry {
+        uint32_t               key;
+        ggml_backend_sched_ptr sched;
+        llm_graph_result     * ready; // the graph allocated in this scheduler, nullptr when it has to be rebuilt
+    };
+    std::vector<sched_small_entry> sched_small;
+    bool sched_per_size = false;
+
+    // env: LLAMA_GRAPH_PER_SIZE=0 keeps the two arenas of llama.cpp before #31156 (batches with and without outputs), so
+    // verify batches of every width share one arena and one CUDA graph key, as on -ladder2; 1 (default, as #31156) gives
+    // batches of up to 8 tokens one arena per token count. LLAMA_SCHED_PER_SIZE=1 needs it on.
+    bool graph_per_size = true;
+
+    // scheduler of the graph of the last process_ubatch(), nullptr for the shared one
+    ggml_backend_sched_t sched_active = nullptr;
+
+    ggml_backend_sched_t sched_res() const { return sched_active ? sched_active : sched.get(); }
+
+    uint32_t gf_res_key(uint32_t n_tokens) const;
+
+    // forget which graphs are allocated, after the graph results were reset
+    void gf_res_invalidate();
 
     // one in-flight single-token evaluation of pipelined decoding: its own scheduler (inputs, inter-device copies and
     // compute buffers), its own graph (and therefore its own CUDA graphs), and a pinned buffer for its logits.
