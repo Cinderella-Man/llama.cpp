@@ -186,6 +186,81 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// Q6_K for the card hops (LLAMA_HOP_CAST=q6_K): the CPU's make_qx_quants(16, 32, x, L, 1, NULL) for one 16-value
+// sub-block (weights x^2, the scale searched over nmax + 0.1 is for is = -9..9). Written with IEEE division and without
+// FMA contraction (__fdiv_rn, __fmul_rn, __fadd_rn), so that under -use_fast_math it does the reference's arithmetic.
+// Writes the codes l + 32 (0..63) to L and returns the sub-block's scale.
+static __device__ __forceinline__ int q6_K_sub_code(const float iscale, const float x) {
+    return max(-32, min(31, __float2int_rn(__fmul_rn(iscale, x))));
+}
+
+static __device__ float quantize_f32_q6_K_sub_scale(const float * __restrict__ x, uint8_t * __restrict__ L) {
+    constexpr int n    = 16;
+    constexpr int nmax = 32;
+
+    float vmax = 0.0f;
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) {
+            amax = ax;
+            vmax = x[i];
+        }
+    }
+    if (amax < 1e-15f) { // GROUP_MAX_EPS: all zero
+        for (int i = 0; i < n; ++i) {
+            L[i] = 0;
+        }
+        return 0.0f;
+    }
+
+    float iscale = __fdiv_rn((float) -nmax, vmax);
+    float sumlx  = 0.0f;
+    float suml2  = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const int   l = q6_K_sub_code(iscale, x[i]);
+        const float w = __fmul_rn(x[i], x[i]);
+        L[i]  = l + nmax;
+        sumlx = __fadd_rn(sumlx, __fmul_rn(__fmul_rn(w, x[i]), (float) l));
+        suml2 = __fadd_rn(suml2, __fmul_rn(__fmul_rn(w, (float) l), (float) l));
+    }
+    float scale = suml2 != 0.0f ? __fdiv_rn(sumlx, suml2) : 0.0f;
+    float best  = __fmul_rn(scale, sumlx);
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) {
+            continue;
+        }
+        iscale = __fdiv_rn(-__fadd_rn((float) nmax, __fmul_rn(0.1f, (float) is)), vmax);
+        sumlx = 0.0f;
+        suml2 = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const int   l = q6_K_sub_code(iscale, x[i]);
+            const float w = __fmul_rn(x[i], x[i]);
+            sumlx = __fadd_rn(sumlx, __fmul_rn(__fmul_rn(w, x[i]), (float) l));
+            suml2 = __fadd_rn(suml2, __fmul_rn(__fmul_rn(w, (float) l), (float) l));
+        }
+        if (suml2 > 0.0f && __fmul_rn(sumlx, sumlx) > __fmul_rn(best, suml2)) {
+            for (int i = 0; i < n; ++i) {
+                L[i] = nmax + q6_K_sub_code(iscale, x[i]);
+            }
+            scale = __fdiv_rn(sumlx, suml2);
+            best  = __fmul_rn(scale, sumlx);
+        }
+    }
+    return scale;
+}
+
+// IQ4_NL -> F32 in the form cpy_blck_q_f32 takes: the values at iqs and iqs + QK4_NL/2
+static __device__ __forceinline__ void dequantize_iq4_nl_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+
+    const float d   = x[ib].d;
+    const int   vui = x[ib].qs[iqs];
+
+    v.x = d * kvalues_iq4nl[vui & 0xF];
+    v.y = d * kvalues_iq4nl[vui >>  4];
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

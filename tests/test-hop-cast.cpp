@@ -1,10 +1,11 @@
 // test-hop-cast: checks for the card-hop switches (LLAMA_HOP_CAST, LLAMA_HOP_CAST_AT, GGML_CUDA_HOP_*)
 //
-//  1. Round trips through ggml_cast on every backend there is (the CPU, and each GPU): F32 -> F16 / BF16 / Q8_0 -> F32
-//     at the shapes of Flash-Next's hops, [2560, 4, T] for T = 1, 4 and 512. Data the narrow type represents comes back
-//     bit for bit; random data (normal, with outlier channels) comes back within the type's rounding bound: F16
-//     max(|x| 2^-11, 2^-25), BF16 |x| 2^-8, Q8_0 0.57 d + 4e-6 with d = the block's max |x| / 127 (half a step of the
-//     integer grid plus the rounding of d to F16).
+//  1. Round trips through ggml_cast on every backend there is (the CPU, and each GPU): F32 -> F16 / BF16 / Q8_0 /
+//     Q6_K / Q5_1 / Q5_0 / Q4_1 / Q4_0 / IQ4_NL -> F32 at the shapes of Flash-Next's hops, [2560, 4, T] for T = 1, 4 and
+//     512. Data the narrow type represents comes back bit for bit; random data (normal, with outlier channels) comes
+//     back within the type's rounding bound (hop_bound: half a step of the type's grid, a whole step where the grid
+//     clips the side opposite the block's largest value, plus the rounding of the scales to F16). Each GPU's round trip
+//     is also compared with the CPU's (printed: the share of values equal bit for bit, the largest difference).
 //  2. With -m <model>: the model's logits for one token sequence, evaluated as a prompt in micro-batches, one 4-token
 //     pass (a verify pass) and single-token steps, every position's logits kept, once per arm. An arm is a name and
 //     environment variables set before its context is made (every variable any arm names is unset first), e.g.
@@ -26,6 +27,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -56,21 +58,50 @@ static void check(bool ok, const char * fmt, ...) {
 
 // ---- bounds -----------------------------------------------------------------------------------------------------------
 
+// the largest |x|, the smallest and the largest x of the block of n values around element i (rows of ne0 elements)
+struct block_range { double amax = 0.0, vmin = INFINITY, vmax = -INFINITY; };
+
+static block_range range_of(const float * x, size_t i, size_t ne0, size_t n) {
+    const size_t row = i / ne0, col = i % ne0;
+    const size_t b0  = row * ne0 + col / n * n;
+    block_range r;
+    for (size_t j = b0; j < b0 + n; ++j) {
+        r.amax = std::max(r.amax, fabs((double) x[j]));
+        r.vmin = std::min(r.vmin, (double) x[j]);
+        r.vmax = std::max(r.vmax, (double) x[j]);
+    }
+    return r;
+}
+
 // the largest error the round trip through type may leave at element i of x (rows of ne0 elements)
 static double hop_bound(ggml_type type, const float * x, size_t i, size_t ne0) {
-    const double v = fabs((double) x[i]);
+    const double v   = fabs((double) x[i]);
+    const double f16 = std::ldexp(1.0, -11); // the relative rounding of a scale to F16
     switch (type) {
-        case GGML_TYPE_F16:  return std::max(v * std::ldexp(1.0, -11), std::ldexp(1.0, -25));
+        case GGML_TYPE_F16:  return std::max(v * f16, std::ldexp(1.0, -25));
         case GGML_TYPE_BF16: return v * std::ldexp(1.0, -8);
-        case GGML_TYPE_Q8_0: {
-            const size_t row = i / ne0, col = i % ne0;
-            const size_t b0  = row * ne0 + col / 32 * 32;
-            double amax = 0.0;
-            for (size_t j = b0; j < b0 + 32; ++j) {
-                amax = std::max(amax, fabs((double) x[j]));
-            }
-            return 0.57 * amax / 127.0 + 4e-6;
+        // d = the block's max |x| / 127: half a step, plus the rounding of d to F16 at |q| <= 127
+        case GGML_TYPE_Q8_0: return 0.57 * range_of(x, i, ne0, 32).amax / 127.0 + 4e-6;
+        // d = max |x| / 2^(bits-1) with q in [-2^(bits-1), 2^(bits-1) - 1]: the side opposite the largest value clips at a
+        // whole step, plus the rounding of d at |q| <= 2^(bits-1)
+        case GGML_TYPE_Q5_0: return (1.0 + 16 * f16) * range_of(x, i, ne0, 32).amax / 16.0 + 4e-6;
+        case GGML_TYPE_Q4_0: return (1.0 +  8 * f16) * range_of(x, i, ne0, 32).amax /  8.0 + 4e-6;
+        // d = (max - min) / (2^bits - 1), m = min: half a step, the rounding of d at q <= 2^bits - 1 and of m
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q4_1: {
+            const block_range r = range_of(x, i, ne0, 32);
+            const double qmax = type == GGML_TYPE_Q5_1 ? 31.0 : 15.0;
+            const double d = (r.vmax - r.vmin) / qmax;
+            return (0.5 + qmax * f16) * d * 1.01 + fabs(r.vmin) * f16 * 1.01 + 4e-6;
         }
+        // the 16-value grid of IQ4_NL ({-127 .. 113} d, gaps up to 24 d) and its least-squares refit of d: a quarter of the
+        // block's max |x| (a layout or index error is the whole of it)
+        case GGML_TYPE_IQ4_NL: return 0.25 * range_of(x, i, ne0, 32).amax + 4e-6;
+        // Q6_K: a 16-value sub-block's scale s ~ its max |x| / 32 (clipped at 31 steps on one side, searched over
+        // 31.1 .. 32.9), stored as an int8 multiple of the super-block's d = max |s| / 128 (an error of d / 2 a step):
+        // within 0.0606 of the sub-block's max |x| and 15.5 d (0.004 of the super-block's max |x|), bounded by 0.08 and
+        // 0.005
+        case GGML_TYPE_Q6_K: return 0.08 * range_of(x, i, ne0, 16).amax + 0.005 * range_of(x, i, ne0, 256).amax + 4e-6;
         default: return 0.0;
     }
 }
@@ -92,18 +123,75 @@ static size_t out_of_bound(ggml_type type, const float * a, const float * b, siz
 
 // ---- part 1: round trips on every backend -------------------------------------------------------------------------
 
-// data the narrow type holds exactly: values rounded to F16 or BF16, or Q8_0 blocks q * d with an F16 d and a ±127
+static float to_f16(float v) {
+    return ggml_fp16_to_fp32(ggml_fp32_to_fp16(v));
+}
+
+// data the narrow type holds exactly: values rounded to F16 or BF16, or blocks of q * d (+ m) with F16 scales whose
+// largest value is the one the quantizer derives its scale from (Q8_0: ±127 d; Q5_0 / Q4_0: -16 d / -8 d; Q5_1 / Q4_1:
+// m = ±2^e, q from 0 to 31 / 15; IQ4_NL: d times the grid, -127 d among them; Q6_K: per 16-value sub-block d sc q with
+// one q = -32, one sub-block of each super-block at sc = -128)
 static std::vector<float> representable(ggml_type type, size_t n, std::mt19937 & rng) {
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::vector<float> x(n);
+    // an F16 scale of either sign, exponents spread over 9 octaves
+    auto scale = [&](size_t b) {
+        const float d = to_f16(std::ldexp(1.0f + fabsf(nd(rng)), -6 + (int) (b % 9)));
+        return b & 2 ? -d : d;
+    };
     if (type == GGML_TYPE_Q8_0) {
         std::uniform_int_distribution<int> qd(-127, 127);
         for (size_t b = 0; b < n / 32; ++b) {
-            const float d = ggml_fp16_to_fp32(ggml_fp32_to_fp16(std::ldexp(1.0f + fabsf(nd(rng)), -6 + (int) (b % 9))));
+            const float d = to_f16(std::ldexp(1.0f + fabsf(nd(rng)), -6 + (int) (b % 9)));
             for (size_t j = 0; j < 32; ++j) {
                 x[b*32 + j] = (float) qd(rng) * d;
             }
             x[b*32 + b % 32] = (b & 1 ? -127.0f : 127.0f) * d;
+        }
+    } else if (type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q4_0) {
+        const int h = type == GGML_TYPE_Q5_0 ? 16 : 8;
+        std::uniform_int_distribution<int> qd(-h, h - 1);
+        for (size_t b = 0; b < n / 32; ++b) {
+            const float d = scale(b);
+            for (size_t j = 0; j < 32; ++j) {
+                x[b*32 + j] = (float) qd(rng) * d;
+            }
+            x[b*32 + b % 32] = (float) -h * d;
+        }
+    } else if (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_1) {
+        const int qmax = type == GGML_TYPE_Q5_1 ? 31 : 15;
+        std::uniform_int_distribution<int> qd(0, qmax);
+        for (size_t b = 0; b < n / 32; ++b) {
+            const float d = fabsf(scale(b));
+            const float m = b % 5 == 0 ? 0.0f : std::ldexp(b & 1 ? -1.0f : 1.0f, -6 + (int) (b % 7));
+            for (size_t j = 0; j < 32; ++j) {
+                x[b*32 + j] = m + (float) qd(rng) * d;
+            }
+            x[b*32 + b % 32]        = m;
+            x[b*32 + (b + 16) % 32] = m + (float) qmax * d;
+        }
+    } else if (type == GGML_TYPE_IQ4_NL) {
+        static const int8_t grid[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+        std::uniform_int_distribution<int> qd(0, 15);
+        for (size_t b = 0; b < n / 32; ++b) {
+            const float d = scale(b);
+            for (size_t j = 0; j < 32; ++j) {
+                x[b*32 + j] = d * (float) grid[qd(rng)];
+            }
+            x[b*32 + b % 32] = d * (float) grid[0];
+        }
+    } else if (type == GGML_TYPE_Q6_K) {
+        std::uniform_int_distribution<int> qd(-32, 31), sd(1, 127);
+        for (size_t b = 0; b < n / 256; ++b) {
+            const float d = scale(b);
+            for (size_t s = 0; s < 16; ++s) {
+                const int   sc = s == b % 16 ? -128 : (sd(rng) * (s & 1 ? -1 : 1));
+                const float ds = d * (float) sc;
+                for (size_t j = 0; j < 16; ++j) {
+                    x[b*256 + s*16 + j] = ds * (float) qd(rng);
+                }
+                x[b*256 + s*16 + (b + s) % 16] = ds * -32.0f;
+            }
         }
     } else {
         for (size_t i = 0; i < n; ++i) {
@@ -144,22 +232,47 @@ static std::vector<float> round_trip(ggml_backend_t backend, ggml_type type, con
     return y;
 }
 
+// the narrow types LLAMA_HOP_CAST takes (llama-context.cpp), by the name ggml_type_name gives, in any case
+static const ggml_type hop_types[] = {
+    GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
+    GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL,
+};
+
+static ggml_type hop_type_of(const std::string & v) {
+    for (ggml_type t : hop_types) {
+        const std::string name = ggml_type_name(t);
+        if (name.size() == v.size() && std::equal(name.begin(), name.end(), v.begin(),
+                [](char a, char b) { return tolower((unsigned char) a) == tolower((unsigned char) b); })) {
+            return t;
+        }
+    }
+    return GGML_TYPE_F32;
+}
+
 static void test_round_trips() {
-    const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0 };
-    const int64_t   ne0 = 2560, ne1 = 4;
+    const int64_t ne0 = 2560, ne1 = 4;
     printf("part 1: round trips F32 -> type -> F32 at [2560, 4, T]\n");
-    printf("  %-14s %-5s %4s  %-22s %-34s\n", "backend", "type", "T", "representable data", "residual-like data");
+    printf("  %-14s %-6s %4s  %-22s %-56s %s\n", "backend", "type", "T", "representable data", "residual-like data",
+            "against the CPU's round trip");
+    // the CPU first: each GPU's residual-like round trip is compared with the CPU's
+    std::vector<ggml_backend_dev_t> devs;
     for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(d);
         const auto dt = ggml_backend_dev_type(dev);
-        if (dt != GGML_BACKEND_DEVICE_TYPE_CPU && dt != GGML_BACKEND_DEVICE_TYPE_GPU) {
-            continue;
+        if (dt == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devs.insert(devs.begin(), dev);
+        } else if (dt == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            devs.push_back(dev);
         }
+    }
+    std::map<std::pair<int, int64_t>, std::vector<float>> cpu_y;
+    for (ggml_backend_dev_t dev : devs) {
+        const bool is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             continue;
         }
-        for (ggml_type type : types) {
+        for (ggml_type type : hop_types) {
             for (int64_t ne2 : { 1, 4, 512 }) {
                 const size_t n = (size_t) (ne0 * ne1 * ne2);
                 std::mt19937 rng(1234 + (unsigned) type * 7 + (unsigned) ne2);
@@ -174,17 +287,37 @@ static void test_round_trips() {
                 const std::vector<float> y = round_trip(backend, type, x, ne0, ne1, ne2);
                 double worst = 0.0;
                 const size_t bad = out_of_bound(type, x.data(), y.data(), n, ne0, worst);
-                double max_err = 0.0, rms = 0.0;
+                double max_err = 0.0, rms = 0.0, rms_x = 0.0;
                 for (size_t i = 0; i < n; ++i) {
                     max_err = std::max(max_err, fabs((double) x[i] - y[i]));
-                    rms += ((double) x[i] - y[i]) * ((double) x[i] - y[i]);
+                    rms   += ((double) x[i] - y[i]) * ((double) x[i] - y[i]);
+                    rms_x += (double) x[i] * x[i];
                 }
-                rms = sqrt(rms / n);
+                rms   = sqrt(rms / n);
+                rms_x = sqrt(rms_x / n);
                 check(bad == 0, "%s %s T=%lld: %zu of %zu elements outside the bound (worst %.3f of it)",
                         ggml_backend_name(backend), ggml_type_name(type), (long long) ne2, bad, n, worst);
-                printf("  %-14s %-5s %4lld  %-22s max err %.3g, rms %.3g, worst/bound %.3f%s\n", ggml_backend_name(backend),
-                        ggml_type_name(type), (long long) ne2, exact ? "exact" : "DIFFERS", max_err, rms, worst,
-                        bad ? "  OUT OF BOUND" : "");
+
+                // a GPU's round trip against the CPU's (the reference implementation of the type)
+                char vs_cpu[96] = "(the reference)";
+                const auto key = std::make_pair((int) type, ne2);
+                if (is_cpu) {
+                    cpu_y[key] = y;
+                } else if (cpu_y.count(key)) {
+                    const std::vector<float> & yc = cpu_y[key];
+                    size_t same = 0;
+                    double max_diff = 0.0;
+                    for (size_t i = 0; i < n; ++i) {
+                        same    += memcmp(&y[i], &yc[i], sizeof(float)) == 0;
+                        max_diff = std::max(max_diff, fabs((double) y[i] - yc[i]));
+                    }
+                    snprintf(vs_cpu, sizeof(vs_cpu), "%.4f %% bit for bit, max |diff| %.3g", 100.0 * same / n, max_diff);
+                } else {
+                    snprintf(vs_cpu, sizeof(vs_cpu), "(no CPU run)");
+                }
+                printf("  %-14s %-6s %4lld  %-22s max err %.3g, rms %.3g (%.2e of the data's), worst/bound %.3f%s  %s\n",
+                        ggml_backend_name(backend), ggml_type_name(type), (long long) ne2, exact ? "exact" : "DIFFERS",
+                        max_err, rms, rms / rms_x, worst, bad ? "  OUT OF BOUND" : "", vs_cpu);
             }
         }
         ggml_backend_free(backend);
@@ -219,9 +352,7 @@ static arm parse_arm(const std::string & spec) {
 static ggml_type arm_type(const arm & a) {
     for (const auto & [k, v] : a.env) {
         if (k == "LLAMA_HOP_CAST") {
-            if (v == "f16")  return GGML_TYPE_F16;
-            if (v == "bf16") return GGML_TYPE_BF16;
-            if (v == "q8_0") return GGML_TYPE_Q8_0;
+            return hop_type_of(v);
         }
     }
     return GGML_TYPE_F32;
@@ -580,8 +711,9 @@ int main(int argc, char ** argv) {
 
     if (model_path && !unit_only) {
         if (arms.empty()) {
-            for (const char * spec : { "off", "f16 LLAMA_HOP_CAST=f16", "bf16 LLAMA_HOP_CAST=bf16", "q8_0 LLAMA_HOP_CAST=q8_0" }) {
-                arms.push_back(parse_arm(spec));
+            arms.push_back(parse_arm("off"));
+            for (ggml_type t : hop_types) {
+                arms.push_back(parse_arm(std::string(ggml_type_name(t)) + " LLAMA_HOP_CAST=" + ggml_type_name(t)));
             }
         }
         test_model(model_path, arms, o, tsv);

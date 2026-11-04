@@ -3357,7 +3357,8 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_Q6_K) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
             // roughly (150*2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -3372,6 +3373,10 @@ struct test_cpy : public test_case {
             }
             if (type_dst == GGML_TYPE_Q8_0) {
                 err_estimate /= 8.0f;
+            }
+            if (type_dst == GGML_TYPE_Q6_K) {
+                // 6 bits (the card hops' Q6_K cast, Q963)
+                err_estimate /= 4.0f;
             }
             err_estimate *= err_estimate;
             err_estimate /= (150.0f*150.0f*0.25f)*float(total_elements());
@@ -11736,8 +11741,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
 
     // card hops (LLAMA_HOP_CAST): Flash-Next's four hc streams of 2,560 at a decoded token, a 4-token verify pass and
-    // a 512-token micro-batch, to and from each narrow type
-    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+    // a 512-token micro-batch, to and from each narrow type (the types below 8 bits: Q963)
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
+                           GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
         for (int64_t n_tokens : {1, 4, 512}) {
             test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type, {2560, 4, n_tokens, 1}));
             test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F32, {2560, 4, n_tokens, 1}));
