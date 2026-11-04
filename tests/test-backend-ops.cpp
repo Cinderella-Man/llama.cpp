@@ -12723,6 +12723,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_large_act(type, 2560, n, 2560));
             }
         }
+        // ... and the types that llama.cpp's mul_mat_vec_q takes at every token count (no k-column kernel; Q5_1 and IQ1_S
+        // have no Pascal kernel either), whose dot products read the block sums: since Q902 in FP32 from the int8 values
+        for (ggml_type type : { GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_IQ1_S }) {
+            for (int64_t n : { 1, 4, 5, 8 }) {
+                test_cases.emplace_back(new test_mul_mat_large_act(type, 2560, n, 2560));
+            }
+        }
     }
     // all 512 experts, as the file has them
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q2_0, GGML_GLU_OP_SWIGLU, 1, 640, 2560, true, 512, 10,
