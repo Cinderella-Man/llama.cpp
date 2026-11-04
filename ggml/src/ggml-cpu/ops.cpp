@@ -5221,6 +5221,11 @@ static void ggml_compute_forward_get_rows_q(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+        if (i01 == -1) {
+            // a skipped expert (ggml_moe_tail_ids, e.g. the lookup of its scale): zeros
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         dequantize_row_q(
@@ -5262,6 +5267,11 @@ static void ggml_compute_forward_get_rows_f16(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+        if (i01 == -1) {
+            // a skipped expert (ggml_moe_tail_ids, e.g. the lookup of its scale): zeros
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_fp16_to_fp32(
@@ -5303,6 +5313,11 @@ static void ggml_compute_forward_get_rows_bf16(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+        if (i01 == -1) {
+            // a skipped expert (ggml_moe_tail_ids, e.g. the lookup of its scale): zeros
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_bf16_to_fp32(
@@ -5344,6 +5359,19 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+        // row -1 (a skipped expert, ggml_moe_tail_ids) reads as -1 from I32 rows (its slot in the MoE cache), as zeros
+        // from float ones
+        if (i01 == -1 && src0->type == GGML_TYPE_I32) {
+            int32_t * d = (int32_t *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3);
+            std::fill(d, d + nc, -1);
+            continue;
+        }
+
+        if (i01 == -1) {
+            // a skipped expert (ggml_moe_tail_ids, e.g. the lookup of its scale): zeros
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_vec_cpy_f32(nc,
@@ -8905,6 +8933,83 @@ void ggml_compute_forward_top_k(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_moe_tail
+
+// The cut of one token's k slots, in the arithmetic of the graph it replaces (llama-graph.cpp, build_moe_tail):
+// sum_rows (a double sum), the shares, cumsum (a float running sum) minus the share, step(p - before) and
+// step(share - w). keep[j] is set; returns the token's total.
+static float ggml_moe_tail_keep(const float * wt, const int64_t k, const float p, const float w, uint8_t * keep) {
+    ggml_float sum = 0.0;
+    for (int64_t j = 0; j < k; ++j) {
+        sum += (ggml_float) wt[j];
+    }
+    const float total = (float) sum;
+
+    float cum = 0.0f;
+    for (int64_t j = 0; j < k; ++j) {
+        const float share  = wt[j] / total;
+        cum                = j == 0 ? share : cum + share;
+        const float before = cum - share;
+        keep[j] = p - before > 0.0f && (w <= 0.0f || share - w > 0.0f);
+    }
+    return total;
+}
+
+void ggml_compute_forward_moe_tail(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * weights = dst->src[0];
+    const ggml_tensor * ids     = dst->src[1];
+
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    const int64_t k        = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+
+    const float p      = ggml_get_op_params_f32(dst, 0);
+    const float w      = ggml_get_op_params_f32(dst, 1);
+    const bool  renorm = ggml_get_op_params_i32(dst, 2) != 0;
+    const int   n_skip = ggml_get_op_params_i32(dst, 3);
+    const bool  repeat = ggml_get_op_params_i32(dst, 4) != 0;
+    const bool  skip   = n_tokens <= n_skip; // else every slot keeps its expert
+
+    std::vector<uint8_t> keep(k);
+
+    for (int64_t i = params->ith; i < n_tokens; i += params->nth) {
+        const float * wt = (const float *) weights->data + i*k;
+        const float total = ggml_moe_tail_keep(wt, k, p, w, keep.data());
+
+        if (dst->type == GGML_TYPE_I32) {
+            const int32_t * id = (const int32_t *) ((const char *) ids->data + i*ids->nb[1]);
+            int32_t       * od = (int32_t *) ((char *) dst->data + i*dst->nb[1]);
+            int32_t last = id[0];
+            for (int64_t j = 0; j < k; ++j) {
+                if (keep[j]) {
+                    last = id[j];
+                }
+            }
+            for (int64_t j = 0; j < k; ++j) {
+                od[j] = keep[j] || !skip ? id[j] : repeat ? last : -1;
+            }
+        } else {
+            float * ow = (float *) dst->data + i*k;
+            ggml_float kept_sum = 0.0;
+            for (int64_t j = 0; j < k; ++j) {
+                ow[j] = keep[j] ? wt[j] : 0.0f;
+                kept_sum += (ggml_float) ow[j];
+            }
+            if (renorm) {
+                const float f = total / (float) kept_sum;
+                for (int64_t j = 0; j < k; ++j) {
+                    ow[j] *= f;
+                }
+            }
+        }
     }
 }
 

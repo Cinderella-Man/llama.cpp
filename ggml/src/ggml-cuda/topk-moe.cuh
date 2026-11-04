@@ -16,6 +16,14 @@ struct ggml_cuda_topk_moe_args {
     bool scale{};
     int  n_groups{};     // > 0: pick experts only from the top n_group_used expert groups
     int  n_group_used{};
+    // the routed experts' tail (GGML_OP_MOE_TAIL, at most WARP_SIZE experts used) on the final weights: weights and ids
+    // are then the two MOE_TAIL nodes' outputs
+    bool  tail{};
+    float tail_p{};
+    float tail_w{};
+    bool  tail_renorm{};
+    bool  tail_skip{};   // up to n_skip tokens: a dropped slot's id is -1 (or with tail_repeat its token's last kept
+    bool  tail_repeat{}; // expert); past them every slot keeps its own expert
 };
 
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,

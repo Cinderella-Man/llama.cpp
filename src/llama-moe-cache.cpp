@@ -116,6 +116,10 @@ struct moe_cache_slru {
         }
         uniq.clear();
         for (size_t i = 0; i < n_ids; ++i) {
+            // -1: a skipped slot (the routed experts' tail, ggml_moe_tail_ids), whose lookup reads -1
+            if (ids[i] == -1) {
+                continue;
+            }
             GGML_ASSERT(ids[i] >= 0 && ids[i] < n_expert);
             if (seen[ids[i]] != seen_gen) {
                 seen[ids[i]] = seen_gen;

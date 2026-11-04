@@ -258,6 +258,18 @@ static __device__ __forceinline__ void mmvqp_rows_1t(const mmvqp_args & p, const
     const uint32_t channel_y = p.ids ? fastmodulo(channel_dst, p.nchannels_y) : channel_dst;
     const uint32_t sample_x  = fastdiv(sample_dst, p.sample_ratio);
 
+    if (p.ids && !shared_expert && (int32_t) channel_x < 0) {
+        // a skipped slot (id -1, moe-tail.cuh), the same for the whole block: zeros, and its expert's rows are not read
+        float * dst = p.dst + sample_dst*p.stride_sample_dst + channel_dst*p.stride_channel_dst;
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            if ((i & (lpr - 1)) == sl && row0 + i < p.nrows) {
+                dst[row0 + i] = 0.0f;
+            }
+        }
+        return;
+    }
+
     const int64_t xoff = sample_x*p.sample_bytes_x + channel_x*p.channel_bytes_x;
     const char * xm[M];
     xm[0] = (shared_expert ? (const char *) fusion.shared_up : p.vx) + xoff;
@@ -484,6 +496,17 @@ static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml
         const int     t0 = blockIdx.y / p.nslots;
         const int     k0 = blockIdx.y - t0 * p.nslots;
         const int32_t e  = p.ids[k0 + t0 * p.ids_stride];
+        if (e < 0) {
+            // a skipped slot (id -1, moe-tail.cuh): zeros, and no expert's rows are read; no other entry matches it
+            float * dst = p.dst + sample_dst*p.stride_sample_dst + k0*p.stride_channel_dst + t0*p.stride_col_dst;
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                if ((i & (lpr - 1)) == sl && row0 + i < p.nrows) {
+                    dst[row0 + i] = 0.0f;
+                }
+            }
+            return;
+        }
         // entries before this one with the same expert: only every NC-th of them starts a group
         int before = 0;
         for (int t = 0; t <= t0; ++t) {

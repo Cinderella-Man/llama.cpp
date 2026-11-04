@@ -983,6 +983,9 @@ struct llm_graph_params {
             cparams.moe_tail_w              == other.cparams.moe_tail_w              &&
             cparams.moe_tail_renorm         == other.cparams.moe_tail_renorm         &&
             cparams.moe_tail_hist           == other.cparams.moe_tail_hist           &&
+            cparams.moe_tail_graph          == other.cparams.moe_tail_graph          &&
+            cparams.moe_tail_skip           == other.cparams.moe_tail_skip           &&
+            cparams.moe_tail_repeat         == other.cparams.moe_tail_repeat         &&
             cparams.head_bound_on           == other.cparams.head_bound_on           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -1338,6 +1341,14 @@ struct llm_graph_context {
                  int64_t   n_expert_used,
                  int64_t   n_tokens,
                      int   il) const;
+
+    // the same cut with GGML_OP_MOE_TAIL: weights and selected_experts [n_expert_used, n_tokens] become the cut ones
+    void build_moe_tail_op(
+             ggml_tensor *& weights,
+             ggml_tensor *& selected_experts,
+                 int64_t    n_expert_used,
+                 int64_t    n_tokens,
+                     int    il) const;
 
     //
     // inputs

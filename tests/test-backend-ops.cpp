@@ -1210,9 +1210,10 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
 }
 
 // TODO: [TAG_MUL_MAT_ID_SKIP] see https://github.com/ggml-org/llama.cpp/pull/26631
+// CUDA skips -1 since Q660 (moe-tail.cuh); the HIP and MUSA builds of the same code are not tested
 static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) {
     const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
-    if (strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
+    if (strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
         return false;
     }
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
@@ -8390,6 +8391,203 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// a token's k routed weights in descending order, some flat and some peaked (so that the tail cuts from 1 to all k
+// slots), and random experts
+static void init_moe_tail_tensors(ggml_context * ctx, int n_expert) {
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> u(0.01f, 1.0f);
+    std::uniform_int_distribution<int> e(0, n_expert - 1);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (ggml_is_view_op(t->op)) {
+            continue;
+        }
+        const int64_t k = t->ne[0] == 1 ? t->ne[1] : t->ne[0];
+        const int64_t n = ggml_nelements(t) / k;
+        if (t->type == GGML_TYPE_I32) {
+            std::vector<int32_t> v(ggml_nelements(t));
+            for (auto & x : v) {
+                x = e(rng);
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        } else if (strcmp(t->name, "weights") == 0) {
+            std::vector<float> v(ggml_nelements(t));
+            for (int64_t i = 0; i < n; ++i) {
+                const float pw = 1.0f + 6.0f*u(rng); // the higher, the more peaked
+                for (int64_t j = 0; j < k; ++j) {
+                    v[i*k + j] = std::pow(u(rng), pw);
+                }
+                std::sort(v.begin() + i*k, v.begin() + (i + 1)*k, std::greater<float>());
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        } else {
+            init_tensor_uniform(t);
+        }
+    }
+}
+
+// GGML_OP_MOE_TAIL on its own (on CUDA its kernel when the router's chain is not fused): the cut weights or the cut ids
+struct test_moe_tail : public test_case {
+    const int64_t k;
+    const int64_t n_tokens;
+    const float p;
+    const float w;
+    const bool renorm;
+    const int n_skip;
+    const bool repeat;
+    const bool out_ids;
+
+    std::string vars() override { return VARS_TO_STR8(k, n_tokens, p, w, renorm, n_skip, repeat, out_ids); }
+
+    test_moe_tail(int64_t k = 10, int64_t n_tokens = 5, float p = 0.9f, float w = 0.0f, bool renorm = true,
+                  int n_skip = 8, bool repeat = false, bool out_ids = false)
+        : k(k), n_tokens(n_tokens), p(p), w(w), renorm(renorm), n_skip(n_skip), repeat(repeat), out_ids(out_ids) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, k, n_tokens);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n_tokens);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * out = out_ids ? ggml_moe_tail_ids(ctx, weights, ids, p, w, n_skip, repeat)
+                                    : ggml_moe_tail(ctx, weights, ids, p, w, renorm);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_moe_tail_tensors(ctx, 64);
+    }
+};
+
+// The router's chain with the tail, as build_moe_ffn emits it: softmax or sigmoid, top-k, the weights normalized and
+// scaled, the cut weights and ids (one launch on CUDA, topk-moe.cu), then an expert product that reads both:
+// MUL_MAT_ID of one-column experts by the cut weights, so a dropped slot gives 0 either way (for up to n_skip tokens id
+// -1, or with repeat the last kept expert at weight 0; past them its own expert at weight 0)
+struct test_topk_moe_tail : public test_case {
+    const int64_t n_expert;
+    const int64_t n_tokens;
+    const int n_expert_used;
+    const bool with_norm;
+    const MoeGatingFunc gating_func;
+    const float scale_w;
+    const float p;
+    const float w;
+    const bool renorm;
+    const int n_skip;
+    const bool repeat;
+    ggml_tensor * w_cut   {};
+    ggml_tensor * ids_cut {};
+    ggml_tensor * out     {};
+
+    test_topk_moe_tail(int64_t n_expert, int64_t n_tokens, int n_expert_used, bool with_norm, MoeGatingFunc gating_func,
+                       float scale_w, float p, float w, bool renorm, int n_skip = 8, bool repeat = false)
+        : n_expert(n_expert), n_tokens(n_tokens), n_expert_used(n_expert_used), with_norm(with_norm),
+          gating_func(gating_func), scale_w(scale_w), p(p), w(w), renorm(renorm), n_skip(n_skip), repeat(repeat) {}
+
+    std::string vars() override {
+        return VARS_TO_STR11(n_expert, n_tokens, n_expert_used, with_norm, gating_func, scale_w, p, w, renorm, n_skip,
+                             repeat);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOPK_MOE_TAIL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+        ggml_set_name(logits, "logits");
+        ggml_tensor * probs = gating_func == GATING_FUNC_SIGMOID ? ggml_sigmoid(ctx, logits) : ggml_soft_max(ctx, logits);
+
+        ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_expert_used); // [n_expert_used, n_tokens]
+        ggml_tensor * weights  = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected);
+        if (with_norm) {
+            weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+            ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights);
+            weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5, INFINITY);
+            weights = ggml_div(ctx, weights, weights_sum);
+            weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+        }
+        if (scale_w) {
+            weights = ggml_scale(ctx, weights, scale_w);
+        }
+
+        // the graph is built from out: its src[1] (the cut weights) comes right before its src[2] (the cut ids)
+        w_cut   = ggml_moe_tail(ctx, weights, selected, p, w, renorm);
+        ids_cut = ggml_moe_tail_ids(ctx, weights, selected, p, w, n_skip, repeat);
+        ggml_set_name(w_cut, "w_cut");
+        ggml_set_name(ids_cut, "ids_cut");
+
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 16, n_expert);
+        ggml_set_name(as, "as");
+        out = ggml_mul_mat_id(ctx, as, w_cut, ids_cut); // [16, n_expert_used, n_tokens]
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { ids_cut, w_cut, out }; }
+
+    // logits of a wide range, so that some tokens favour a few experts and the tail cuts deep
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "logits") == 0) {
+                init_tensor_uniform(t, -6.0f, 6.0f);
+            } else if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    // the top-k may come in another order for equal weights
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> a2(a, a + n);
+        std::vector<float> b2(b, b + n);
+        std::sort(a2.begin(), a2.end());
+        std::sort(b2.begin(), b2.end());
+        return nmse(a2.data(), b2.data(), n);
+    }
+};
+
+// GET_ROWS of a skipped expert (row -1, ggml_moe_tail_ids): zeros from float and quantized rows (an expert's scale),
+// -1 from I32 rows (its slot in the MoE cache, llama-moe-cache.cpp)
+struct test_get_rows_skip : public test_case {
+    const ggml_type type;
+    const int64_t ne0;
+    const int64_t n_rows;
+    const int64_t n_idx;
+
+    std::string vars() override { return VARS_TO_STR4(type, ne0, n_rows, n_idx); }
+
+    test_get_rows_skip(ggml_type type = GGML_TYPE_I32, int64_t ne0 = 1, int64_t n_rows = 64, int64_t n_idx = 40)
+        : type(type), ne0(ne0), n_rows(n_rows), n_idx(n_idx) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, type, ne0, n_rows);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_idx);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * out = ggml_get_rows(ctx, rows, idx);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::vector<int32_t> v(ggml_nelements(t));
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = strcmp(t->name, "idx") == 0 ? (i % 3 == 1 ? -1 : (int32_t) (rng() % n_rows)) : (int32_t) (rng() % 1000);
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -13009,6 +13207,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Q660: skipped slots at Flash-Next's shapes (10 of 32 experts, gate/up K = 2560, the Q2_0 down projection K = 640)
+    // through every expert kernel of 1 to 8 tokens on CUDA: the Pascal one- and multi-token kernels and -mtok (Q2_0, the
+    // grid types, IQ1_M; GGML_CUDA_MMVQ_PASCAL=2 on another GPU), llama.cpp's mul_mat_vec_q (Q4_K, or
+    // GGML_CUDA_MMVQ_PASCAL=0), the fused gate/up + SwiGLU, and MMQ past 8 tokens
+    for (ggml_type type : { GGML_TYPE_Q2_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S,
+                            GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_M, GGML_TYPE_Q4_K }) {
+        const int64_t k_down = type == GGML_TYPE_Q2_0 ? 640 : 1024;
+        for (int64_t n : { 1, 2, 3, 4, 5, 6, 7, 8, 17 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, true,  640, n, 2560, 0, false, true));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 2560, n, k_down, 0, false, true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 32, 10, true,
+                                                                false, true, false, { 4, 2 }, true));
+        }
+    }
     // n_used == n_mats, so every expert can be skipped
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, false, 512, 64, 256, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1, 0, false, true));
@@ -14013,6 +14225,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // Q660: the routed experts' tail (GGML_OP_MOE_TAIL) alone and on the router's chain (one launch on CUDA, topk-moe.cu)
+    // at Flash-Next's 512 experts and 10 used, at up to n_skip tokens (-1, or with repeat the last kept expert) and past
+    // them (every slot's own expert), with softmax and sigmoid routers; more used experts than a warp's lanes run the op's
+    // own kernel after the chain
+    for (bool out_ids : { false, true }) {
+        for (auto [p, w] : std::vector<std::pair<float, float>>{
+                { 1.0f, 0.0f }, { 0.9f, 0.0f }, { 0.8f, 0.0f }, { 0.5f, 0.0f }, { 1.0f, 0.05f }, { 0.9f, 0.03f } }) {
+            for (bool renorm : { false, true }) {
+                for (int64_t n_tokens : { 1, 5, 8, 9, 33 }) {
+                    test_cases.emplace_back(new test_moe_tail(10, n_tokens, p, w, renorm, 8, false, out_ids));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_moe_tail(40, 7, 0.9f, 0.0f, true, 8, false, out_ids));
+        test_cases.emplace_back(new test_moe_tail(10, 7, 0.9f, 0.0f, true, 0, false, out_ids));
+        for (int64_t n_tokens : { 3, 8, 9 }) {
+            test_cases.emplace_back(new test_moe_tail(10, n_tokens, 0.8f, 0.0f, true, 8, true, out_ids));
+        }
+    }
+    for (int64_t n_tokens : { 1, 3, 8, 9, 22 }) {
+        for (auto [p, w, renorm] : std::vector<std::tuple<float, float, bool>>{
+                { 1.0f, 0.0f, false }, { 0.9f, 0.0f, true }, { 0.9f, 0.0f, false }, { 0.8f, 0.0f, true },
+                { 0.6f, 0.0f, true }, { 1.0f, 0.05f, true } }) {
+            test_cases.emplace_back(new test_topk_moe_tail(512, n_tokens, 10, true, GATING_FUNC_SOFTMAX, 0.0f, p, w, renorm));
+        }
+        test_cases.emplace_back(new test_topk_moe_tail(512, n_tokens, 10, false, GATING_FUNC_SOFTMAX, 0.0f, 0.9f, 0.0f, true));
+        test_cases.emplace_back(new test_topk_moe_tail(256, n_tokens, 8, true, GATING_FUNC_SIGMOID, 2.5f, 0.8f, 0.0f, true));
+        test_cases.emplace_back(new test_topk_moe_tail(128, n_tokens, 8, true, GATING_FUNC_SOFTMAX, 0.0f, 0.9f, 0.0f, true, 0));
+        test_cases.emplace_back(new test_topk_moe_tail(512, n_tokens, 10, true, GATING_FUNC_SOFTMAX, 0.0f, 0.8f, 0.0f, true, 8, true));
+        test_cases.emplace_back(new test_topk_moe_tail(64, n_tokens, 40, true, GATING_FUNC_SOFTMAX, 0.0f, 0.9f, 0.0f, true));
+    }
+    for (ggml_type type : { GGML_TYPE_I32, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (int64_t ne0 : { 1, 4, 5, 256 }) {
+            test_cases.emplace_back(new test_get_rows_skip(type, ne0, 64, 40));
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q2_0 }) {
+        test_cases.emplace_back(new test_get_rows_skip(type, 512, 64, 40));
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.

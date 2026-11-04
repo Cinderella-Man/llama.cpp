@@ -59,6 +59,7 @@
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
+#include "ggml-cuda/moe-tail.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
@@ -2568,6 +2569,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
 
+    // ids that may hold -1 or a repeated expert (moe-tail.cuh): the products read a copy in which every slot names an
+    // expert its token names once, and the -1 slots' rows become zeros at the end
+    const ggml_cuda_skip_ids skip(ctx, ids, ne02);
+    const ggml_tensor * ids_r = skip.ids();
+
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
 
@@ -2592,7 +2598,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids_r->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
@@ -2679,6 +2685,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+
+    skip.zero_rows(ctx, dst);
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -2986,6 +2994,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
+            break;
+        case GGML_OP_MOE_TAIL:
+            ggml_cuda_op_moe_tail(ctx, dst);
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
@@ -3837,6 +3848,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     args.norm            = false;
     args.n_groups        = 0;
     args.n_group_used    = 0;
+    args.tail            = false;
 
     const int      n_nodes = cgraph->n_nodes;
     ggml_tensor ** nodes   = cgraph->nodes;
@@ -3988,6 +4000,39 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         args.scale = true;
     }
 
+    return true;
+}
+
+// The routed experts' tail (llama-graph.cpp, build_moe_ffn): the two MOE_TAIL nodes of the top-k chain's weights and ids
+// right after its last node (i_next = that node + 1), the cut weights and the cut ids in either order, with the same cut.
+// Sets args.tail and returns the nodes' indices.
+static bool ggml_cuda_topk_moe_tail_match(const ggml_cgraph * cgraph, const int i_next, const ggml_tensor * weights,
+                                          const ggml_tensor * ids, ggml_cuda_topk_moe_args & args, int & i_tw, int & i_ti) {
+    if (i_next + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * a = cgraph->nodes[i_next];
+    const ggml_tensor * b = cgraph->nodes[i_next + 1];
+    for (const ggml_tensor * t : { a, b }) {
+        if (t->op != GGML_OP_MOE_TAIL || t->src[0] != weights || t->src[1] != ids || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    if (a->type == b->type || ggml_get_op_params_f32(a, 0) != ggml_get_op_params_f32(b, 0) ||
+            ggml_get_op_params_f32(a, 1) != ggml_get_op_params_f32(b, 1) || weights->ne[1] > WARP_SIZE) {
+        return false;
+    }
+    i_tw = a->type == GGML_TYPE_F32 ? i_next : i_next + 1;
+    i_ti = a->type == GGML_TYPE_F32 ? i_next + 1 : i_next;
+    const ggml_tensor * tw = cgraph->nodes[i_tw];
+    const ggml_tensor * ti = cgraph->nodes[i_ti];
+
+    args.tail        = true;
+    args.tail_p      = ggml_get_op_params_f32(tw, 0);
+    args.tail_w      = ggml_get_op_params_f32(tw, 1);
+    args.tail_renorm = ggml_get_op_params_i32(tw, 2) != 0;
+    args.tail_skip   = ti->ne[1] <= ggml_get_op_params_i32(ti, 3);
+    args.tail_repeat = ggml_get_op_params_i32(ti, 4) != 0;
     return true;
 }
 
@@ -5047,6 +5092,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 weights      = cgraph->nodes[i + ops.size() - 1];
                 out_nodes[1] = i + ops.size() - 1;
+
+                // the routed experts' tail after the chain: the same launch writes the cut weights and ids instead
+                int i_tw = -1;
+                int i_ti = -1;
+                if (ggml_cuda_topk_moe_tail_match(cgraph, i + ops.size(), weights, ids, args, i_tw, i_ti)) {
+                    std::vector<ggml_op> ops_tail = ops;
+                    ops_tail.insert(ops_tail.end(), { GGML_OP_MOE_TAIL, GGML_OP_MOE_TAIL });
+                    const int out_tail[2] = { i_ti, i_tw };
+                    if (ggml_can_fuse_subgraph(cgraph, i, ops_tail.size(), ops_tail.data(), out_tail, 2) &&
+                            ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops_tail.size(), out_tail, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, cgraph->nodes[i_tw], cgraph->nodes[i_ti], clamp, scale, bias, args);
+                        return ops_tail.size() - 1;
+                    }
+                    args.tail = false;
+                }
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
@@ -6765,7 +6826,25 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         weights      = cgraph->nodes[i + ops.size() - 1];
                         out_nodes[1] = i + ops.size() - 1;
 
-                        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                        // with the routed experts' tail (as ggml_cuda_try_fuse fuses it): the
+                        // inputs stay alive until both tail outputs are allocated
+                        int i_tw = -1;
+                        int i_ti = -1;
+                        bool fused_tail = false;
+                        if (ggml_cuda_topk_moe_tail_match(cgraph, i + ops.size(), weights, ids, args, i_tw, i_ti) &&
+                                i + (int) ops.size() + 2 < cgraph->n_nodes) {
+                            std::vector<ggml_op> ops_tail = ops;
+                            ops_tail.insert(ops_tail.end(), { GGML_OP_MOE_TAIL, GGML_OP_MOE_TAIL });
+                            const int out_tail[2] = { i_ti, i_tw };
+                            if (ggml_can_fuse_subgraph(cgraph, i, ops_tail.size(), ops_tail.data(), out_tail, 2) &&
+                                    ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
+                                add_alloc_deps(i, i + ops_tail.size());
+                                i += ops_tail.size() - 1;
+                                fused_tail = true;
+                            }
+                        }
+
+                        if (!fused_tail && ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                 ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
 
                             add_alloc_deps(i, i + ops.size());
@@ -7748,6 +7827,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguously_allocated(op->src[0]);
         case GGML_OP_TOP_K:
             return op->src[0]->ne[0] <= INT_MAX;
+        case GGML_OP_MOE_TAIL:
+            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->src[1]->type == GGML_TYPE_I32 &&
+                op->src[1]->nb[0] == sizeof(int32_t);
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
             {

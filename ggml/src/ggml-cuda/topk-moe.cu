@@ -1,5 +1,6 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
+#include "moe-tail.cuh"
 #include "topk-moe.cuh"
 
 #include <cmath>
@@ -13,6 +14,13 @@ struct topk_moe_config {
     bool delayed_softmax;
     int  n_groups;
     int  n_group_used;
+    int  ids_stride; // ids per row: n_experts (the argsort's layout), or n_expert_used for the tail's ids
+    bool  tail;
+    float tail_p;
+    float tail_w;
+    bool  tail_renorm;
+    bool  tail_skip;
+    bool  tail_repeat;
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -159,7 +167,7 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     logits += n_experts * row;
     weights += n_expert_used * row;
-    ids += n_experts * row;
+    ids += config.ids_stride * row;
 
     constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
 
@@ -243,6 +251,7 @@ __global__ void topk_moe_cuda(const float *         logits,
     for (int i = 0; i < experts_per_thread; i++) {
         output_weights[i] = 0.f;
     }
+    int slot_id = 0;
 
     ggml_cuda_pdl_lc();
     for (int k = 0; k < n_expert_used; k++) {
@@ -305,9 +314,14 @@ __global__ void topk_moe_cuda(const float *         logits,
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
             output_weights[k / WARP_SIZE] = max_val;
         }
+        if (k == threadIdx.x) {
+            slot_id = max_expert; // the tail's: slot k on lane k
+        }
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-            ids[k] = max_expert;
+            if (!config.tail) {
+                ids[k] = max_expert;
+            }
             if (config.with_norm) {
                 wt_sum += max_val;
             }
@@ -326,6 +340,42 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     if (config.delayed_softmax) {
         softmax_warp_inplace<experts_per_thread, true>(output_weights, n_expert_used, threadIdx.x);
+    }
+
+    if (config.tail) {
+        // the cut of the final weights (n_expert_used <= WARP_SIZE: slot j on lane j), in the arithmetic of
+        // ggml_cuda_op_moe_tail and the CPU backend
+        const int   lane = threadIdx.x;
+        const float wf   = output_weights[0] * scale_val;
+        double sum = 0.0;
+        for (int j = 0; j < n_expert_used; j++) {
+            sum = __dadd_rn(sum, (double) __shfl_sync(0xFFFFFFFF, wf, j, WARP_SIZE));
+        }
+        const float total = __double2float_rn(sum);
+        float cum  = 0.0f;
+        bool  keep = false;
+        int   last = 0; // the last kept slot
+        for (int j = 0; j < n_expert_used; j++) {
+            const float wj = __shfl_sync(0xFFFFFFFF, wf, j, WARP_SIZE);
+            const bool  kj = ggml_cuda_moe_tail_keep(wj, total, cum, j, config.tail_p, config.tail_w);
+            keep = j == lane ? kj : keep;
+            last = kj ? j : last;
+        }
+        const float kept = keep ? wf : 0.0f;
+        float       out  = kept;
+        if (config.tail_renorm) {
+            double kept_sum = 0.0;
+            for (int j = 0; j < n_expert_used; j++) {
+                kept_sum = __dadd_rn(kept_sum, (double) __shfl_sync(0xFFFFFFFF, kept, j, WARP_SIZE));
+            }
+            out = __fmul_rn(kept, __fdiv_rn(total, __double2float_rn(kept_sum)));
+        }
+        const int last_id = __shfl_sync(0xFFFFFFFF, slot_id, last, WARP_SIZE);
+        if (lane < n_expert_used) {
+            weights[lane] = out;
+            ids[lane]     = keep || !config.tail_skip ? slot_id : config.tail_repeat ? last_id : -1;
+        }
+        return;
     }
 
 #pragma unroll
@@ -441,9 +491,11 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
 
-    GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts);
-
+    // the argsort's [n_experts, n_rows], or the tail's ids [n_expert_used, n_rows]
     const int n_expert_used = weights->ne[1];
+    const int ids_stride    = ids->nb[1] / ggml_type_size(ids->type);
+    GGML_ASSERT(ids_stride == (args.tail ? n_expert_used : n_experts));
+    GGML_ASSERT(!args.tail || n_expert_used <= WARP_SIZE);
 
     const bool with_norm = clamp != nullptr;
 
@@ -459,6 +511,13 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.delayed_softmax   = args.delayed_softmax;
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
+    config.ids_stride        = ids_stride;
+    config.tail              = args.tail;
+    config.tail_p            = args.tail_p;
+    config.tail_w            = args.tail_w;
+    config.tail_renorm       = args.tail_renorm;
+    config.tail_skip         = args.tail_skip;
+    config.tail_repeat       = args.tail_repeat;
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
