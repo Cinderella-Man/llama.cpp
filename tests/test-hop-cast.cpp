@@ -14,8 +14,9 @@
 //     over the same sequence checks each hop_wide tensor (the residual after its round trip) against its hop_narrow's
 //     source (the residual before the cast) within the bound of part 1, counts the hops, and checks that layer 0's
 //     output (l_last-0, before any boundary) equals the reference's bit for bit. Without hops nothing may differ.
-//     Printed per arm: max |logit difference|, mean and max KL divergence from the reference, top-1 agreement.
-// Usage: test-hop-cast [--unit-only] [-m model.gguf] [-ngl N] [-t threads] [--arm "name [exact] VAR=value ..."]...
+//     Printed per arm: max |logit difference|, mean and max KL divergence from the reference, top-1 agreement; per
+//     boundary of a cast arm: the source's largest |x| and rms, the round trip's largest and rms error.
+// Usage: test-hop-cast [--unit-only] [-m model.gguf] [-ngl N] [-ts a,b,...] [-t threads] [--arm "name [exact] VAR=value ..."]...
 //                      [--prompt N] [--ubatch N] [--tsv file]
 // Exit status 0 when every check passes.
 
@@ -234,6 +235,10 @@ struct probe {
     int    n_narrow = 0, n_wide = 0, n_bad_hops = 0;
     size_t n_hop_values = 0;
     double worst = 0.0, max_err = 0.0;
+    // per boundary (the hop_wide tensor's name): hops, values, the source's largest |x| (F16's range is 65,504) and
+    // sum of squares, the error's largest |e| and sum of squares
+    struct per_hop { int n = 0; size_t values = 0; double max_src = 0.0, ss_src = 0.0, max_err = 0.0, ss_err = 0.0; };
+    std::map<std::string, per_hop> hops;
 };
 
 static std::vector<float> tensor_f32(const ggml_tensor * t) {
@@ -248,8 +253,10 @@ static std::vector<float> tensor_f32(const ggml_tensor * t) {
 
 static bool probe_cb(ggml_tensor * t, bool ask, void * user_data) {
     probe * p = (probe *) user_data;
-    const bool narrow = strncmp(t->name, "hop_narrow-", 11) == 0;
-    const bool wide   = strncmp(t->name, "hop_wide-", 9) == 0;
+    // the casts themselves, not the views of them ("hop_wide-1 (reshaped)")
+    const bool plain  = strchr(t->name, ' ') == nullptr;
+    const bool narrow = plain && strncmp(t->name, "hop_narrow-", 11) == 0;
+    const bool wide   = plain && strncmp(t->name, "hop_wide-", 9) == 0;
     const bool layer0 = strcmp(t->name, "l_last-0") == 0;
     if (ask) {
         return narrow || wide || layer0;
@@ -272,8 +279,16 @@ static bool probe_cb(ggml_tensor * t, bool ask, void * user_data) {
             const size_t bad = out_of_bound(p->type, p->src.data(), v.data(), v.size(), (size_t) t->ne[0], worst);
             p->n_bad_hops += bad != 0;
             p->worst = std::max(p->worst, worst);
+            probe::per_hop & h = p->hops[t->name];
+            h.n++;
+            h.values += v.size();
             for (size_t i = 0; i < v.size(); ++i) {
-                p->max_err = std::max(p->max_err, fabs((double) v[i] - p->src[i]));
+                const double e = fabs((double) v[i] - p->src[i]);
+                p->max_err = std::max(p->max_err, e);
+                h.max_err  = std::max(h.max_err, e);
+                h.ss_err  += e*e;
+                h.max_src  = std::max(h.max_src, fabs((double) p->src[i]));
+                h.ss_src  += (double) p->src[i] * p->src[i];
             }
             p->n_hop_values += v.size();
         }
@@ -288,6 +303,7 @@ struct run_opts {
     int n_steps  = 6;
     int n_gpu_layers = 0;
     int n_threads = 4;
+    std::vector<float> tensor_split; // -ts: the layer split's shares per device
 };
 
 // every position's logits for the sequence: the prompt (in micro-batches), one verify pass, single steps
@@ -405,6 +421,12 @@ static void set_arm_env(const arm & a, const std::set<std::string> & all_vars) {
 static void test_model(const char * path, const std::vector<arm> & arms, const run_opts & o, const char * tsv) {
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = o.n_gpu_layers;
+    std::vector<float> ts(llama_max_devices(), 0.0f);
+    if (!o.tensor_split.empty()) {
+        std::copy_n(o.tensor_split.begin(), std::min(o.tensor_split.size(), ts.size()), ts.begin());
+        mp.tensor_split = ts.data();
+        mp.split_mode   = LLAMA_SPLIT_MODE_LAYER;
+    }
     llama_model * model = llama_model_load_from_file(path, mp);
     if (!model) {
         check(false, "cannot load %s", path);
@@ -464,7 +486,12 @@ static void test_model(const char * path, const std::vector<arm> & arms, const r
         }
         check(p.n_narrow == p.n_wide, "arm %s: %d narrow casts against %d wide ones", a.name.c_str(), p.n_narrow, p.n_wide);
         if (cast) {
-            check(p.n_wide > 0, "arm %s: no hop in the graph", a.name.c_str());
+            // a cast arm marked exact has no boundary to cast at (LLAMA_HOP_CAST without a second GPU)
+            if (a.exact) {
+                check(p.n_wide == 0, "arm %s: %d hops in an arm that must not change anything", a.name.c_str(), p.n_wide);
+            } else {
+                check(p.n_wide > 0, "arm %s: no hop in the graph", a.name.c_str());
+            }
             check(p.n_bad_hops == 0, "arm %s: %d hops outside the round-trip bound", a.name.c_str(), p.n_bad_hops);
         } else {
             check(p.n_wide == 0, "arm %s: %d hops in the graph without LLAMA_HOP_CAST", a.name.c_str(), p.n_wide);
@@ -479,6 +506,13 @@ static void test_model(const char * path, const std::vector<arm> & arms, const r
                 s.max_abs, s.kld_mean, s.kld_max, s.top1, p.n_wide, p.max_err,
                 !cast ? (p.n_wide == 0 ? "none, as expected" : "UNEXPECTED HOPS")
                       : (p.n_bad_hops == 0 ? "all within bound" : "OUT OF BOUND"));
+        // per boundary: the source's range and the round trip's error relative to it
+        for (const auto & [name, h] : p.hops) {
+            const double rms_src = sqrt(h.ss_src / std::max<size_t>(h.values, 1));
+            const double rms_err = sqrt(h.ss_err / std::max<size_t>(h.values, 1));
+            printf("    %-16s %4d hops, source max |x| %.4g, rms %.4g; error max %.4g, rms %.4g (%.3g of the source's rms)\n",
+                    name.c_str(), h.n, h.max_src, rms_src, h.max_err, rms_err, rms_src > 0 ? rms_err / rms_src : 0.0);
+        }
         if (ft) {
             fprintf(ft, "%s\t%s\t%d\t%d\t%.6g\t%.6g\t%.6g\t%.6f\t%d\t%zu\t%d\t%.6g\t%.4f\t%d\n", a.name.c_str(), env.c_str(),
                     a.exact, s.identical, s.max_abs, s.kld_mean, s.kld_max, s.top1, p.n_wide, p.n_hop_values,
@@ -513,6 +547,15 @@ int main(int argc, char ** argv) {
             o.n_gpu_layers = atoi(next());
         } else if (a == "-t") {
             o.n_threads = atoi(next());
+        } else if (a == "-ts") {
+            for (const char * p = next(); *p; ) {
+                char * end = nullptr;
+                o.tensor_split.push_back(strtof(p, &end));
+                if (end == p) {
+                    break;
+                }
+                p = *end == ',' ? end + 1 : end;
+            }
         } else if (a == "--arm") {
             arms.push_back(parse_arm(next()));
         } else if (a == "--prompt") {
@@ -524,7 +567,7 @@ int main(int argc, char ** argv) {
         } else if (a == "--unit-only") {
             unit_only = true;
         } else {
-            fprintf(stderr, "usage: %s [--unit-only] [-m model.gguf] [-ngl N] [-t threads] [--arm \"name [exact] VAR=value ...\"]... "
+            fprintf(stderr, "usage: %s [--unit-only] [-m model.gguf] [-ngl N] [-ts a,b,...] [-t threads] [--arm \"name [exact] VAR=value ...\"]... "
                     "[--prompt N] [--ubatch N] [--tsv file]\n", argv[0]);
             return 2;
         }
