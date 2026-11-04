@@ -18,9 +18,21 @@
 //       other kernels do, so that one binary measures what the sharing gains
 //   RB  row blocks per block (default 4 where an expert has 8 or more of them, else 1)
 //   G   1: a fused gate/up loads its weights directly instead of staging them through shared memory (default 0)
+//
+// Since Q713 the same for the grid types IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and for IQ1_M (mmvq-pascal-mtok-iq.cuh), the
+// routed experts of Swift-1.5's IQ files: a grid type's result is bit-identical to the one-token Pascal kernel's; IQ1_M has
+// none. G does not apply to them. GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP=iq2_s,iq1_m leaves the types listed (these, not Q2_0)
+// to the earlier kernels: mul_mat_vec_q_pascal_mc at 2-4 tokens, llama.cpp's at 5-8 tokens; GGML_CUDA_MMVQ_PASCAL_SKIP
+// also skips them here. Where these kernels take a type, MUL_MAT_ID runs its 5-8-token products here instead of
+// llama.cpp's matrix-matrix kernels (get_mmvq_mmid_max_batch); a product of such a type that they then decline (more than
+// 128 (token, slot) entries, rows these kernels can't stage) runs in chunks of tokens on the other kernels.
 bool ggml_cuda_mmvq_pascal_mtok(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
         float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x, int64_t stride_col_y,
         int64_t stride_col_dst, int64_t nchannels_x, int64_t nchannels_y, int64_t nchannels_dst, int64_t stride_channel_x,
         int64_t stride_channel_y, int64_t stride_channel_dst, int64_t nsamples_x, int64_t nsamples_dst, int64_t stride_sample_x,
         int64_t stride_sample_y, int64_t stride_sample_dst, int64_t ids_stride, cudaStream_t stream);
+
+// Whether these kernels take MUL_MAT_ID products of type with 2 to 8 tokens on a device of compute capability cc (the grid
+// types and IQ1_M; Q2_0 needs no raised batch limit).
+bool ggml_cuda_mmvq_pascal_mtok_takes(ggml_type type, int cc);

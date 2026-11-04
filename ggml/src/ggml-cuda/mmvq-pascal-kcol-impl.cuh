@@ -3,7 +3,10 @@
 // The k-column Pascal matrix products of mmvq-pascal-kcol.cu without ggml's headers, so that a standalone benchmark can
 // time the same code (bench/mmvq_pascal/src/kcol_mm.cuh in llms-on-crypto-mining-rigs is a copy). The weight layouts are
 // ggml's (block_q8_0, block_q2_0, block_q3_K, block_q4_K, block_q5_K, block_q6_K, block_iq4_xs, block_q4_0, block_q5_0,
-// block_iq4_nl), read as bytes.
+// block_iq4_nl, and since Q713 block_iq2_xxs, block_iq2_xs, block_iq2_s, block_iq3_xxs, block_iq3_s, block_iq1_m), read as
+// bytes. The grid types and IQ1_M decode each 32-weight block once into signed int8 words with mmvqp_iq::decode32
+// (mmvq-pascal-iq.cuh, also ggml-free; the bench copies it beside this file), each block copying its type's grid into
+// shared memory once.
 //
 // What the kernels do (dst = x * y for k = 1 to 8 columns of y, the k tokens of a speculative-decoding verify):
 //   - Each weight is read from memory once per launch and decoded once into signed or unsigned int8 words, which are
@@ -44,10 +47,15 @@
 #ifndef KCOL_HD
 #define KCOL_HD __device__
 #endif
+#ifndef MMVQP_IQ_HD
+#define MMVQP_IQ_HD KCOL_HD
+#endif
+#include "mmvq-pascal-iq.cuh"
 
 namespace kcol {
 
-enum ktype : int { KQ8_0 = 0, KQ2_0, KQ3_K, KQ4_K, KQ5_K, KQ6_K, KIQ4_XS, KQ4_0, KQ5_0, KIQ4_NL, KTYPE_COUNT };
+enum ktype : int { KQ8_0 = 0, KQ2_0, KQ3_K, KQ4_K, KQ5_K, KQ6_K, KIQ4_XS, KQ4_0, KQ5_0, KIQ4_NL,
+                   KIQ2_XXS, KIQ2_XS, KIQ2_S, KIQ3_XXS, KIQ3_S, KIQ1_M, KTYPE_COUNT };
 
 // What an activation record holds besides the int8 values and the FP32 scale d of each 32-value block:
 //   ACT_D:  nothing (the second float of each pair is 0);
@@ -58,8 +66,8 @@ enum ktype : int { KQ8_0 = 0, KQ2_0, KQ3_K, KQ4_K, KQ5_K, KQ6_K, KIQ4_XS, KQ4_0,
 //           dp4a chain's initial value.
 enum act_kind { ACT_D = 0, ACT_DS = 1, ACT_DH = 2, ACT_DI = 3 };
 // The order of the int8 values in a block: as they come, IQ4_XS's lookup order, Q2_0's lookup order, Q5_0's order
-// (word m holds values m, m + 8, m + 16, m + 24).
-enum act_perm { PERM_NONE = 0, PERM_IQ4 = 1, PERM_Q2 = 2, PERM_Q5 = 3 };
+// (word m holds values m, m + 8, m + 16, m + 24), IQ1_M's order (mmvqp_iq::act_perm_iq1).
+enum act_perm { PERM_NONE = 0, PERM_IQ4 = 1, PERM_Q2 = 2, PERM_Q5 = 3, PERM_IQ1 = 4 };
 
 // Per type: UB bytes and UW weights per lane unit (a lane's share of one iteration), AL the unit's alignment in the
 // staging buffer, the activation records' contents and order.
@@ -75,6 +83,26 @@ template <> struct traits<KIQ4_XS> { static constexpr int UB = 136, UW = 256, AL
 template <> struct traits<KQ4_0>   { static constexpr int UB = 36,  UW = 64,  AL = 4,  ACT = ACT_DI, PERM = PERM_NONE; };
 template <> struct traits<KQ5_0>   { static constexpr int UB = 44,  UW = 64,  AL = 4,  ACT = ACT_DI, PERM = PERM_Q5;   };
 template <> struct traits<KIQ4_NL> { static constexpr int UB = 36,  UW = 64,  AL = 4,  ACT = ACT_D,  PERM = PERM_IQ4;  };
+// one 256-weight super-block per unit (Q713): the grid types' blocks are 2-byte aligned, IQ1_M's 56 bytes 8-byte aligned
+template <> struct traits<KIQ2_XXS> { static constexpr int UB = 66,  UW = 256, AL = 2, ACT = ACT_D, PERM = PERM_NONE; };
+template <> struct traits<KIQ2_XS>  { static constexpr int UB = 74,  UW = 256, AL = 2, ACT = ACT_D, PERM = PERM_NONE; };
+template <> struct traits<KIQ2_S>   { static constexpr int UB = 82,  UW = 256, AL = 2, ACT = ACT_D, PERM = PERM_NONE; };
+template <> struct traits<KIQ3_XXS> { static constexpr int UB = 98,  UW = 256, AL = 2, ACT = ACT_D, PERM = PERM_NONE; };
+template <> struct traits<KIQ3_S>   { static constexpr int UB = 110, UW = 256, AL = 2, ACT = ACT_D, PERM = PERM_NONE; };
+template <> struct traits<KIQ1_M>   { static constexpr int UB = 56,  UW = 256, AL = 8, ACT = ACT_D, PERM = PERM_IQ1;  };
+
+// The grid types and IQ1_M: their mmvqp_iq type (-1 for the other types) and the words of their grid in shared memory.
+template <int T> constexpr __host__ __device__ int gtype_of() {
+    return T == KIQ2_XXS ? mmvqp_iq::G_IQ2_XXS : T == KIQ2_XS ? mmvqp_iq::G_IQ2_XS : T == KIQ2_S ? mmvqp_iq::G_IQ2_S :
+        T == KIQ3_XXS ? mmvqp_iq::G_IQ3_XXS : T == KIQ3_S ? mmvqp_iq::G_IQ3_S : T == KIQ1_M ? mmvqp_iq::G_IQ1_M : -1;
+}
+template <int T> constexpr __host__ __device__ int grid_words() {
+    if constexpr (gtype_of<T>() >= 0) {
+        return mmvqp_iq::gtraits<gtype_of<T>()>::GW;
+    } else {
+        return 0;
+    }
+}
 
 // ACT_DI: the offset of the type's unsigned codes
 template <int T> constexpr __host__ __device__ int act_off() { return T == KQ4_0 ? -8 : T == KQ5_0 ? -16 : 0; }
@@ -101,7 +129,28 @@ inline type_info info(const int t) {
         case KQ4_0:   return { traits<KQ4_0>::UB,   traits<KQ4_0>::UW,   traits<KQ4_0>::AL,   rec_words<KQ4_0>()   };
         case KQ5_0:   return { traits<KQ5_0>::UB,   traits<KQ5_0>::UW,   traits<KQ5_0>::AL,   rec_words<KQ5_0>()   };
         case KIQ4_NL: return { traits<KIQ4_NL>::UB, traits<KIQ4_NL>::UW, traits<KIQ4_NL>::AL, rec_words<KIQ4_NL>() };
+#define KCOL_IQ_INFO(T) return { traits<T>::UB, traits<T>::UW, traits<T>::AL, rec_words<T>() }
+        case KIQ2_XXS: KCOL_IQ_INFO(KIQ2_XXS);
+        case KIQ2_XS:  KCOL_IQ_INFO(KIQ2_XS);
+        case KIQ2_S:   KCOL_IQ_INFO(KIQ2_S);
+        case KIQ3_XXS: KCOL_IQ_INFO(KIQ3_XXS);
+        case KIQ3_S:   KCOL_IQ_INFO(KIQ3_S);
+        case KIQ1_M:   KCOL_IQ_INFO(KIQ1_M);
+#undef KCOL_IQ_INFO
         default:      return { 0, 0, 0, 0 };
+    }
+}
+
+// Bytes of the grid a type's kernels keep in shared memory (the grid types and IQ1_M; 0 for the others).
+inline int grid_bytes(const int t) {
+    switch (t) {
+        case KIQ2_XXS: return 4 * grid_words<KIQ2_XXS>();
+        case KIQ2_XS:  return 4 * grid_words<KIQ2_XS>();
+        case KIQ2_S:   return 4 * grid_words<KIQ2_S>();
+        case KIQ3_XXS: return 4 * grid_words<KIQ3_XXS>();
+        case KIQ3_S:   return 4 * grid_words<KIQ3_S>();
+        case KIQ1_M:   return 4 * grid_words<KIQ1_M>();
+        default:       return 0;
     }
 }
 
@@ -189,6 +238,8 @@ static __host__ __device__ __forceinline__ int act_pos(const int i) {
     } else if constexpr (PERM == PERM_Q5) {
         // Q5_0's decoding returns weights (m, m + 8, m + 16, m + 24) as word m
         return 4 * (i & 7) + (i >> 3);
+    } else if constexpr (PERM == PERM_IQ1) {
+        return mmvqp_iq::act_perm_iq1(i);
     } else {
         return i;
     }
@@ -872,10 +923,61 @@ static KCOL_HD __forceinline__ void unit_q5_0(const unit_ptr (&wu)[R], const uin
     }
 }
 
+// The grid types and IQ1_M (Q713): one super-block per unit. Each row's super-block is read into registers once, each of
+// its 32-weight blocks decoded once (mmvqp_iq::decode32: 8 words of signed int8 weights, the integer scales of its two
+// halves) and dotted with every column: per 32 weights, row and column 8 dp4a and 4 FP32 operations, as Q6_K. tab: the
+// type's grid in shared memory.
+template <int NC, int R, int T>
+static KCOL_HD __forceinline__ void unit_iq(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
+                                            float (&acc)[R][NC], const uint32_t * tab) {
+    constexpr int G  = gtype_of<T>();
+    constexpr int NW = mmvqp_iq::gtraits<G>::NW;
+    static_assert(G >= 0 && traits<T>::UB == mmvqp_iq::gtraits<G>::BS, "a grid type or IQ1_M");
+    uint32_t w[R][NW];
+    float    dd[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        unit_words<traits<T>::AL, NW>(w[i], wu[i], 0);
+        dd[i] = mmvqp_iq::sblock_scale<G>(w[i]);
+    }
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        int   q[R][8];
+        float d0[R];
+        float d1[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            int ls0, ls1;
+            mmvqp_iq::decode32<G>(w[i], ib, tab, q[i], ls0, ls1);
+            d0[i] = dd[i] * (float) ls0;
+            d1[i] = dd[i] * (float) ls1;
+        }
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            act_blk a;
+            load_act<T>(a, act + j * cstride, ib);
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                int i0 = 0;
+                int i1 = 0;
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    i0 = dp4a(q[i][kk],     a.u[kk],     i0);
+                    i1 = dp4a(q[i][kk + 4], a.u[kk + 4], i1);
+                }
+                acc[i][j] = fmaf(fmaf((float) i1, d1[i], (float) i0 * d0[i]), a.d, acc[i][j]);
+            }
+        }
+    }
+}
+
 template <int T, int NC, int R>
 static KCOL_HD __forceinline__ void unit_dot(const unit_ptr (&wu)[R], const uint32_t * act, const int cstride,
-                                                float (&acc)[R][NC]) {
-    if constexpr (T == KQ8_0) {
+                                                float (&acc)[R][NC], const uint32_t * tab = nullptr) {
+    (void) tab;
+    if constexpr (gtype_of<T>() >= 0) {
+        unit_iq<NC, R, T>(wu, act, cstride, acc, tab);
+    } else if constexpr (T == KQ8_0) {
         unit_q8_0<NC, R>(wu, act, cstride, acc);
     } else if constexpr (T == KQ2_0) {
         unit_q2_0<NC, R>(wu, act, cstride, acc);
@@ -914,6 +1016,13 @@ struct args {
     int              gen;      // 0: each lane group stages its own rows' 16-byte segments; 1: the warp stages all its rows
     int              seg_log2; // gen: 16-byte units per row slot = 1 << seg_log2
     int              stride_col_dst;
+    const uint32_t * grid;     // grid types and IQ1_M: the grid in global memory (see grid_src)
+};
+
+// Where the kernels of a grid type (or IQ1_M) copy its grid from into shared memory: args::grid, unless the file that
+// launches them specializes this for the type (the fork's mmvq-pascal-kcol-<type>.cu: ggml's own device tables).
+template <int T> struct grid_src {
+    static __device__ __forceinline__ const uint32_t * get(const args & p) { return p.grid; }
 };
 
 // Bytes of one warp's staging buffer.
@@ -923,13 +1032,14 @@ inline __host__ __device__ int stage_bytes(const int UB, const int lpr_log2, con
 }
 
 // Grid: (row blocks, 1, 1), KCOL_NT threads; dynamic shared memory: the activation tile (NC columns of itt * L
-// records), then the 4 warps' staging buffers.
+// records), then the 4 warps' staging buffers, then (grid types and IQ1_M) the type's grid.
 template <int T, int NC, int R>
 __launch_bounds__(KCOL_NT, 2)
 static __global__ void mul_mat_kcol(const args p) {
     constexpr int UB = traits<T>::UB;
     constexpr int AL = traits<T>::AL;
     constexpr int RS = rec_words<T>();
+    constexpr int GW = grid_words<T>();
     extern __shared__ uint4 kcol_sm[];
 
     const int lane     = threadIdx.x % 32;
@@ -949,6 +1059,14 @@ static __global__ void mul_mat_kcol(const args p) {
     char     * sm_w   = (char *) kcol_sm + NC * cstride * 4 +
         wid * stage_bytes(UB, lpr_log2, R, p.gen, p.seg_log2);
     const int slot = p.gen ? 16 << p.seg_log2 : seg;          // bytes per row in the staging buffer
+    [[maybe_unused]] uint32_t * sm_tab = nullptr;              // the grid, copied before the first tile's barrier
+    if constexpr (GW > 0) {
+        sm_tab = (uint32_t *) ((char *) kcol_sm + NC * cstride * 4 + KCOL_NW * stage_bytes(UB, lpr_log2, R, p.gen, p.seg_log2));
+        const uint32_t * src = grid_src<T>::get(p);
+        for (int i = threadIdx.x; i < GW; i += KCOL_NT) {
+            sm_tab[i] = __ldg(src + i);
+        }
+    }
 
     // the lane group's rows (clamped, so that segment staging reads valid rows; their results are not written)
     const char * rw_x[R];
@@ -1029,7 +1147,7 @@ static __global__ void mul_mat_kcol(const args p) {
                 }
             }
             __syncwarp();
-            unit_dot<T, NC, R>(wu, sm_act + ((it << lpr_log2) + sl) * RS, cstride, acc);
+            unit_dot<T, NC, R>(wu, sm_act + ((it << lpr_log2) + sl) * RS, cstride, acc, sm_tab);
             __syncwarp();
         }
     }
@@ -1073,8 +1191,10 @@ struct shape {
 };
 
 // The launch shape for ncols columns: L the largest power of two (at most 32) that divides the row's units; R rows per
-// lane group (r_force if given, else 2, or 1 where 2 leaves fewer than 3 blocks per SM or no activation tile fits);
-// the largest activation tile (in iterations, itt_force if given) that fits smem_budget next to the staging buffers.
+// lane group (r_force if given, else 2, or 1 where 2 leaves fewer than 3 blocks per SM or no activation tile fits, and
+// for the 2-byte-aligned grid types);
+// the largest activation tile (in iterations, itt_force if given) that fits smem_budget next to the staging buffers
+// (and the grid of a grid type).
 // Returns false where the row width or the alignment doesn't fit the kernels.
 inline bool pick_shape(const int t, const int K, const int nrows, const int ncols, const int row_bytes, const uintptr_t x_addr,
                        const int nsm, const int r_force, const int itt_force, const int smem_budget, shape & s) {
@@ -1108,8 +1228,11 @@ inline bool pick_shape(const int t, const int K, const int nrows, const int ncol
     const int niter = nunits >> lpr_log2;
     const int budget = smem_budget > 0 && smem_budget <= KCOL_SMEM_MAX ? smem_budget : KCOL_SMEM_MAX;
     const int act_per_iter = ncols * (1 << lpr_log2) * ti.RS * 4;
-    for (int R = r_force > 0 ? r_force : 2; R >= 1; --R) {
-        const int wbytes = KCOL_NW * stage_bytes(ti.UB, lpr_log2, R, gen, seg_log2);
+    // the grid types start at R = 1: at R = 2 their decoding takes all 255 registers (some spill), and their shared memory
+    // allows 2 blocks per SM either way
+    const int r_max = grid_bytes(t) > 0 && ti.AL == 2 ? 1 : 2;
+    for (int R = r_force > 0 ? r_force : r_max; R >= 1; --R) {
+        const int wbytes = KCOL_NW * stage_bytes(ti.UB, lpr_log2, R, gen, seg_log2) + grid_bytes(t);
         if (wbytes + act_per_iter > budget) {
             if (r_force > 0) {
                 return false;
@@ -1156,6 +1279,7 @@ struct params {
     int           stride_col_y;
     int           stride_col_dst;
     shape         s;
+    const uint32_t * grid = nullptr; // grid types and IQ1_M: args::grid
 };
 
 template <int T, int NC, int R>
@@ -1197,6 +1321,7 @@ inline void launch(const params & p, cudaStream_t stream) {
     a.gen            = p.s.gen;
     a.seg_log2       = p.s.seg_log2;
     a.stride_col_dst = p.stride_col_dst;
+    a.grid           = p.grid;
     if (p.s.R == 1) {
         launch_cols<T, 1>(a, p.s, p.ncols, stream);
     } else {

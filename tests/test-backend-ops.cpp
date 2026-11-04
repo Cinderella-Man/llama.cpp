@@ -12756,6 +12756,89 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The five grid types (IQ2_XXS, IQ2_XS and IQ3_S since Q222; IQ2_S and IQ3_XXS) at Qwen3.8-Flash-Next's shapes on the
+    // Pascal matrix-vector kernels, 1 to 4 tokens: the routed experts' gate/up (2560 -> 640, 10 of 32 experts; one input
+    // for all, one per slot, and fused with SwiGLU), the shared expert's gate/up (2560 -> 640), attn_qkv, attn_gate,
+    // attn_q and attn_k (2560 -> 10240, 6144, 12288, 512), attn_output and ssm_out (6144 -> 2560). Rows of 10 super-blocks
+    // (K = 2560) stage with 4-byte loads, K = 1024 and 3072 with 8-byte loads, K = 2048 and 6144 with 16-byte loads; an
+    // odd row count; rows that are views of wider rows (K = 2560 of 3072); activations whose blocks sum past FP16's
+    // range; one-super-block rows (K = 256, left to mul_mat_vec_q). GGML_CUDA_MMVQ_PASCAL=2 runs the Pascal kernels on
+    // any GPU; GGML_CUDA_MMVQ_PASCAL_SKIP=iq2_xxs,iq2_xs,iq3_s leaves the new types to mul_mat_vec_q.
+    for (ggml_type type : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 640, 2560 }, { 10240, 2560 }, { 6144, 2560 }, { 12288, 2560 }, { 512, 2560 }, { 2560, 6144 },
+                    { 641, 2560 }, { 1000, 1024 }, { 768, 2048 }, { 333, 3072 }, { 64, 256 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 640, n, 2560, { 1, 1 }, { 1, 1 },
+                                                     { 0, 1, 2, 3 }, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, true,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 2560, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 32, 10, true));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 640, n, 2560, 32, 10));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 2560, n, 2560));
+        }
+        // the shared expert's fused gate/up, and one token with a fused bias
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 640, 2560, false, 1, 1, false,
+                                                            false, true, false, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 640, 2560, false, 1, 1, false,
+                                                            true, false, false, { 1, 1 }));
+        for (int64_t n : { 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 256, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 256, n, 2560));
+        }
+    }
+
+    // The grid types and IQ1_M in the k-column and multi-token kernels (Q713): 5 to 8 tokens of the grid types (1 to 4 are
+    // above), 1 to 8 of IQ1_M, which has no one-token Pascal kernel. Dense products (mmvq-pascal-kcol: one super-block per
+    // lane, 2-byte-aligned rows staged by the warp): K = 2560 (2 lanes per row), 6144 (8), 1024, 2048, 3072, an odd row
+    // count, rows that are views of wider rows, one-super-block rows (K = 256). Routed experts (mmvq-pascal-mtok-iq.cuh:
+    // each distinct expert read once): gate or up with one input for all slots and one per slot, K = 1024 (8-byte staging
+    // for IQ2_XXS and IQ3_S), the fused gate/up + SwiGLU (with a bias, with skipped slots), the routed + shared expert
+    // launch, duplicate routing, and consecutive tokens sharing experts (init_mul_mat_id_ids_overlap, partial row blocks
+    // at 641 rows). 32 of 64 experts at 5 to 8 tokens give more (token, slot) entries than the kernels take: those run in
+    // chunks of tokens on the earlier kernels. GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP=<types> and _KCOL_SKIP=<types> switch the
+    // new kernels off per type.
+    for (ggml_type type : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                            GGML_TYPE_IQ1_M }) {
+        const int64_t n0 = type == GGML_TYPE_IQ1_M ? 1 : 5;
+        for (int64_t n = n0; n <= 8; ++n) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 640, 2560 }, { 641, 2560 }, { 2560, 6144 }, { 1000, 1024 }, { 768, 2048 }, { 333, 3072 }, { 64, 256 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 640, n, 2560, { 1, 1 }, { 1, 1 },
+                                                     { 0, 1, 2, 3 }, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, true,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 1000, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 32, 10, true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 256, 2560, true, 16, 10, true,
+                                                                true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 256, 2560, true, 16, 10, true,
+                                                                false, true, false, { 4, 2 }, true));
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 256, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 256, n, 2560));
+            if (n >= 5) {
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 32, false, 256, n, 1024));
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 256, 1024, true, 64, 32,
+                                                                    true));
+            }
+        }
+        for (int64_t n : { 2, 3, 4, 5, 6, 7, 8 }) {
+            for (double keep : { 0.5, 1.0 }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion_overlap(type, n, 256, 2560, 32, 10, keep));
+                test_cases.emplace_back(new test_mul_mat_id_overlap(type, 32, 10, true, 256, n, 2560, keep));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion_overlap(type, n, 641, 2560, 16, 10, 0.5));
+            test_cases.emplace_back(new test_mul_mat_id_overlap(type, 32, 10, false, 1000, n, 1024, 0.5));
+        }
+    }
+
     // Q2_0 experts of 2 to 8 tokens (mmvq-pascal-mtok.cu: each distinct expert read once for all the tokens that picked
     // it): 5 to 8 tokens of the cases above (1 to 4 are there); routing where consecutive tokens share experts
     // (init_mul_mat_id_ids_overlap: groups of 1 to n entries) for the fused gate/up + SwiGLU (with and without a bias),
@@ -14119,6 +14202,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
+    // the grid types at 5 to 8 tokens and IQ1_M at 1 to 8 (Q713: the k-column and multi-token kernels), the shapes below:
+    // compare with GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP=<type> (dense) and GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP=<type> (experts);
+    // bench/mmvq_pascal/iq_kcol_perf.sh runs both
+    for (ggml_type type : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                            GGML_TYPE_IQ1_M }) {
+        for (int64_t n = type == GGML_TYPE_IQ1_M ? 1 : 5; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 128, 10, true));
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 10240, 2560 }, { 12288, 2560 }, { 6144, 2560 }, { 2560, 6144 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+
+    // the five grid types at Qwen3.8-Flash-Next's shapes, 1 to 4 tokens (Q222): one routed gate or up projection
+    // (2560 -> 640, 10 of 128 random experts per token), the fused routed gate/up + SwiGLU (perf mode times its last
+    // node; bench/mmvq_pascal/iq_perf.sh times it under GGML_CUDA_PROFILE), and the dense attention and recurrent
+    // shapes attn_qkv, attn_q, attn_gate (2560 -> 10240, 12288, 6144) and attn_output / ssm_out (6144 -> 2560). Every
+    // call reads 4 MB or more (the shared expert's 2560 -> 640, under 1 MB, would be timed from the 1.5 MB L2). Compare
+    // the Pascal kernels with GGML_CUDA_MMVQ_PASCAL_SKIP=<type>; GGML_TEST_RAW_QUANT=1 skips the slow quantization of
+    // the random weights.
+    for (ggml_type type : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+        for (int64_t n : { 1, 2, 3, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 128, 10, true));
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 10240, 2560 }, { 12288, 2560 }, { 6144, 2560 }, { 2560, 6144 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
         }
     }
 

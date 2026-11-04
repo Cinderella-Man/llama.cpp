@@ -8,6 +8,8 @@
 // k-token passes of speculative decoding, where kernels that loop over the columns cost 2.3x (BF16) to 2.8x (Q3_K,
 // IQ4_XS) a token at 4 tokens on Qwen3.8-Flash-Next's dense products. Types: Q8_0, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K,
 // IQ4_XS, and Q4_0, Q5_0 and IQ4_NL in rows of whole 64-weight pairs of blocks (the shared expert's down projections);
+// since Q713 the grid types IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ1_M (Swift's IQ attention, shared experts and
+// ssm_out at 2 to 8 tokens; one token keeps their one-token Pascal kernels, IQ1_M llama.cpp's);
 // plain 2-D products without fusion (MUL_MAT; the experts' MUL_MAT_ID stays with mmvq-pascal.cu).
 //
 // GGML_CUDA_MMVQ_PASCAL_KCOL: 0 off; 1 (default) 2 to 8 columns, and 1 column for Q3_K and IQ4_NL (which have no other
@@ -36,4 +38,10 @@ void ggml_cuda_kcol_launch_iq4_xs(const kcol::params & p, cudaStream_t stream);
 void ggml_cuda_kcol_launch_q4_0(const kcol::params & p, cudaStream_t stream);
 void ggml_cuda_kcol_launch_q5_0(const kcol::params & p, cudaStream_t stream);
 void ggml_cuda_kcol_launch_iq4_nl(const kcol::params & p, cudaStream_t stream);
+void ggml_cuda_kcol_launch_iq2_xxs(const kcol::params & p, cudaStream_t stream);
+void ggml_cuda_kcol_launch_iq2_xs(const kcol::params & p, cudaStream_t stream);
+void ggml_cuda_kcol_launch_iq2_s(const kcol::params & p, cudaStream_t stream);
+void ggml_cuda_kcol_launch_iq3_xxs(const kcol::params & p, cudaStream_t stream);
+void ggml_cuda_kcol_launch_iq3_s(const kcol::params & p, cudaStream_t stream);
+void ggml_cuda_kcol_launch_iq1_m(const kcol::params & p, cudaStream_t stream);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

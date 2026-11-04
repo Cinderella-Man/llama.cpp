@@ -1,6 +1,7 @@
 #include "mmvq-pascal-mtok.cuh"
 #include "mmvq-pascal.cuh"
 #include "mmvq-pascal-impl.cuh"
+#include "mmvq-pascal-mtok-iq.cuh"
 #include "unary.cuh"
 
 #include <algorithm>
@@ -521,6 +522,161 @@ static bool mtok_aligned(const void * ptr, const int64_t al) {
     return ptr == nullptr || (uintptr_t) ptr % al == 0;
 }
 
+// The types of mmvq-pascal-mtok-iq.cuh (Q713).
+static bool mtok_iq_type(const ggml_type type) {
+    return type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+        type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ1_M;
+}
+
+// Whether the comma-separated ggml type names of environment variable var list type.
+static bool mtok_env_lists(const char * var, const ggml_type type) {
+    const char * env = getenv(var);
+    const std::string list = env ? env : "";
+    size_t a = 0;
+    while (a < list.size()) {
+        size_t b = list.find(',', a);
+        if (b == std::string::npos) {
+            b = list.size();
+        }
+        if (list.compare(a, b - a, ggml_type_name(type)) == 0) {
+            return true;
+        }
+        a = b + 1;
+    }
+    return false;
+}
+
+// An IQ type is left to the other kernels when GGML_CUDA_MMVQ_PASCAL_SKIP lists it (all the Pascal kernels) or
+// GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP does (these only: 2 to 4 tokens then run mul_mat_vec_q_pascal_mc, 5 to 8 llama.cpp's
+// kernels, as before Q713). Read once per type.
+static bool mtok_iq_skipped(const ggml_type type) {
+    static int8_t skip[GGML_TYPE_COUNT];
+    static bool   init = [] {
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            skip[t] = mtok_iq_type((ggml_type) t) && (mtok_env_lists("GGML_CUDA_MMVQ_PASCAL_SKIP", (ggml_type) t) ||
+                mtok_env_lists("GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP", (ggml_type) t));
+        }
+        return true;
+    }();
+    GGML_UNUSED(init);
+    return skip[type] != 0;
+}
+
+// The grid types and IQ1_M (mmvq-pascal-mtok-iq.cuh): the arguments as for Q2_0.
+static bool mtok_iq_run(
+        const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
+        float * dst, int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t stride_row_x, int64_t stride_col_y,
+        int64_t stride_col_dst, int64_t nchannels_y, int64_t nchannels_dst, int64_t stride_channel_x,
+        int64_t stride_channel_y, int64_t stride_channel_dst, int64_t nsamples_x, int64_t nsamples_dst, int64_t stride_sample_x,
+        int64_t stride_sample_y, int64_t stride_sample_dst, int64_t ids_stride, cudaStream_t stream) {
+    if (ids == nullptr || ncols_dst < 2 || ncols_dst > MMVQP_MTOK_MAX_COLS || !mtok_config().on || mtok_iq_skipped(type) ||
+            !ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        return false;
+    }
+    if (fusion.x_scale || fusion.gate_scale || (fusion.shared_up && !fusion.gate)) {
+        return false;
+    }
+    const int64_t ne = ncols_dst * nchannels_dst;
+    if (ne > MMVQP_MTOK_MAX_ENTRIES || ncols_x % QK_K != 0) {
+        return false;
+    }
+    const bool    gate   = fusion.gate != nullptr;
+    const int64_t bs     = ggml_type_size(type);
+    const int64_t blocks = ncols_x / QK_K; // one super-block per lane and iteration
+    int lpr_log2 = 0;
+    while (lpr_log2 < 5 && blocks % (2 << lpr_log2) == 0) {
+        lpr_log2++;
+    }
+
+    // the one-token kernel's staging: the widest loads the rows and the segments allow
+    const int64_t row_bytes = stride_row_x * bs;
+    const auto x_aligned = [&](const int64_t al) {
+        return mtok_aligned(vx, al) && mtok_aligned(fusion.gate, al) && mtok_aligned(fusion.shared_up, al) &&
+            mtok_aligned(fusion.shared_gate, al) && row_bytes % al == 0 && (stride_channel_x * bs) % al == 0 &&
+            (stride_sample_x * bs) % al == 0;
+    };
+    int su = 0;
+    for (const int u : { 16, 8, 4 }) {
+        if ((bs << lpr_log2) % u == 0 && x_aligned(u)) {
+            su = u;
+            break;
+        }
+    }
+    if (su == 0 || row_bytes > INT_MAX || !mtok_aligned(vy, 4)) {
+        return false;
+    }
+
+    // the kernel keeps the offsets of each member's activations and outputs in an int
+    const int64_t y_extent = (nsamples_dst - 1) * stride_sample_y + (std::max(nchannels_y, nchannels_dst) - 1) *
+        stride_channel_y + (ncols_dst - 1) * stride_col_y + blocks * (QK_K / QK8_1);
+    const int64_t d_extent = (nsamples_dst - 1) * stride_sample_dst + (nchannels_dst - 1) * stride_channel_dst +
+        (ncols_dst - 1) * std::max(stride_col_dst, (int64_t) fusion.shared_stride_col_dst) + nrows_x;
+    if (y_extent * (int64_t) sizeof(block_q8_1) > INT_MAX || d_extent > INT_MAX) {
+        return false;
+    }
+
+    const int act_tok = (int) (blocks * (MMVQP_MTOK_IQ_ACT_RUN + 8 * 4));
+    const int gcap    = mtok_config().cap > 0 ? mtok_config().cap : (int) ncols_dst;
+    const int ntm     = std::max(gcap, fusion.shared_up ? (int) ncols_dst : 1);
+    const int smem    = ntm * act_tok;
+    int smem_static = 0;
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: smem_static = mtok_iq::static_smem<GGML_TYPE_IQ2_XXS>(); break;
+        case GGML_TYPE_IQ2_XS:  smem_static = mtok_iq::static_smem<GGML_TYPE_IQ2_XS>();  break;
+        case GGML_TYPE_IQ2_S:   smem_static = mtok_iq::static_smem<GGML_TYPE_IQ2_S>();   break;
+        case GGML_TYPE_IQ3_XXS: smem_static = mtok_iq::static_smem<GGML_TYPE_IQ3_XXS>(); break;
+        case GGML_TYPE_IQ3_S:   smem_static = mtok_iq::static_smem<GGML_TYPE_IQ3_S>();   break;
+        default:                smem_static = mtok_iq::static_smem<GGML_TYPE_IQ1_M>();   break;
+    }
+    if (smem + smem_static > 48 * 1024) {
+        return false;
+    }
+
+    const int64_t rows_per_block = MMVQP_MTOK_IQ_NWARPS * (WARP_SIZE >> lpr_log2);
+    const int     nrowblocks     = (int) ((nrows_x + rows_per_block - 1) / rows_per_block);
+    const int     rb             = std::min(nrowblocks, mtok_config().rb > 0 ? mtok_config().rb : (nrowblocks >= 8 ? 4 : 1));
+
+    mtok_iq::args p;
+    p.vx                 = (const char *) vx;
+    p.vy                 = (const char *) vy;
+    p.ids                = ids;
+    p.dst                = dst;
+    p.nrows              = (int) nrows_x;
+    p.row_bytes          = (int) row_bytes;
+    p.lpr_log2           = lpr_log2;
+    p.niter              = (int) (blocks >> lpr_log2);
+    p.nrowblocks         = nrowblocks;
+    p.rb                 = rb;
+    p.gcap               = gcap;
+    p.ncols              = (int) ncols_dst;
+    p.nslots             = (int) nchannels_dst;
+    p.ids_stride         = (int) ids_stride;
+    p.nchunk             = (int) blocks;
+    p.act_tok            = act_tok;
+    p.nchannels_y        = init_fastdiv_values(nchannels_y);
+    p.sample_ratio       = init_fastdiv_values(nsamples_dst / nsamples_x);
+    p.channel_bytes_x    = stride_channel_x * bs;
+    p.sample_bytes_x     = stride_sample_x * bs;
+    p.channel_bytes_y    = stride_channel_y * (int64_t) sizeof(block_q8_1);
+    p.sample_bytes_y     = stride_sample_y * (int64_t) sizeof(block_q8_1);
+    p.col_bytes_y        = stride_col_y * (int64_t) sizeof(block_q8_1);
+    p.stride_channel_dst = stride_channel_dst;
+    p.stride_sample_dst  = stride_sample_dst;
+    p.stride_col_dst     = stride_col_dst;
+
+    const dim3 grid((unsigned) ((nrowblocks + rb - 1) / rb), (unsigned) (ne + (fusion.shared_up ? 1 : 0)),
+                    (unsigned) nsamples_dst);
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: ggml_cuda_mtok_iq_launch_iq2_xxs(p, fusion, grid, smem, gate, su, ntm, stream); break;
+        case GGML_TYPE_IQ2_XS:  ggml_cuda_mtok_iq_launch_iq2_xs(p, fusion, grid, smem, gate, su, ntm, stream);  break;
+        case GGML_TYPE_IQ2_S:   ggml_cuda_mtok_iq_launch_iq2_s(p, fusion, grid, smem, gate, su, ntm, stream);   break;
+        case GGML_TYPE_IQ3_XXS: ggml_cuda_mtok_iq_launch_iq3_xxs(p, fusion, grid, smem, gate, su, ntm, stream); break;
+        case GGML_TYPE_IQ3_S:   ggml_cuda_mtok_iq_launch_iq3_s(p, fusion, grid, smem, gate, su, ntm, stream);   break;
+        default:                ggml_cuda_mtok_iq_launch_iq1_m(p, fusion, grid, smem, gate, su, ntm, stream);   break;
+    }
+    return true;
+}
+
 } // namespace
 
 bool ggml_cuda_mmvq_pascal_mtok(
@@ -530,6 +686,11 @@ bool ggml_cuda_mmvq_pascal_mtok(
         int64_t stride_channel_y, int64_t stride_channel_dst, int64_t nsamples_x, int64_t nsamples_dst, int64_t stride_sample_x,
         int64_t stride_sample_y, int64_t stride_sample_dst, int64_t ids_stride, cudaStream_t stream) {
     GGML_UNUSED(nchannels_x);
+    if (mtok_iq_type(type)) {
+        return mtok_iq_run(vx, type, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                           stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                           nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+    }
     if (type != GGML_TYPE_Q2_0 || ids == nullptr || ncols_dst < 2 || ncols_dst > MMVQP_MTOK_MAX_COLS ||
             !mtok_config().on || mtok_skip_q2_0() ||
             !ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
@@ -653,7 +814,16 @@ bool ggml_cuda_mmvq_pascal_mtok(
     return true;
 }
 
+bool ggml_cuda_mmvq_pascal_mtok_takes(const ggml_type type, const int cc) {
+    return mtok_iq_type(type) && mtok_config().on && !mtok_iq_skipped(type) && ggml_cuda_mmvq_pascal_active(cc);
+}
+
 #else
+
+bool ggml_cuda_mmvq_pascal_mtok_takes(const ggml_type type, const int cc) {
+    GGML_UNUSED_VARS(type, cc);
+    return false;
+}
 
 bool ggml_cuda_mmvq_pascal_mtok(
         const void * vx, ggml_type type, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,

@@ -78,6 +78,12 @@ static int kcol_type(const ggml_type type) {
         case GGML_TYPE_Q4_0:   return kcol::KQ4_0;
         case GGML_TYPE_Q5_0:   return kcol::KQ5_0;
         case GGML_TYPE_IQ4_NL: return kcol::KIQ4_NL;
+        case GGML_TYPE_IQ2_XXS: return kcol::KIQ2_XXS;
+        case GGML_TYPE_IQ2_XS:  return kcol::KIQ2_XS;
+        case GGML_TYPE_IQ2_S:   return kcol::KIQ2_S;
+        case GGML_TYPE_IQ3_XXS: return kcol::KIQ3_XXS;
+        case GGML_TYPE_IQ3_S:   return kcol::KIQ3_S;
+        case GGML_TYPE_IQ1_M:   return kcol::KIQ1_M;
         default:               return -1;
     }
 }
@@ -156,6 +162,12 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
         case kcol::KQ4_0:   ggml_cuda_kcol_launch_q4_0(p, stream);   break;
         case kcol::KQ5_0:   ggml_cuda_kcol_launch_q5_0(p, stream);   break;
         case kcol::KIQ4_NL: ggml_cuda_kcol_launch_iq4_nl(p, stream); break;
+        case kcol::KIQ2_XXS: ggml_cuda_kcol_launch_iq2_xxs(p, stream); break;
+        case kcol::KIQ2_XS:  ggml_cuda_kcol_launch_iq2_xs(p, stream);  break;
+        case kcol::KIQ2_S:   ggml_cuda_kcol_launch_iq2_s(p, stream);   break;
+        case kcol::KIQ3_XXS: ggml_cuda_kcol_launch_iq3_xxs(p, stream); break;
+        case kcol::KIQ3_S:   ggml_cuda_kcol_launch_iq3_s(p, stream);   break;
+        case kcol::KIQ1_M:   ggml_cuda_kcol_launch_iq1_m(p, stream);   break;
         default:            GGML_ABORT("fatal error");
     }
     CUDA_CHECK(cudaGetLastError());

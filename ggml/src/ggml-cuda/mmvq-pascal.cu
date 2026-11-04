@@ -46,6 +46,10 @@
 //     Qwen3.8-Flash-Next's 640-wide down projection: 180-byte rows, one lane per row, 36 bytes per iteration): each
 //     warp copies all its rows, which are contiguous, into dynamic shared memory once with coalesced 128-bit loads,
 //     then every lane reads its chunks from there, instead of each lane loading its own row 4 bytes at a time.
+//   - The grid types (IQ2_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ3_S) take one super-block per lane, staged as Q6_K. Each block
+//     copies its type's grid into shared memory first; a weight's sign is applied as sum(g * u) - 2 * sum((g & m) * u)
+//     with m the byte mask of the negative weights, and every scale multiplies its integer sum in FP32. The decoding of
+//     IQ2_XXS, IQ2_XS and IQ3_S is in mmvq-pascal-iq.cuh, free of ggml's headers so that it can be checked on a CPU.
 //   - Row pointers are computed once and advanced by a constant; partial sums are reduced with warp shuffles only.
 // The expert path (ids), the routed + shared expert launch (fusion.shared_up), biases and the GLU epilogue follow
 // mul_mat_vec_q exactly.
@@ -103,13 +107,17 @@ struct mmvqp_args_mc : mmvqp_args {
 
 enum mmvqp_fusion { MMVQP_PLAIN = 0, MMVQP_BIAS = 1, MMVQP_GATE = 2 };
 
-// Types whose blocks start at 2-byte boundaries (Q6_K 210 bytes, IQ2_S 82, IQ3_XXS 98): staged only, one super-block
-// per lane, read from shared memory with mmvqp_lds_h.
+// Types whose blocks start at 2-byte boundaries (Q6_K 210 bytes, IQ2_S 82, IQ3_XXS 98, IQ2_XXS 66, IQ2_XS 74, IQ3_S
+// 110): staged only, one super-block per lane, read from shared memory with mmvqp_lds_h.
 template <ggml_type type> constexpr __host__ __device__ bool mmvqp_halfword() {
-    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
+    return type == GGML_TYPE_Q6_K || mmvqp_grid_type<type>();
+}
+static bool mmvqp_grid_type_of(const ggml_type type) {
+    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+        type == GGML_TYPE_IQ3_S;
 }
 static bool mmvqp_halfword_type(const ggml_type type) {
-    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
+    return type == GGML_TYPE_Q6_K || mmvqp_grid_type_of(type);
 }
 
 // Staged weights: matrices staged at a time (the half-word types' gate and up one after the other: half the staging
@@ -958,7 +966,7 @@ bool ggml_cuda_mmvq_pascal(
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
             type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K &&
-            type != GGML_TYPE_Q2_0 && type != GGML_TYPE_IQ2_S && type != GGML_TYPE_IQ3_XXS) {
+            type != GGML_TYPE_Q2_0 && !mmvqp_grid_type_of(type)) {
         return false;
     }
     if (mmvqp_skip_type(type)) {
@@ -1102,7 +1110,7 @@ bool ggml_cuda_mmvq_pascal(
     dim3 grid((unsigned) ((nrows_x + rows_per_block - 1) / rows_per_block),
               (unsigned) (nblocks_y + (fusion.shared_up ? 1 : 0)), (unsigned) nsamples_dst);
     p.nrowblocks = (int) grid.x;
-    if (MMVQP_IQ_PERSIST > 0 && ncols_dst == 1 && (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS)) {
+    if (MMVQP_IQ_PERSIST > 0 && ncols_dst == 1 && mmvqp_grid_type_of(type)) {
         // MMVQP_IQ_PERSIST blocks per SM in all, over the experts (grid.y) and samples (grid.z)
         const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
         const int per = (int) (grid.y * grid.z);
@@ -1121,6 +1129,9 @@ bool ggml_cuda_mmvq_pascal(
         case GGML_TYPE_Q2_0: mmvqp_launch_shape<GGML_TYPE_Q2_0>(s, p, fusion, fk, grid, stream, su, smem); break;
         case GGML_TYPE_IQ2_S: mmvqp_launch_shape<GGML_TYPE_IQ2_S>(s, p, fusion, fk, grid, stream, su, smem); break;
         case GGML_TYPE_IQ3_XXS: mmvqp_launch_shape<GGML_TYPE_IQ3_XXS>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_IQ2_XXS: mmvqp_launch_shape<GGML_TYPE_IQ2_XXS>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_IQ2_XS:  mmvqp_launch_shape<GGML_TYPE_IQ2_XS>(s, p, fusion, fk, grid, stream, su, smem);  break;
+        case GGML_TYPE_IQ3_S:   mmvqp_launch_shape<GGML_TYPE_IQ3_S>(s, p, fusion, fk, grid, stream, su, smem);   break;
         default:             GGML_ABORT("fatal error");
     }
     return true;
