@@ -132,6 +132,19 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    # Extra nvcc options for the Pascal kernel files only (mmvq-pascal*.cu, mmvf-pascal*.cu, fattn-pascal.cu,
+    # fattn-tile-pascal.cu, moe-persistent.cu, gdn-fused.cu), so that a compiler-flag or register-budget A/B recompiles
+    # these files and nothing else. A ;-list of single-token options (nvcc's long forms, e.g. --ptxas-options=-dlcm=ca for
+    # -Xptxas -dlcm=ca; CMake does not split a source file's options at spaces), e.g.
+    #   -DGGML_CUDA_PASCAL_FLAGS="--ptxas-options=-dlcm=ca;-DMMVQP_IQ_MIN_BLOCKS=2"
+    set(GGML_CUDA_PASCAL_FLAGS "" CACHE STRING "extra nvcc options for the Pascal kernel files")
+    if (GGML_CUDA_PASCAL_FLAGS)
+        file(GLOB GGML_CUDA_PASCAL_SRCS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "mmvq-pascal*.cu" "mmvf-pascal*.cu"
+             "fattn-pascal.cu" "fattn-tile-pascal.cu" "moe-persistent.cu" "gdn-fused.cu")
+        set_source_files_properties(${GGML_CUDA_PASCAL_SRCS} PROPERTIES COMPILE_OPTIONS "${GGML_CUDA_PASCAL_FLAGS}")
+        message(STATUS "Extra nvcc options for the Pascal kernel files: ${GGML_CUDA_PASCAL_FLAGS}")
+    endif()
+
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()

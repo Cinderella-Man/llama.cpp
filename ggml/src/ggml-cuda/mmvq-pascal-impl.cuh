@@ -26,6 +26,9 @@ template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = s
 // P106 (one-token expert products at Ornith-1.5-122B's shapes, 2026-10-27):
 //   MMVQP_IQ_SIGN_LUT    1: a weight group's sign masks come from a shared-memory table; 0: from its sign bits, in registers
 //   MMVQP_IQ_MIN_BLOCKS  blocks per SM the compiler keeps registers for (__launch_bounds__), 1: no limit
+//   MMVQP_IQ_MC_MIN_BLOCKS  the same for the kernels of 2 to 4 tokens (default: MMVQP_IQ_MIN_BLOCKS)
+//   MMVQP_MIN_BLOCKS     the same for the other types' one-token kernels (default 1: no limit);
+//   MMVQP_MC_MIN_BLOCKS  and their kernels of 2 to 4 tokens (default: MMVQP_MIN_BLOCKS)
 //   MMVQP_IQ_R           rows per lane group
 //   MMVQP_IQ_PERSIST     one token: blocks per SM, each looping over row blocks, so a block fills its tables once for
 //                        many rows; 0: one block per row block
@@ -38,6 +41,15 @@ template <> struct mmvqp_traits<GGML_TYPE_IQ3_XXS> { static constexpr int bs = s
 #ifndef MMVQP_IQ_MIN_BLOCKS
 #define MMVQP_IQ_MIN_BLOCKS 3
 #endif
+#ifndef MMVQP_IQ_MC_MIN_BLOCKS
+#define MMVQP_IQ_MC_MIN_BLOCKS MMVQP_IQ_MIN_BLOCKS
+#endif
+#ifndef MMVQP_MIN_BLOCKS
+#define MMVQP_MIN_BLOCKS 1
+#endif
+#ifndef MMVQP_MC_MIN_BLOCKS
+#define MMVQP_MC_MIN_BLOCKS MMVQP_MIN_BLOCKS
+#endif
 #ifndef MMVQP_IQ_R
 #define MMVQP_IQ_R 1
 #endif
@@ -45,7 +57,10 @@ template <ggml_type type> constexpr __host__ __device__ bool mmvqp_grid_type() {
     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
 }
 template <ggml_type type> constexpr __host__ __device__ int mmvqp_min_blocks() {
-    return mmvqp_grid_type<type>() ? MMVQP_IQ_MIN_BLOCKS : 1;
+    return mmvqp_grid_type<type>() ? MMVQP_IQ_MIN_BLOCKS : MMVQP_MIN_BLOCKS;
+}
+template <ggml_type type> constexpr __host__ __device__ int mmvqp_min_blocks_mc() {
+    return mmvqp_grid_type<type>() ? MMVQP_IQ_MC_MIN_BLOCKS : MMVQP_MC_MIN_BLOCKS;
 }
 
 // Lookup tables of the grid types, copied into each block's shared memory by mmvqp_init_tabs (32-bit words): the grid

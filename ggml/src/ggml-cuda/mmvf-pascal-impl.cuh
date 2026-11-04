@@ -6,6 +6,15 @@
 #include <cstdint>
 
 #define MMVF_PASCAL_NT 128 // threads per block (4 warps)
+// MMVF_PASCAL_MIN_BLOCKS: blocks per SM the compiler keeps registers for (__launch_bounds__); 0: no limit
+#ifndef MMVF_PASCAL_MIN_BLOCKS
+#define MMVF_PASCAL_MIN_BLOCKS 0
+#endif
+#if MMVF_PASCAL_MIN_BLOCKS > 0
+#define MMVF_PASCAL_BOUNDS __launch_bounds__(MMVF_PASCAL_NT, MMVF_PASCAL_MIN_BLOCKS)
+#else
+#define MMVF_PASCAL_BOUNDS __launch_bounds__(MMVF_PASCAL_NT)
+#endif
 
 // 8 BF16 weights (one 16-byte load) times 8 FP32 activations, added to acc one weight at a time in column order. A
 // BF16 value is the upper half of an FP32 one, so moving it into place converts it exactly.
@@ -30,7 +39,7 @@ static __device__ __forceinline__ float mmvfp_dot8(const uint4 w, const float4 a
 // of a group holds all T * R sums, and lane lg writes those whose index t * R + i is lg modulo the group's lanes in the
 // warp, so a lane writes several outputs where T * R exceeds them.
 template <int G, int R, int T, bool has_bias>
-__launch_bounds__(MMVF_PASCAL_NT)
+MMVF_PASCAL_BOUNDS
 static __global__ void mul_mat_vec_bf16_pascal(
         const uint4 * __restrict__ x, const float4 * __restrict__ y, const float * __restrict__ bias, float * __restrict__ dst,
         const int nrows, const int nchunks, const int stride_row, const int stride_col_y4, const int stride_col_dst) {

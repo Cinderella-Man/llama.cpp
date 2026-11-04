@@ -425,7 +425,7 @@ static __global__ void mul_mat_vec_q_pascal_qkv(const mmvqp_args pq, const mmvqp
 // sa: each token's activation segment is copied into shared memory by the whole warp with coalesced 128-bit loads, and
 // every lane reads its blocks from there, instead of loading its own blocks from global memory at a stride of YB bytes.
 template <ggml_type type, int R, int C, bool staged, int fk, bool sa, int SU = 16, bool tile = false>
-__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, mmvqp_min_blocks<type>())
+__launch_bounds__(MMVQ_PASCAL_NWARPS*WARP_SIZE, mmvqp_min_blocks_mc<type>())
 static __global__ void mul_mat_vec_q_pascal_mc(const mmvqp_args_mc p, const ggml_cuda_mm_fusion_args_device fusion) {
     using unit_t = typename mmvqp_stage_unit<SU>::t;
     constexpr int NW = MMVQ_PASCAL_NWARPS;
