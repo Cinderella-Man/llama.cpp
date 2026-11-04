@@ -1328,6 +1328,27 @@ extern "C" {
     // number of candidates the model's output_screen is made for, 0 if the model has none
     LLAMA_API uint32_t llama_model_screen_head_m(const struct llama_model * model);
 
+    // Micro-batch taper: with layer-split pipeline parallelism a micro-batch crosses the devices one after another, so
+    // a decode call that starts on idle devices fills the pipeline with its first micro-batches, and the last ones
+    // before the caller waits (logits, a state read) drain it. The taper splits those ends of a call into smaller
+    // micro-batches and leaves the rest at n_ubatch, which stays the largest size. It applies to batches of token ids of
+    // one sequence and changes how a call is split, as n_ubatch does, not what is computed. Off by default;
+    // LLAMA_UBATCH_TAPER=<spec> sets it at context creation. spec: "off" (or "", "0"); "on" (or "1") =
+    // "head=256:64,tail=512:128,short=600:64"; or any of
+    //   head=N:S   the first N tokens of a call that starts with nothing in flight, in micro-batches of S tokens
+    //   tail=N:S   the last N tokens of a call that the caller waits for, in micro-batches of S tokens
+    //   short=N:S  a call that is both and holds N tokens or fewer: all of it in micro-batches of S tokens
+    //   min=N      no micro-batch under N tokens, a shorter remainder joins its neighbour (default 9: batches of 1-8
+    //              tokens take the matrix-vector kernels)
+    // comma-separated. Returns false and keeps the current schedule on a bad spec.
+    LLAMA_API bool         llama_set_ubatch_taper(struct llama_context * ctx, const char * spec);
+    // the current schedule as a spec, "off" when off
+    LLAMA_API const char * llama_get_ubatch_taper(const struct llama_context * ctx);
+    // what the caller knows about the next decode call only (llama_decode, llama_process): head = it starts on idle
+    // devices, tail = the caller waits for it; 1 = yes, 0 = no, -1 = the default (head when nothing was submitted
+    // since the last synchronize, tail always)
+    LLAMA_API void         llama_set_ubatch_taper_next(struct llama_context * ctx, int32_t head, int32_t tail);
+
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 

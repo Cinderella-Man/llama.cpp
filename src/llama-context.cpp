@@ -439,6 +439,13 @@ llama_context::llama_context(
         graph_reuse_wait = LLAMA_GRAPH_REUSE_WAIT ? (atoi(LLAMA_GRAPH_REUSE_WAIT) != 0) : graph_reuse_wait;
     }
 
+    // Q771: the micro-batch taper, off unless LLAMA_UBATCH_TAPER sets it (llama_set_ubatch_taper can change it later)
+    if (const char * LLAMA_UBATCH_TAPER = getenv("LLAMA_UBATCH_TAPER")) {
+        if (!set_ubatch_taper(LLAMA_UBATCH_TAPER)) {
+            LLAMA_LOG_WARN("%s: LLAMA_UBATCH_TAPER ignored, the micro-batch taper stays off\n", __func__);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -1646,6 +1653,32 @@ bool llama_context::get_screen_head() const {
     return cparams.screen_head;
 }
 
+bool llama_context::set_ubatch_taper(const char * spec) {
+    llama_ubatch_taper t;
+    std::string err;
+    if (!t.parse(spec, err)) {
+        LLAMA_LOG_ERROR("%s: bad micro-batch taper '%s': %s\n", __func__, spec ? spec : "", err.c_str());
+        return false;
+    }
+    const std::string s = t.str();
+    if (s != taper_spec) {
+        LLAMA_LOG_INFO("%s: micro-batch taper %s (n_ubatch %u)\n", __func__, s.c_str(), cparams.n_ubatch);
+    }
+    // the plan is made per call, so a change takes effect at the next decode call
+    taper      = t;
+    taper_spec = s;
+    return true;
+}
+
+const char * llama_context::get_ubatch_taper() const {
+    return taper_spec.c_str();
+}
+
+void llama_context::set_ubatch_taper_next(int32_t head, int32_t tail) {
+    taper_next_head = head < 0 ? -1 : head > 0;
+    taper_next_tail = tail < 0 ? -1 : tail > 0;
+}
+
 bool llama_context::head_shortlist_init(uint32_t k_low, uint32_t m_cap) {
     const ggml_tensor * output = model.output;
     if (output == nullptr || output->buffer == nullptr) {
@@ -2763,6 +2796,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // Q771: the caller's taper hints are for this call only
+    const int32_t taper_hint_head = taper_next_head;
+    const int32_t taper_hint_tail = taper_next_tail;
+    taper_next_head = -1;
+    taper_next_tail = -1;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2875,6 +2914,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // handle any pending shifts/copies
     memory_update(false);
 
+    // Q771: the micro-batch taper's plan for this call, which the memory module's splits follow; without one (taper off,
+    // other batches, or a plan equal to the plain split) they take n_ubatch tokens at a time as before. The head rule
+    // applies when nothing is in flight now (after every wait above), unless the caller said otherwise.
+    const bool taper_log = taper.enabled() && n_tokens_all > 8;
+    bool taper_head = false;
+    bool taper_tail = false;
+    std::vector<uint32_t> taper_sizes;
+    if (taper.enabled() && !embd_all && balloc->is_one_seq_tokens()) {
+        taper_head = taper_hint_head < 0 ? !gf_in_flight : taper_hint_head > 0;
+        taper_tail = taper_hint_tail != 0;
+        balloc->set_ubatch_plan(llama_ubatch_taper_plan(taper, n_tokens_all, cparams.n_ubatch, taper_head, taper_tail));
+    }
+
     llama_memory_context_ptr mctx;
 
     while (true) {
@@ -2954,6 +3006,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        if (taper_log) {
+            taper_sizes.push_back(ubatch.n_tokens);
+        }
 
         // count the outputs in this ubatch
         {
@@ -3218,6 +3274,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 output_ids[out_ids[i]] = i;
             }
         }
+    }
+
+    // Q771: the micro-batch sizes of this call, run-length coded (n x count)
+    if (taper_log) {
+        std::string sizes;
+        for (size_t i = 0; i < taper_sizes.size(); ) {
+            size_t j = i;
+            while (j < taper_sizes.size() && taper_sizes[j] == taper_sizes[i]) {
+                ++j;
+            }
+            sizes += (sizes.empty() ? "" : " ") + std::to_string(taper_sizes[i]) + (j - i > 1 ? "x" + std::to_string(j - i) : "");
+            i = j;
+        }
+        LLAMA_LOG_INFO("%s: ubatch taper: %u tokens, head %d, tail %d, %zu ubatches: %s\n", __func__, n_tokens_all,
+                (int) taper_head, (int) taper_tail, taper_sizes.size(), sizes.c_str());
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
@@ -5648,6 +5719,18 @@ void llama_set_screen_head(llama_context * ctx, bool enable) {
 
 bool llama_get_screen_head(const llama_context * ctx) {
     return ctx->get_screen_head();
+}
+
+bool llama_set_ubatch_taper(llama_context * ctx, const char * spec) {
+    return ctx->set_ubatch_taper(spec);
+}
+
+const char * llama_get_ubatch_taper(const llama_context * ctx) {
+    return ctx->get_ubatch_taper();
+}
+
+void llama_set_ubatch_taper_next(llama_context * ctx, int32_t head, int32_t tail) {
+    ctx->set_ubatch_taper_next(head, tail);
 }
 
 bool llama_head_shortlist_init(llama_context * ctx, uint32_t k_low, uint32_t m_cap) {

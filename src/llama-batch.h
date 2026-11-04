@@ -10,6 +10,7 @@
 #include <set>
 #include <bitset>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -154,6 +155,37 @@ struct llama_batch_ext {
     bool set_decision_order(int32_t idx, int32_t order);
 };
 
+// Micro-batch taper (Q771, LLAMA_UBATCH_TAPER, llama_set_ubatch_taper): with layer-split pipeline parallelism a
+// micro-batch crosses the devices one after another, so the first micro-batches of a call that starts on idle devices
+// fill the pipeline and the last ones before the caller waits drain it. The taper gives those ends of a call smaller
+// micro-batches and leaves the rest at n_ubatch. Sizes never exceed n_ubatch, so the reserved compute buffers hold.
+struct llama_ubatch_taper {
+    uint32_t head_n  = 0; // the first head_n tokens of a call that starts with nothing in flight,
+    uint32_t head_s  = 0; //     in micro-batches of head_s tokens (the remainder first)
+    uint32_t tail_n  = 0; // the last tail_n tokens of a call that the caller waits for,
+    uint32_t tail_s  = 0; //     in micro-batches of tail_s tokens (the remainder last)
+    uint32_t short_n = 0; // a call that is both and holds short_n tokens or fewer: all of it
+    uint32_t short_s = 0; //     in micro-batches of short_s tokens (the remainder last)
+    uint32_t min_s   = 9; // no planned micro-batch below min_s tokens (1-8 tokens take the matrix-vector products)
+
+    bool enabled() const {
+        return (head_n > 0 && head_s > 0) || (tail_n > 0 && tail_s > 0) || (short_n > 0 && short_s > 0);
+    }
+
+    // "", "0" or "off": off; "1" or "on": head=256:64,tail=512:128,short=600:64; otherwise any of head=N:S, tail=N:S,
+    // short=N:S and min=N, comma-separated (a rule left out is off, min 9); false with a message in err on a bad spec
+    bool parse(const char * spec, std::string & err);
+
+    // the spec of this schedule, "off" when off
+    std::string str() const;
+};
+
+// the ends (token offsets) of the micro-batches of a call of n_tokens under the taper; head: the call starts with
+// nothing in flight, tail: the caller waits after it. Empty when the taper leaves the call to n_ubatch (the split the
+// memory modules make without a plan).
+std::vector<uint32_t> llama_ubatch_taper_plan(
+        const llama_ubatch_taper & taper, uint32_t n_tokens, uint32_t n_ubatch, bool head, bool tail);
+
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
@@ -197,8 +229,21 @@ public:
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
 
+    // Q771: the ends (token offsets) of the micro-batches planned for the current batch (llama_ubatch_taper_plan);
+    // while set, a split takes at most the tokens up to the next planned end. init() clears it, empty = no plan
+    void set_ubatch_plan(std::vector<uint32_t> ends);
+
+    // the batches the taper applies to: token ids only (no embeddings, states, embd rows or decision orders), all
+    // of one sequence
+    bool is_one_seq_tokens() const;
+
 private:
     void clear();
+
+    // the most tokens the next split may take under the plan, n_ubatch without one
+    uint32_t plan_cap(uint32_t n_ubatch) const;
+
+    std::vector<uint32_t> ubatch_plan;
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed

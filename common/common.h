@@ -666,6 +666,7 @@ struct common_params {
     bool    checkpoint_vram_sync = false; // move an older one to the host at once, not in the background
     int32_t checkpoint_spread   = 0;     // context checkpoints at most N tokens apart inside a prompt, evicted by the smallest gap; 0 = off
     bool    checkpoint_tail2    = false; // two checkpoints at a prompt's end (4 + n_ubatch and 4 tokens before it), as stock
+    std::string ubatch_taper;            // micro-batch taper of the target context (llama_set_ubatch_taper); empty = as LLAMA_UBATCH_TAPER leaves it
 
     // agent sessions: checkpoints while generating, at tokens that end a reasoning block or start a tool call
     bool        checkpoint_gen     = false;

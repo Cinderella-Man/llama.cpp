@@ -1397,6 +1397,11 @@ private:
     int32_t ckpt_vram_stores = 0;
     std::map<int, ckpt_spill_job> ckpt_spills; // by slot id
 
+    // Q771: the target context's micro-batch taper: the server's (--ubatch-taper, else LLAMA_UBATCH_TAPER) and the one
+    // set now (a request's "ubatch_taper" sets it for the batches of its prompt)
+    std::string taper_default = "off";
+    std::string taper_cur     = "off";
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -2003,6 +2008,17 @@ private:
                 SRV_INF("generation checkpoints at %zu token(s) of '%s', %d tokens or more after the last checkpoint\n",
                         ckpt_gen_tokens.size(), params_base.checkpoint_gen_at.c_str(), params_base.checkpoint_gen_min);
             }
+        }
+
+        // Q771: the micro-batch taper of the target context's prompt calls: --ubatch-taper, else what LLAMA_UBATCH_TAPER set
+        if (!params_base.ubatch_taper.empty() && !llama_set_ubatch_taper(ctx_tgt, params_base.ubatch_taper.c_str())) {
+            SRV_ERR("bad --ubatch-taper '%s'\n", params_base.ubatch_taper.c_str());
+            return false;
+        }
+        taper_default = llama_get_ubatch_taper(ctx_tgt);
+        taper_cur     = taper_default;
+        if (taper_default != "off") {
+            SRV_INF("micro-batch taper of prompt calls: %s (n_ubatch %d)\n", taper_default.c_str(), (int) llama_n_ubatch(ctx_tgt));
         }
 
         if (!params_base.model_alias.empty()) {
@@ -4652,6 +4668,17 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+
+            // Q771: the micro-batch taper for this batch: the request's "ubatch_taper", else the server's
+            const std::string & taper_want = slot_batched->task && !slot_batched->task->params.ubatch_taper.empty()
+                ? slot_batched->task->params.ubatch_taper : taper_default;
+            if (taper_want != taper_cur) {
+                if (!llama_set_ubatch_taper(ctx_tgt, taper_want.c_str())) {
+                    SRV_WRN("bad ubatch_taper '%s' in a request - the server's (%s) instead\n", taper_want.c_str(), taper_default.c_str());
+                    llama_set_ubatch_taper(ctx_tgt, taper_default.c_str());
+                }
+                taper_cur = taper_want;
+            }
         }
 
         int32_t off_next = 0;
@@ -5819,6 +5846,10 @@ private:
                 screen_head_state = screen;
             }
         }
+
+        // Q771: the server waits after this call when it reads an output, and when a prompt batch stopped short of n_batch
+        // (for a checkpoint, a user message or the prompt's end); a full prompt batch is followed by the next one at once
+        llama_set_ubatch_taper_next(ctx_tgt, -1, (has_output || (int32_t) batch.view.size() < (int32_t) llama_n_batch(ctx_tgt)) ? 1 : 0);
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
