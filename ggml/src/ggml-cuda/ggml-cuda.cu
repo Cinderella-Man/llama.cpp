@@ -98,6 +98,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <tuple>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -5554,20 +5555,71 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 // GGML_CUDA_PROFILE=<file>: times every launch group (one node, or one group of fused nodes) of every graph evaluation
 // with CUDA events recorded between the groups and writes one CSV line per group to <file>. Under stream capture the
-// events become event-record nodes of the CUDA graph, so graph launches are timed as they run. NVIDIA's profilers
-// refuse the CMP mining GPUs (P106 and others); this works on any GPU. The stream is synchronized after every
-// evaluation, and each event adds a little GPU time.
+// events become event-record nodes of the CUDA graph, so graph launches are timed as they run (the profiler leaves
+// CUDA graphs on). NVIDIA's profilers refuse the CMP mining GPUs (P106 and others); this works on any GPU. The stream
+// is synchronized after every evaluation, and each event adds a little GPU time: on a P106 est. 7-9 us a group, so
+// small groups profile at several times their real time (Q681).
+//
+// GGML_CUDA_PROFILE_MODE picks what is timed (Q681); the CUDA graphs stay on in every mode:
+//   group       the default above, unchanged
+//   layer       an event where the layer of the launch groups changes (one segment per layer and card, plus
+//               "input", "output" and "other"), and an event pair around the whole evaluation
+//   sample=<N>  an event pair around every N-th launch group, the first one rotating by one per evaluation of the
+//               same graph, so N evaluations in a row time every group once; under CUDA graphs each of the N phases
+//               keeps its own captured executables (N times the graph memory; every phase is captured once after
+//               each warm-up), and an event pair around the whole evaluation
+//   graph       only an event pair around the whole evaluation (every chunk of a replayed CUDA graph)
+// These modes do not synchronize: an evaluation's events are read when the same graph (and phase) is evaluated
+// again, which in decoding is a token later, so the last evaluation of each graph is never written. An evaluation
+// whose last event has not completed by then is written as one "(not ready)" line, and a replay of graphs captured
+// before the loop last ran eagerly (whose events no longer match the spans) as one "(unmatched)" line, both with
+// group -1. Their file has the columns
+//   device,eval,host_ms,group,label,us,mode,graph,phase,how,groups,eval_groups,eval_us
+// with one line per timed span: host_ms when the evaluation was enqueued (ms since the profiler started); group the
+// span's first launch group; label the group's label (sample), "layer <n>"/"input"/"output"/"other" (layer) or
+// "graph"; us the span's GPU time; graph the graph's number on its device; phase the sampling phase; how "replay"
+// (a launch of captured CUDA graphs), "capture" or "eager"; groups the span's launch groups; eval_groups the
+// evaluation's; eval_us the GPU time of the whole evaluation. scripts/prof_summary.py reads both formats.
+struct ggml_cuda_profile_span {
+    int ev_start;   // index into events
+    int ev_end;
+    int group;      // first launch group
+    int n_groups;
+};
+
 struct ggml_cuda_profile_graph {
-    std::vector<cudaEvent_t> events;  // events[k] before group k, events[k + 1] after it
-    std::vector<std::string> labels;
+    std::vector<cudaEvent_t> events;  // group mode: events[k] before group k, events[k + 1] after it
+    std::vector<std::string> labels;  // group mode: one per launch group; the other modes: one per span
+    // the light modes
+    std::vector<ggml_cuda_profile_span> spans;
+    int          n_groups      = 0;       // launch groups when the loop last ran (eager or under capture)
+    bool         loop_captured = false;   // the loop last ran under capture: replays record these spans' events
+    int          graph_id      = -1;
+    cudaEvent_t  ev_eval[2]    = { nullptr, nullptr };  // around the whole evaluation, never inside a capture
+    bool         pending       = false;   // an evaluation whose events are not read yet
+    bool         pending_ok    = false;   // its in-graph events match `spans`
+    int64_t      pending_eval  = 0;
+    double       pending_host_ms = 0.0;
+    const char * pending_how   = "";
 };
 
 struct ggml_cuda_profile_state {
     FILE * f = nullptr;
     std::mutex mutex;
-    std::map<std::pair<const void *, const void *>, ggml_cuda_profile_graph> graphs; // (context, graph key)
-    std::map<int, int64_t> n_eval;                                                      // per device
+    ggml_cuda_profile_mode mode = GGML_CUDA_PROFILE_MODE_GROUP;
+    int sample_n = 1;
+    // (context, graph key, sampling phase); the phase is 0 outside sample mode
+    std::map<std::tuple<const void *, const void *, int>, ggml_cuda_profile_graph> graphs;
+    std::map<int, int64_t> n_eval;                                                         // per device
+    std::map<std::pair<const void *, const void *>, int64_t> n_graph_eval;  // per (context, graph key): sample phases
+    std::map<std::pair<const void *, const void *>, int> graph_ids;
+    std::map<int, int> n_graph_ids;                                         // per device
+    double last_flush_ms = 0.0;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+
+    double now_ms() const {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
 };
 
 static ggml_cuda_profile_state * ggml_cuda_profile() {
@@ -5576,14 +5628,39 @@ static ggml_cuda_profile_state * ggml_cuda_profile() {
         if (path == nullptr || path[0] == '\0') {
             return nullptr;
         }
+        const char * mode_env = getenv("GGML_CUDA_PROFILE_MODE");
+        ggml_cuda_profile_mode mode;
+        int sample_n;
+        if (!ggml_cuda_profile_parse_mode(mode_env, mode, sample_n)) {
+            GGML_ABORT("GGML_CUDA_PROFILE_MODE=%s: expected group, layer, sample=<1..%d> or graph",
+                       mode_env, GGML_CUDA_PROFILE_SAMPLE_MAX);
+        }
         ggml_cuda_profile_state * st = new ggml_cuda_profile_state;
+        st->mode     = mode;
+        st->sample_n = sample_n;
         st->f = fopen(path, "w");
         GGML_ASSERT(st->f != nullptr);
-        fprintf(st->f, "device,eval,host_ms,group,label,us\n");
-        GGML_LOG_INFO("%s: timing every launch group into %s\n", __func__, path);
+        if (mode == GGML_CUDA_PROFILE_MODE_GROUP) {
+            fprintf(st->f, "device,eval,host_ms,group,label,us\n");
+            GGML_LOG_INFO("%s: timing every launch group into %s\n", __func__, path);
+        } else {
+            setvbuf(st->f, nullptr, _IOFBF, 1 << 20);
+            fprintf(st->f, "device,eval,host_ms,group,label,us,mode,graph,phase,how,groups,eval_groups,eval_us\n");
+            GGML_LOG_INFO("%s: GGML_CUDA_PROFILE_MODE=%s%s: timing %s into %s, no synchronization\n", __func__,
+                          ggml_cuda_profile_mode_name(mode),
+                          mode == GGML_CUDA_PROFILE_MODE_SAMPLE ? ("=" + std::to_string(sample_n)).c_str() : "",
+                          mode == GGML_CUDA_PROFILE_MODE_LAYER  ? "each layer's launch groups" :
+                          mode == GGML_CUDA_PROFILE_MODE_SAMPLE ? "every N-th launch group, rotating" :
+                                                                  "whole evaluations",
+                          path);
+        }
         return st;
     }();
     return state;
+}
+
+static bool ggml_cuda_profile_light(const ggml_cuda_profile_state * prof) {
+    return prof != nullptr && prof->mode != GGML_CUDA_PROFILE_MODE_GROUP;
 }
 
 // "blk.12.ffn_up_exps.weight" -> "ffn_up_exps", "attn_norm-12" -> "attn_norm"
@@ -5654,7 +5731,7 @@ static void ggml_cuda_profile_record(ggml_cuda_profile_graph & pg, const size_t 
 static void ggml_cuda_profile_write(ggml_cuda_profile_state * prof, ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
     std::lock_guard<std::mutex> lock(prof->mutex);
-    const ggml_cuda_profile_graph & pg = prof->graphs[{ cuda_ctx, graph_key }];
+    const ggml_cuda_profile_graph & pg = prof->graphs[{ cuda_ctx, graph_key, 0 }];
     const int64_t eval = prof->n_eval[cuda_ctx->device]++;
     const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prof->t0).count();
     for (size_t k = 0; k < pg.labels.size(); ++k) {
@@ -5665,7 +5742,185 @@ static void ggml_cuda_profile_write(ggml_cuda_profile_state * prof, ggml_backend
     fflush(prof->f);
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+// The light modes. The layer of a node: its name, else a source weight's "blk.<n>." name.
+static int ggml_cuda_profile_layer(const ggml_tensor * node) {
+    const int layer = ggml_cuda_profile_layer_of_name(node->name);
+    if (layer != GGML_CUDA_PROFILE_LAYER_UNKNOWN) {
+        return layer;
+    }
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        if (node->src[j] != nullptr) {
+            const int w = ggml_cuda_profile_layer_of_weight(node->src[j]->name);
+            if (w != GGML_CUDA_PROFILE_LAYER_UNKNOWN) {
+                return w;
+            }
+        }
+    }
+    return GGML_CUDA_PROFILE_LAYER_UNKNOWN;
+}
+
+// sample mode: the phase of this evaluation of the graph (0 in the other modes)
+static int ggml_cuda_profile_next_phase(ggml_cuda_profile_state * prof, ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+    if (prof->mode != GGML_CUDA_PROFILE_MODE_SAMPLE) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(prof->mutex);
+    return (int) (prof->n_graph_eval[{ cuda_ctx, graph_key }]++ % prof->sample_n);
+}
+
+// writes the pending evaluation of pg: every span's GPU time, or one "(not ready)" line if its last event has not
+// completed (nothing waits for it); called with prof->mutex held
+static void ggml_cuda_profile_light_write(ggml_cuda_profile_state * prof, ggml_cuda_profile_graph & pg, const int device, const int phase) {
+    pg.pending = false;
+    const char * mode = ggml_cuda_profile_mode_name(prof->mode);
+    const cudaError_t st = cudaEventQuery(pg.ev_eval[1]);
+    if (st == cudaErrorNotReady) {
+        (void) cudaGetLastError(); // not an error
+    } else {
+        CUDA_CHECK(st);
+    }
+    if (st == cudaErrorNotReady || !pg.pending_ok) {
+        fprintf(prof->f, "%d,%" PRId64 ",%.3f,-1,%s,0.00,%s,%d,%d,%s,0,0,-1\n", device, pg.pending_eval,
+                pg.pending_host_ms, st == cudaErrorNotReady ? "(not ready)" : "(unmatched)", mode, pg.graph_id, phase,
+                pg.pending_how);
+        return;
+    }
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, pg.ev_eval[0], pg.ev_eval[1]));
+    const double eval_us = 1000.0 * ms;
+    if (prof->mode == GGML_CUDA_PROFILE_MODE_GRAPH) {
+        fprintf(prof->f, "%d,%" PRId64 ",%.3f,0,graph,%.2f,%s,%d,%d,%s,%d,%d,%.2f\n", device, pg.pending_eval,
+                pg.pending_host_ms, eval_us, mode, pg.graph_id, phase, pg.pending_how, pg.n_groups, pg.n_groups, eval_us);
+    } else {
+        for (size_t j = 0; j < pg.spans.size(); ++j) {
+            const ggml_cuda_profile_span & sp = pg.spans[j];
+            CUDA_CHECK(cudaEventElapsedTime(&ms, pg.events[sp.ev_start], pg.events[sp.ev_end]));
+            fprintf(prof->f, "%d,%" PRId64 ",%.3f,%d,%s,%.2f,%s,%d,%d,%s,%d,%d,%.2f\n", device, pg.pending_eval,
+                    pg.pending_host_ms, sp.group, pg.labels[j].c_str(), 1000.0 * ms, mode, pg.graph_id, phase,
+                    pg.pending_how, sp.n_groups, pg.n_groups, eval_us);
+        }
+    }
+    const double now = prof->now_ms();
+    if (now - prof->last_flush_ms >= 1000.0) {
+        fflush(prof->f);
+        prof->last_flush_ms = now;
+    }
+}
+
+// at the start of an evaluation, before any capture begins: write this graph and phase's previous evaluation, which
+// re-recording its events would overwrite, then record the evaluation's start event
+static ggml_cuda_profile_graph * ggml_cuda_profile_light_begin(ggml_cuda_profile_state * prof, ggml_backend_cuda_context * cuda_ctx, const void * graph_key, const int phase) {
+    std::lock_guard<std::mutex> lock(prof->mutex);
+    ggml_cuda_profile_graph & pg = prof->graphs[{ cuda_ctx, graph_key, phase }];
+    if (pg.ev_eval[0] == nullptr) {
+        CUDA_CHECK(cudaEventCreate(&pg.ev_eval[0]));
+        CUDA_CHECK(cudaEventCreate(&pg.ev_eval[1]));
+        const std::pair<const void *, const void *> key(cuda_ctx, graph_key);
+        auto [it, inserted] = prof->graph_ids.try_emplace(key, 0);
+        if (inserted) {
+            it->second = prof->n_graph_ids[cuda_ctx->device]++;
+        }
+        pg.graph_id = it->second;
+    }
+    if (pg.pending) {
+        ggml_cuda_profile_light_write(prof, pg, cuda_ctx->device, phase);
+    }
+    CUDA_CHECK(cudaEventRecord(pg.ev_eval[0], cuda_ctx->stream()));
+    return &pg;
+}
+
+// after the evaluation's last launch: record its end event; it is written at the next evaluation of the same graph
+static void ggml_cuda_profile_light_end(ggml_cuda_profile_state * prof, ggml_backend_cuda_context * cuda_ctx, ggml_cuda_profile_graph * pg, const char * how) {
+    std::lock_guard<std::mutex> lock(prof->mutex);
+    CUDA_CHECK(cudaEventRecord(pg->ev_eval[1], cuda_ctx->stream()));
+    pg->pending         = true;
+    // a replay records the events of the capture; if the loop ran eagerly since, `spans` describes something else
+    pg->pending_ok      = strcmp(how, "replay") != 0 || pg->loop_captured;
+    pg->pending_eval    = prof->n_eval[cuda_ctx->device]++;
+    pg->pending_host_ms = prof->now_ms();
+    pg->pending_how     = how;
+}
+
+// the light modes' events inside one run of the evaluation loop (eager or under capture); a replay of the captured
+// graphs records the same events at the same places, so the spans built here describe every replay
+struct ggml_cuda_profile_loop {
+    ggml_cuda_profile_state    * prof   = nullptr;
+    ggml_cuda_profile_graph    * pg     = nullptr;
+    ggml_backend_cuda_context  * cuda_ctx = nullptr;
+    int  phase   = 0;
+    int  k       = 0;      // launch groups so far
+    int  n_ev    = 0;      // events recorded so far
+    bool sampled = false;  // sample mode: the group being launched is timed
+    ggml_cuda_profile_layer_plan plan;
+
+    ggml_cuda_profile_loop(ggml_cuda_profile_state * prof, ggml_cuda_profile_graph * pg, ggml_backend_cuda_context * cuda_ctx, const int phase, const bool capturing) :
+        prof(prof), pg(pg), cuda_ctx(cuda_ctx), phase(phase) {
+        if (pg == nullptr) {
+            return;
+        }
+        pg->spans.clear();
+        pg->labels.clear();
+        pg->loop_captured = capturing;
+        if (prof->mode == GGML_CUDA_PROFILE_MODE_LAYER) {
+            plan.begin();
+            record();
+        }
+    }
+
+    void record() {
+        ggml_cuda_profile_record(*pg, n_ev++, cuda_ctx->stream());
+    }
+
+    // before launch group k, whose first node is cgraph->nodes[i]
+    void before(const ggml_cgraph * cgraph, const int i) {
+        if (pg == nullptr) {
+            return;
+        }
+        if (prof->mode == GGML_CUDA_PROFILE_MODE_LAYER) {
+            if (plan.group(ggml_cuda_profile_layer(cgraph->nodes[i]))) {
+                record();
+            }
+        } else if (prof->mode == GGML_CUDA_PROFILE_MODE_SAMPLE) {
+            sampled = ggml_cuda_profile_sampled(k, prof->sample_n, phase);
+            if (sampled) {
+                record();
+            }
+        }
+    }
+
+    // after launch group k, nodes i0..i1
+    void after(const ggml_cgraph * cgraph, const int i0, const int i1) {
+        if (pg == nullptr) {
+            return;
+        }
+        if (sampled) {
+            record();
+            pg->spans.push_back({ n_ev - 2, n_ev - 1, k, 1 });
+            pg->labels.push_back(ggml_cuda_profile_label(cgraph, i0, i1));
+            sampled = false;
+        }
+        k++;
+    }
+
+    void end() {
+        if (pg == nullptr) {
+            return;
+        }
+        if (prof->mode == GGML_CUDA_PROFILE_MODE_LAYER) {
+            if (plan.end()) {
+                record();
+            }
+            for (size_t j = 0; j < plan.segs.size(); ++j) {
+                const ggml_cuda_profile_layer_plan::segment & s = plan.segs[j];
+                pg->spans.push_back({ (int) j, (int) j + 1, s.first, s.n_groups });
+                pg->labels.push_back(ggml_cuda_profile_layer_label(s.layer));
+            }
+        }
+        pg->n_groups = k;
+    }
+};
+
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key, ggml_cuda_profile_graph * prof_light_graph, const int prof_phase) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5772,12 +6027,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             ggml_cuda_profile_state * prof = ggml_cuda_profile();
             ggml_cuda_profile_graph * prof_graph = nullptr;
-            if (prof) {
+            if (prof && prof->mode == GGML_CUDA_PROFILE_MODE_GROUP) {
                 std::lock_guard<std::mutex> lock(prof->mutex);
-                prof_graph = &prof->graphs[{ cuda_ctx, graph_key }];
+                prof_graph = &prof->graphs[{ cuda_ctx, graph_key, 0 }];
                 prof_graph->labels.clear();
                 ggml_cuda_profile_record(*prof_graph, 0, cuda_ctx->stream());
             }
+            // the loop runs under capture only when graphs are used
+            ggml_cuda_profile_loop prof_loop(prof, prof_light_graph, cuda_ctx, prof_phase, use_cuda_graph);
 
             cuda_ctx->q8_1_row.src = nullptr;
             cuda_ctx->q8_1_row.n_written = cuda_ctx->q8_1_row.n_written_add = 0;
@@ -5858,9 +6115,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 const ggml_tensor * q8_1_row_before = cuda_ctx->q8_1_row.src;
+                prof_loop.before(cgraph, i);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    prof_loop.after(cgraph, i, i + nodes_to_skip);
                     q8_1_row_check(i, i + nodes_to_skip, q8_1_row_before);
                     for (int j = i; cuda_ctx->moe_persistent.check_dst && j <= i + nodes_to_skip; ++j) {
                         ggml_cuda_moe_persistent_check_node(*cuda_ctx, cgraph->nodes[j]);
@@ -5900,6 +6159,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                prof_loop.after(cgraph, i, i);
                 q8_1_row_check(i, i, q8_1_row_before);
                 if (cuda_ctx->moe_persistent.check_dst) {
                     ggml_cuda_moe_persistent_check_node(*cuda_ctx, node);
@@ -5916,6 +6176,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             ggml_cuda_moe_persistent_end_graph(*cuda_ctx);
+            prof_loop.end();
 
             static const bool norm_q8_debug = [] {
                 const char * env = getenv("GGML_CUDA_NORM_Q8_DEBUG");
@@ -5960,7 +6221,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // USE_CUDA_GRAPH
     }
 
-    if (ggml_cuda_profile_state * prof = ggml_cuda_profile()) {
+    if (ggml_cuda_profile_state * prof = ggml_cuda_profile(); prof && prof->mode == GGML_CUDA_PROFILE_MODE_GROUP) {
         ggml_cuda_profile_write(prof, cuda_ctx, graph_key);
     }
 }
@@ -6070,12 +6331,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // GGML_CUDA_PROFILE_MODE other than group: sample mode's phase of this evaluation
+    ggml_cuda_profile_state * prof = ggml_cuda_profile();
+    const bool prof_light = ggml_cuda_profile_light(prof);
+    int prof_phase = 0;
+
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (prof_light && prof->mode == GGML_CUDA_PROFILE_MODE_SAMPLE) {
+        // the phase's own executables become graph->instances for this evaluation
+        prof_phase = ggml_cuda_profile_next_phase(prof, cuda_ctx, graph_key);
+        graph->profile_phases.select(graph->instances, prof_phase, prof->sample_n);
+    }
     // the persistent MoE kernel's check mode reads its counts on the host after every evaluation
     if (graph->is_enabled() && !ggml_cuda_moe_persistent_check_mode()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
@@ -6086,6 +6357,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
+                    graph->capture_gen++;
                     if (ggml_cuda_graph_debug_enabled()) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     }
@@ -6103,12 +6375,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     }
                 } else {
                     use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instances.empty();
+                    // sample mode: a phase's set captured before the latest warm-up has stale pointers
+                    cuda_graph_update_required = graph->instances.empty() || graph->profile_phases.stale(graph->capture_gen);
                 }
             }
         }
     }
+#else
+    if (prof_light) {
+        prof_phase = ggml_cuda_profile_next_phase(prof, cuda_ctx, graph_key);
+    }
 #endif // USE_CUDA_GRAPH
+
+    // the light modes' start event goes before any capture begins, so it is never a node of a graph
+    ggml_cuda_profile_graph * prof_light_graph = prof_light ? ggml_cuda_profile_light_begin(prof, cuda_ctx, graph_key, prof_phase) : nullptr;
+    const char * prof_how = !use_cuda_graph ? "eager" : cuda_graph_update_required ? "capture" : "replay";
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -6120,7 +6401,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, prof_light_graph, prof_phase);
+
+#ifdef USE_CUDA_GRAPH
+    if (use_cuda_graph && cuda_graph_update_required) {
+        graph->profile_phases.captured(graph->capture_gen);
+    }
+#endif // USE_CUDA_GRAPH
+
+    if (prof_light_graph) {
+        ggml_cuda_profile_light_end(prof, cuda_ctx, prof_light_graph, prof_how);
+    }
 
     if (prof_host) {
         ggml_cuda_profile_host_exit(prof_host, cuda_ctx);

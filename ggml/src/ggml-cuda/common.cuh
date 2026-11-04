@@ -21,6 +21,7 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "profile-light.h"
 
 #include <array>
 #include <algorithm>
@@ -1278,9 +1279,17 @@ struct ggml_cuda_graph {
         for (cudaGraphExec_t instance : instances) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
+        for (const std::vector<cudaGraphExec_t> & set : profile_phases.parked) {
+            for (cudaGraphExec_t instance : set) {
+                CUDA_CHECK(cudaGraphExecDestroy(instance));
+            }
+        }
     }
     // the ggml graph is captured as a series of CUDA graphs, so the GPU can run one chunk while the next is enqueued
     std::vector<cudaGraphExec_t> instances;
+    // GGML_CUDA_PROFILE_MODE=sample=<N>: the other phases' sets of chunk executables (profile-light.h); empty otherwise
+    ggml_cuda_profile_phase_sets<std::vector<cudaGraphExec_t>> profile_phases;
+    uint64_t capture_gen = 0; // completed warm-ups: a phase's set captured before the latest one has stale pointers
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
