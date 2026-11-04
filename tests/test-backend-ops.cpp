@@ -10971,7 +10971,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_N2P, GGML_TYPE_N3P,
+    GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_N2P_128, GGML_TYPE_N3P_128,
 };
 
 static const ggml_type base_types[] = {
@@ -11001,7 +11001,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_N2P, GGML_TYPE_N3P,
+    GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_N2P_128, GGML_TYPE_N3P_128,
     GGML_TYPE_BF16,
 };
 
@@ -12927,6 +12927,63 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // N2P and N3P (K = 2560: the routed gate/up) and N2P-128 and N3P-128 (K = 640: the routed down) at
+    // Qwen3.8-Flash-Next's shapes (Q928), 1 to 8 tokens: plain products (odd and partial row counts, other row widths,
+    // rows that are views of wider rows), the routed experts (10 of 32) with and without a fused gate, the routed + shared
+    // expert launch, repeated experts, routing that consecutive tokens share, activations whose blocks sum past FP16's
+    // range; and prompt-sized batches (MMQ). The 128-weight types' 640-wide rows are staged a warp tile at a time by the
+    // one-token and the multi-token kernels; experts of 2 to 8 tokens run the multi-token kernel (mmvq-pascal-mtok-np.cuh).
+    // GGML_CUDA_MMVQ_PASCAL=2 runs the Pascal kernels on any GPU, GGML_CUDA_MMVQ_PASCAL_MTOK=0 the earlier paths.
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 640, 2560 }, { 641, 2560 }, { 333, 2560 }, { 2560, 512 }, { 64, 768 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 256, n, 2560, { 1, 1 }, { 1, 1 },
+                                                     { 0, 1, 2, 3 }, 2816));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, true,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 32, 10, true));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 640, n, 2560, 32, 10));
+        }
+        for (ggml_type type : { GGML_TYPE_N2P_128, GGML_TYPE_N3P_128 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 2560, 640 }, { 2561, 640 }, { 2576, 640 }, { 1024, 1280 }, { 333, 768 }, { 64, 384 }, { 129, 128 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2560, n, 640, { 1, 1 }, { 1, 1 },
+                                                     { 0, 1, 2, 3 }, 768));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 2560, n, 640));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, true,  2560, n, 640));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 2561, n, 640));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 2560, 640, true, 32, 10, true));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 2560, n, 768, 32, 10));
+            test_cases.emplace_back(new test_mul_mat_large_act(type, 2560, n, 768));
+        }
+        for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P, GGML_TYPE_N2P_128, GGML_TYPE_N3P_128 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 1024, n, 256));
+            if (n >= 2) {
+                const bool    n2  = type == GGML_TYPE_N2P || type == GGML_TYPE_N3P;
+                const int64_t m_o = n2 ? 640 : 2560;
+                const int64_t k_o = n2 ? 2560 : 640;
+                test_cases.emplace_back(new test_mul_mat_id_overlap(type, 64, 10, n2, m_o, n, k_o, 0.5));
+                test_cases.emplace_back(new test_mul_mat_id_overlap(type, 64, 10, n2, m_o, n, k_o, 0.1));
+            }
+        }
+    }
+    for (int64_t n : { 9, 33, 128 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_N2P, GGML_TYPE_F32, 640, n, 2560, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_N2P, GGML_TYPE_F32, 32, 10, true, 640, n, 2560));
+        for (ggml_type type : { GGML_TYPE_N2P_128, GGML_TYPE_N3P_128 }) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2560, n, 640, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 333, n, 1280, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 2560, n, 640));
+        }
+    }
+
     // prompt-sized batches with Flint's expert routing (256 experts, 6 used), at reduced widths: from under one token
     // per expert up to a dozen, the regime of the MoE layout of the matrix-matrix kernels (MMQ, MMF); odd batch sizes
     // leave partial tiles. One case at Flint's own expert shapes.
@@ -14259,6 +14316,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (double keep : { 0.1, 0.5 }) {
             test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q2_0, 128, 10, true,  640, n, 2560, keep));
             test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q2_0, 128, 10, false, 2560, n, 640, keep));
+        }
+    }
+
+    // N2P and N3P (gate/up, K = 2560) and N2P-128 and N3P-128 (down, K = 640) at Qwen3.8-Flash-Next's expert shapes, 1
+    // to 8 tokens, as the Q2_0 cases above (10 of 128 random experts per token; Q928): one routed gate or up projection,
+    // the fused gate/up + SwiGLU (perf mode times its last node; GGML_CUDA_PROFILE times it whole), the down projection.
+    // Compare with the Q2_0 cases, GGML_CUDA_MMVQ_PASCAL_SKIP=<type> (llama.cpp's kernels) and GGML_CUDA_MMVQ_PASCAL_MTOK=0
+    // (2-8 tokens without the multi-token kernel); GGML_TEST_RAW_QUANT=1 skips quantizing the random weights.
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (ggml_type type : { GGML_TYPE_N2P, GGML_TYPE_N3P }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 128, 10, true));
+        }
+        for (ggml_type type : { GGML_TYPE_N2P_128, GGML_TYPE_N3P_128 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 10, false, 2560, n, 640));
         }
     }
 
