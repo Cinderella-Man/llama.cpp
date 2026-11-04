@@ -15,4 +15,8 @@ void ggml_cuda_kcol_launch_iq1_m(const kcol::params & p, cudaStream_t stream) {
     kcol::launch<kcol::KIQ1_M>(p, stream);
 }
 
+int ggml_cuda_kcol_blocks_iq1_m(const int ncols, const int R) {
+    return kcol::kernel_blocks<kcol::KIQ1_M>(ncols, R);
+}
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

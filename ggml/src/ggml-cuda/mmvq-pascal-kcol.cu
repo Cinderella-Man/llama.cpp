@@ -28,6 +28,7 @@ struct kcol_overrides {
     int itt;
     int smem;
     int nsm;
+    int smsm;
 };
 
 static const kcol_overrides & kcol_shape_env() {
@@ -36,6 +37,7 @@ static const kcol_overrides & kcol_shape_env() {
         kcol_env_int("GGML_CUDA_MMVQ_PASCAL_KCOL_ITT", 0),
         kcol_env_int("GGML_CUDA_MMVQ_PASCAL_KCOL_SMEM", 0),
         kcol_env_int("GGML_CUDA_MMVQ_PASCAL_KCOL_NSM", 0),
+        kcol_env_int("GGML_CUDA_MMVQ_PASCAL_KCOL_SMSM", 0),
     };
     return o;
 }
@@ -88,6 +90,100 @@ static int kcol_type(const ggml_type type) {
     }
 }
 
+// GGML_CUDA_MMVQ_PASCAL_KCOL_TABLE: 1 (default) the dispatch table below, 0 the k-column kernels wherever they take the
+// product (as before Q824)
+static bool kcol_table_on() {
+    static const bool on = kcol_env_int("GGML_CUDA_MMVQ_PASCAL_KCOL_TABLE", 1) != 0;
+    return on;
+}
+
+// Q824: the products of 2 to 8 columns that the other kernels (mul_mat_vec_q_pascal_mc, llama.cpp's mul_mat_vec_q) run
+// faster on a P106 than the k-column kernels with Q823's launch shapes: per type and row width (kmin <= K <= kmax
+// weights), bit k - 1 of mask set for k columns. From test-backend-ops perf inside ggml at Flash-Next's shapes, the
+// k-column side scaled by the bench's gain from Q823's shapes (llms-on-crypto-mining-rigs
+// docs/data/2026-11-04_kshape/ggml_est.tsv, from docs/data/2026-11-04_kcurve_p106/perf_dense.tsv, perf_cov.tsv and
+// perf_iq.md). Rows wider than 4096 weights are the 6144-wide ssm_out and attn_output and the retype's 10240-wide
+// hc_down, all 2560 or fewer rows; the narrower ones the 2560-wide attention, the output layer (Q5_K, Q6_K) and the
+// shared expert's 640-wide down projection (Q2_0, Q4_0, Q5_0). A product whose launch shape is pick_shape's fallback (no
+// tile within a third of the SM: the K-quants and IQ4_XS at K = 6144 from 4-6 columns on, Q6_K's 2560-wide rows) also
+// goes to the other kernels: wherever the perf runs timed such a shape, they were faster (level for Q4_K at 8 columns).
+struct kcol_rule {
+    ggml_type type;
+    int64_t   kmin;
+    int64_t   kmax;
+    uint32_t  mask;
+};
+#define KCOL_COLS(k) (1u << ((k) - 1))
+#define KCOL_COLS_2_8 0xFEu
+static const kcol_rule kcol_table[] = {
+    { GGML_TYPE_IQ4_XS,  4097, INT64_MAX, KCOL_COLS(2) | KCOL_COLS(5) | KCOL_COLS(6) | KCOL_COLS(7) | KCOL_COLS(8) },
+    { GGML_TYPE_Q4_K,    4097, INT64_MAX, KCOL_COLS(2) | KCOL_COLS(3) | KCOL_COLS(4) | KCOL_COLS(6) | KCOL_COLS(7) },
+    { GGML_TYPE_Q8_0,    4097, INT64_MAX, KCOL_COLS_2_8 },
+    { GGML_TYPE_IQ2_XXS, 4097, INT64_MAX, KCOL_COLS_2_8 },
+    { GGML_TYPE_IQ2_XS,  4097, INT64_MAX, KCOL_COLS_2_8 },
+    { GGML_TYPE_IQ2_S,   4097, INT64_MAX, KCOL_COLS_2_8 },
+    { GGML_TYPE_IQ3_XXS, 4097, INT64_MAX, KCOL_COLS_2_8 },
+    { GGML_TYPE_IQ3_S,   4097, INT64_MAX, KCOL_COLS_2_8 },
+    { GGML_TYPE_Q5_K,    0,    4096,      KCOL_COLS(2) | KCOL_COLS(3) },
+    { GGML_TYPE_Q6_K,    0,    4096,      KCOL_COLS_2_8 },
+    { GGML_TYPE_Q4_0,    0,    4096,      KCOL_COLS(2) | KCOL_COLS(3) | KCOL_COLS(4) },
+    { GGML_TYPE_Q5_0,    0,    4096,      KCOL_COLS(2) | KCOL_COLS(3) | KCOL_COLS(4) },
+    { GGML_TYPE_Q2_0,    0,    4096,      KCOL_COLS(2) },
+    { GGML_TYPE_IQ2_XXS, 0,    4096,      KCOL_COLS(2) },
+    { GGML_TYPE_IQ3_S,   0,    4096,      KCOL_COLS(2) | KCOL_COLS(3) },
+    { GGML_TYPE_IQ2_S,   0,    4096,      KCOL_COLS(3) },
+    { GGML_TYPE_IQ3_XXS, 0,    4096,      KCOL_COLS(3) },
+};
+#undef KCOL_COLS
+#undef KCOL_COLS_2_8
+
+// Whether the table leaves a product of ncols (2 to 8) columns of type with rows of K weights to the other kernels.
+static bool kcol_table_declines(const ggml_type type, const int64_t K, const int64_t ncols) {
+    for (const kcol_rule & r : kcol_table) {
+        if (r.type == type && K >= r.kmin && K <= r.kmax) {
+            return (r.mask >> (ncols - 1)) & 1u;
+        }
+    }
+    return false;
+}
+
+// kcol::blocks_fn: the resident blocks per SM that the registers of the type's kernel allow
+static int kcol_blocks(const int t, const int ncols, const int R) {
+    switch (t) {
+        case kcol::KQ8_0:    return ggml_cuda_kcol_blocks_q8_0(ncols, R);
+        case kcol::KQ2_0:    return ggml_cuda_kcol_blocks_q2_0(ncols, R);
+        case kcol::KQ3_K:    return ggml_cuda_kcol_blocks_q3_K(ncols, R);
+        case kcol::KQ4_K:    return ggml_cuda_kcol_blocks_q4_K(ncols, R);
+        case kcol::KQ5_K:    return ggml_cuda_kcol_blocks_q5_K(ncols, R);
+        case kcol::KQ6_K:    return ggml_cuda_kcol_blocks_q6_K(ncols, R);
+        case kcol::KIQ4_XS:  return ggml_cuda_kcol_blocks_iq4_xs(ncols, R);
+        case kcol::KQ4_0:    return ggml_cuda_kcol_blocks_q4_0(ncols, R);
+        case kcol::KQ5_0:    return ggml_cuda_kcol_blocks_q5_0(ncols, R);
+        case kcol::KIQ4_NL:  return ggml_cuda_kcol_blocks_iq4_nl(ncols, R);
+        case kcol::KIQ2_XXS: return ggml_cuda_kcol_blocks_iq2_xxs(ncols, R);
+        case kcol::KIQ2_XS:  return ggml_cuda_kcol_blocks_iq2_xs(ncols, R);
+        case kcol::KIQ2_S:   return ggml_cuda_kcol_blocks_iq2_s(ncols, R);
+        case kcol::KIQ3_XXS: return ggml_cuda_kcol_blocks_iq3_xxs(ncols, R);
+        case kcol::KIQ3_S:   return ggml_cuda_kcol_blocks_iq3_s(ncols, R);
+        case kcol::KIQ1_M:   return ggml_cuda_kcol_blocks_iq1_m(ncols, R);
+        default:             return 0;
+    }
+}
+
+// shared memory per SM of device dev, read once
+static int kcol_smem_sm(const int dev) {
+    static int smem[GGML_CUDA_MAX_DEVICES] = {};
+    if (smem[dev] == 0) {
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) != cudaSuccess || v <= 0) {
+            (void) cudaGetLastError();
+            v = 96 * 1024;
+        }
+        smem[dev] = v;
+    }
+    return smem[dev];
+}
+
 } // namespace
 
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -127,11 +223,20 @@ bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tens
         }
     }
 
+    // Q824: where the other kernels are faster (mode 1, 2 or more columns)
+    const bool table = mode == 1 && ncols >= 2 && kcol_table_on();
+    if (table && kcol_table_declines(src0->type, K, ncols)) {
+        return false;
+    }
+
     const kcol_overrides & o = kcol_shape_env();
     const int nsm = o.nsm > 0 ? o.nsm : ggml_cuda_info().devices[ctx.device].nsm;
     kcol::shape s;
     if (!kcol::pick_shape(t, (int) K, (int) nrows, (int) ncols, (int) src0->nb[1], (uintptr_t) src0->data, nsm, o.r, o.itt,
-                          o.smem, s)) {
+                          o.smem, s, o.smsm > 0 ? o.smsm : kcol_smem_sm(ctx.device), kcol_blocks)) {
+        return false;
+    }
+    if (table && s.fallback) {
         return false;
     }
 

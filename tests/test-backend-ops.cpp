@@ -12676,7 +12676,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 640 -> 2560 and 2560 -> 640 in Q2_0; the output layer's 2560-wide rows in Q5_K and Q6_K, at 4096 rows), odd row
     // counts, row widths that give each lane-group size and both staging modes, and rows that are views of wider rows
     // (2-byte-aligned rows for Q3_K). GGML_CUDA_MMVQ_PASCAL=2 runs them on any GPU, GGML_CUDA_MMVQ_PASCAL_KCOL=2 also on
-    // every one-token product, GGML_CUDA_MMVQ_PASCAL_KCOL_R and _ITT force the other launch shapes.
+    // every one-token product, GGML_CUDA_MMVQ_PASCAL_KCOL_R, _ITT and _SMEM force the other launch shapes (_SMEM=49152:
+    // the shapes before Q823). By default the dispatch table (Q824) leaves some types, row widths and token counts to
+    // the other kernels; =2 or GGML_CUDA_MMVQ_PASCAL_KCOL_TABLE=0 puts them on the k-column kernels.
     {
         struct kcol_case { ggml_type type; int64_t m, k, k_v; };
         const std::vector<kcol_case> kcol_cases = {
@@ -12852,9 +12854,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // it): 5 to 8 tokens of the cases above (1 to 4 are there); routing where consecutive tokens share experts
     // (init_mul_mat_id_ids_overlap: groups of 1 to n entries) for the fused gate/up + SwiGLU (with and without a bias),
     // one gate or up projection and the down projection at Flash-Next's shapes; partial row blocks staged by segment
-    // (641 rows) and by tile (2564), tiles of two lanes per row (K = 768), a fused gate with direct loads (K = 1280); all
-    // 512 experts at 3, 5 and 8 tokens. GGML_CUDA_MMVQ_PASCAL_MTOK=1,CAP,RB,G selects the group size, the row blocks per
-    // block and the gate's loads; =0 the earlier kernels.
+    // (641 rows) and by tile (2564), tiles of two lanes per row (K = 768), a fused gate with direct loads (K = 1280), a
+    // down projection with direct loads (2561 rows of 180 bytes: the matrix doesn't end at a 16-byte boundary); all
+    // 512 experts at 3, 5 and 8 tokens. Since Q825 the down projection's 180-byte rows take the tiles (before, the tile
+    // check also asked for 16-byte rows, and these cases ran on the earlier kernels). GGML_CUDA_MMVQ_PASCAL_MTOK=1,CAP,RB,G,T
+    // selects the group size, the row blocks per block, the gate's loads and (T = 0) direct loads for every product
+    // without a gate that would take tiles; =0 the earlier kernels.
     for (int64_t n : { 5, 6, 7, 8 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 32, 10, true,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 32, 10, false, 2560, n, 640));
@@ -12876,6 +12881,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion_overlap(GGML_TYPE_Q2_0, n, 512, 1280, 64, 10, 0.5));
         test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q2_0, 64, 10, true,  641, n, 2560, 0.5));
         test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q2_0, 64, 10, false, 2564, n, 640, 0.5));
+        test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q2_0, 64, 10, false, 2561, n, 640, 0.5));
         test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q2_0, 64, 10, false, 1024, n, 768, 0.5));
     }
     for (int64_t n : { 3, 5, 8 }) {

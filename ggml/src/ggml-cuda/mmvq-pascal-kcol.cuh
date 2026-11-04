@@ -16,9 +16,14 @@
 // Pascal kernel) and for Q8_0 rows whose 64-weight chunks aren't a multiple of 4 (the one-token kernel loads those 32
 // bits at a time); 2 every product of 1 to 8 columns of these types. GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP=q4_K,q6_K: types
 // left to the other kernels. GGML_CUDA_MMVQ_PASCAL_KCOL_R=1|2 rows per lane group, _KCOL_ITT=n iterations per activation
-// tile, _KCOL_SMEM=bytes of shared memory per block (at most 49152), _KCOL_NSM=n the SM count the shape is chosen for:
-// launch shapes for tuning. GGML_CUDA_MMVQ_PASCAL=0 turns these kernels off with the other Pascal kernels, =2 runs them
-// on any NVIDIA GPU (testing).
+// tile, _KCOL_SMEM=bytes of shared memory per block (at most 49152), _KCOL_NSM=n the SM count and _KCOL_SMSM=bytes the
+// shared memory per SM the shape is chosen for (=5 and =98304: a P106's shapes on another card): launch shapes for
+// tuning. Any of R, ITT and SMEM selects the shape as before Q823 with those values (_KCOL_SMEM=49152:
+// the default before Q823); without them the shape follows kcol::pick_shape's defaults (Q823: a third of the SM's shared
+// memory per block where the registers allow a third block). In mode 1 a dispatch table (Q824, mmvq-pascal-kcol.cu)
+// leaves the products of 2 to 8 columns that the other kernels run faster on a P106 to them, by type, row width and
+// column count; GGML_CUDA_MMVQ_PASCAL_KCOL_TABLE=0 turns it off. GGML_CUDA_MMVQ_PASCAL=0 turns these kernels off with the
+// other Pascal kernels, =2 runs them on any NVIDIA GPU (testing).
 
 // Runs dst = src0 * src1 if these kernels take it; returns false (nothing launched) otherwise.
 bool ggml_cuda_mmvq_pascal_kcol(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -44,4 +49,23 @@ void ggml_cuda_kcol_launch_iq2_s(const kcol::params & p, cudaStream_t stream);
 void ggml_cuda_kcol_launch_iq3_xxs(const kcol::params & p, cudaStream_t stream);
 void ggml_cuda_kcol_launch_iq3_s(const kcol::params & p, cudaStream_t stream);
 void ggml_cuda_kcol_launch_iq1_m(const kcol::params & p, cudaStream_t stream);
+
+// Per type: the resident blocks per SM that the registers of its kernel for ncols columns and R rows per lane group allow
+// (kcol::kernel_blocks; the launch shape's blocks_fn).
+int ggml_cuda_kcol_blocks_q8_0(int ncols, int R);
+int ggml_cuda_kcol_blocks_q2_0(int ncols, int R);
+int ggml_cuda_kcol_blocks_q3_K(int ncols, int R);
+int ggml_cuda_kcol_blocks_q4_K(int ncols, int R);
+int ggml_cuda_kcol_blocks_q5_K(int ncols, int R);
+int ggml_cuda_kcol_blocks_q6_K(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq4_xs(int ncols, int R);
+int ggml_cuda_kcol_blocks_q4_0(int ncols, int R);
+int ggml_cuda_kcol_blocks_q5_0(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq4_nl(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq2_xxs(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq2_xs(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq2_s(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq3_xxs(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq3_s(int ncols, int R);
+int ggml_cuda_kcol_blocks_iq1_m(int ncols, int R);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

@@ -15,4 +15,8 @@ void ggml_cuda_kcol_launch_iq3_xxs(const kcol::params & p, cudaStream_t stream) 
     kcol::launch<kcol::KIQ3_XXS>(p, stream);
 }
 
+int ggml_cuda_kcol_blocks_iq3_xxs(const int ncols, const int R) {
+    return kcol::kernel_blocks<kcol::KIQ3_XXS>(ncols, R);
+}
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

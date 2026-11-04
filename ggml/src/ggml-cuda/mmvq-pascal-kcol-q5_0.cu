@@ -8,4 +8,8 @@ void ggml_cuda_kcol_launch_q5_0(const kcol::params & p, cudaStream_t stream) {
     kcol::launch<kcol::KQ5_0>(p, stream);
 }
 
+int ggml_cuda_kcol_blocks_q5_0(const int ncols, const int R) {
+    return kcol::kernel_blocks<kcol::KQ5_0>(ncols, R);
+}
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

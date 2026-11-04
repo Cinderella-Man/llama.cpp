@@ -1191,16 +1191,36 @@ struct shape {
     int seg_log2;
     int smem;
     int nblocks;
+    int fallback; // 1: pick_shape's defaults found no tile within a third of the SM and took the shape before Q823
 };
 
-// The launch shape for ncols columns: L the largest power of two (at most 32) that divides the row's units; R rows per
-// lane group (r_force if given, else 2, or 1 where 2 leaves fewer than 3 blocks per SM or no activation tile fits, and
-// for the 2-byte-aligned grid types);
-// the largest activation tile (in iterations, itt_force if given) that fits smem_budget next to the staging buffers
-// (and the grid of a grid type).
+// Resident blocks per SM that the registers and threads of the kernel of type t for ncols columns and R rows per lane
+// group allow (no shared memory counted), or 0 where that is unknown: the caller's query of the compiled kernel
+// (kernel_blocks below).
+typedef int (*blocks_fn)(int t, int ncols, int R);
+
+// The launch shape for ncols columns: L the largest power of two (at most 32) that divides the row's units, then, by
+// default (Q823, from the P106's bench of every launch shape at Flash-Next's shapes and the in-model passes: the 32 KB
+// budget alone made every k-token pass 7.5-21.8 ms faster, docs/data/2026-11-04_kshape):
+//   - R = 2 rows per lane group only for 2 or more columns, where that leaves at least 8 blocks per SM, its registers
+//     allow 3 blocks per SM and its shape fits a third of the SM's shared memory; else R = 1. The grid types and IQ1_M
+//     always take R = 1 (at R = 2 their decoding takes most of the registers).
+//   - The largest activation tile (in iterations) that fits a third of the SM's shared memory (smem_sm / 3: 32 KB on a
+//     P106, so that a third block fits beside two), unless the kernel's registers allow only 2 blocks per SM (the grid
+//     types from about 4 columns on) or the grid has at most 2 blocks per SM: then the largest that fits 48 KB, since
+//     the smaller tile would buy no resident block.
+//   - Where no tile fits that, the shape before Q823 (below), with s.fallback = 1 (mmvq-pascal-kcol.cu leaves such
+//     products of 2 or more columns to the other kernels, Q824).
+// r_force, itt_force or smem_budget (GGML_CUDA_MMVQ_PASCAL_KCOL_R, _ITT, _SMEM) select the shape as before Q823: R rows
+// per lane group (r_force if given, else 2, or 1 where 2 leaves fewer than 3 blocks per SM or no activation tile fits, and
+// for the 2-byte-aligned grid types); the largest activation tile (at most itt_force) that fits smem_budget (48 KB if not
+// given) next to the staging buffers (and the grid of a grid type). _SMEM=49152 is the default before Q823.
+// smem_sm: shared memory per SM (0: 96 KB, as on every Pascal card of compute capability 6.1); blocks: see blocks_fn
+// (nullptr: registers taken to allow 3 blocks).
 // Returns false where the row width or the alignment doesn't fit the kernels.
 inline bool pick_shape(const int t, const int K, const int nrows, const int ncols, const int row_bytes, const uintptr_t x_addr,
-                       const int nsm, const int r_force, const int itt_force, const int smem_budget, shape & s) {
+                       const int nsm, const int r_force, const int itt_force, const int smem_budget, shape & s,
+                       const int smem_sm = 0, const blocks_fn blocks = nullptr) {
     const type_info ti = info(t);
     if (ti.UW == 0 || K % ti.UW != 0 || ncols < 1 || ncols > KCOL_MAX_COLS || nrows < 1) {
         return false;
@@ -1229,28 +1249,21 @@ inline bool pick_shape(const int t, const int K, const int nrows, const int ncol
         }
     }
     const int niter = nunits >> lpr_log2;
-    const int budget = smem_budget > 0 && smem_budget <= KCOL_SMEM_MAX ? smem_budget : KCOL_SMEM_MAX;
     const int act_per_iter = ncols * (1 << lpr_log2) * ti.RS * 4;
-    // the grid types start at R = 1: at R = 2 their decoding takes all 255 registers (some spill), and their shared memory
-    // allows 2 blocks per SM either way
-    const int r_max = grid_bytes(t) > 0 && ti.AL == 2 ? 1 : 2;
-    for (int R = r_force > 0 ? r_force : r_max; R >= 1; --R) {
+    const auto nblocks_of = [&](const int R) {
+        const int rows_per_block = KCOL_NW * (32 >> lpr_log2) * R;
+        return (nrows + rows_per_block - 1) / rows_per_block;
+    };
+    // R rows per lane group and the largest activation tile (at most itt_max iterations if given) that fits budget
+    const auto fit = [&](const int R, const int budget, const int itt_max) {
         const int wbytes = KCOL_NW * stage_bytes(ti.UB, lpr_log2, R, gen, seg_log2) + grid_bytes(t);
         if (wbytes + act_per_iter > budget) {
-            if (r_force > 0) {
-                return false;
-            }
-            continue;
+            return false;
         }
         int itt = (budget - wbytes) / act_per_iter;
         itt = itt < niter ? itt : niter;
-        if (itt_force > 0) {
-            itt = itt_force < itt ? itt_force : itt;
-        }
-        const int rows_per_block = KCOL_NW * (32 >> lpr_log2) * R;
-        const int nblocks = (nrows + rows_per_block - 1) / rows_per_block;
-        if (r_force <= 0 && R > 1 && nblocks < 3 * nsm) {
-            continue;
+        if (itt_max > 0) {
+            itt = itt_max < itt ? itt_max : itt;
         }
         s.lpr_log2 = lpr_log2;
         s.R        = R;
@@ -1258,11 +1271,87 @@ inline bool pick_shape(const int t, const int K, const int nrows, const int ncol
         s.gen      = gen;
         s.seg_log2 = seg_log2;
         s.smem     = wbytes + ncols * itt * (1 << lpr_log2) * ti.RS * 4;
-        s.nblocks  = nblocks;
+        s.nblocks  = nblocks_of(R);
+        s.fallback = 0;
+        return true;
+    };
+    // the shape before Q823: the grid types start at R = 1 (at R = 2 their decoding takes all 255 registers, some spill,
+    // and their shared memory allows 2 blocks per SM either way)
+    const auto pick_old = [&](const int budget) {
+        const int r_max = grid_bytes(t) > 0 && ti.AL == 2 ? 1 : 2;
+        for (int R = r_force > 0 ? r_force : r_max; R >= 1; --R) {
+            if (r_force <= 0 && R > 1 && nblocks_of(R) < 3 * nsm) {
+                continue;
+            }
+            if (fit(R, budget, itt_force)) {
+                return true;
+            }
+            if (r_force > 0) {
+                return false;
+            }
+        }
+        return false;
+    };
+    if (r_force > 0 || itt_force > 0 || smem_budget > 0) {
+        return pick_old(smem_budget > 0 && smem_budget <= KCOL_SMEM_MAX ? smem_budget : KCOL_SMEM_MAX);
+    }
+
+    // Q823: a third of the SM's shared memory per block where the registers allow a third block
+    const int third = (smem_sm > 0 ? smem_sm : 96 * 1024) / 3;
+    const int b3    = third < KCOL_SMEM_MAX ? third : KCOL_SMEM_MAX;
+    const auto regs_allow_3 = [&](const int R) {
+        const int b = blocks ? blocks(t, ncols, R) : 0;
+        return b <= 0 || b >= 3;
+    };
+    if (grid_bytes(t) == 0 && ncols >= 2 && nblocks_of(2) >= 8 * nsm && regs_allow_3(2) && fit(2, b3, 0)) {
         return true;
     }
-    return false;
+    if (fit(1, regs_allow_3(1) && nblocks_of(1) > 2 * nsm ? b3 : KCOL_SMEM_MAX, 0)) {
+        return true;
+    }
+    if (!pick_old(KCOL_SMEM_MAX)) {
+        return false;
+    }
+    s.fallback = 1;
+    return true;
 }
+
+#ifdef __CUDACC__
+// Resident blocks per SM that the registers and threads of mul_mat_kcol<T, NC, R> allow on the current device
+// (cudaOccupancyMaxActiveBlocksPerMultiprocessor without dynamic shared memory), queried once per kernel; 0 if the query
+// fails. For pick_shape's blocks_fn, from the file that compiles the type's kernels.
+template <int T, int NC, int R>
+inline int kernel_blocks_nc() {
+    static const int b = [] {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, mul_mat_kcol<T, NC, R>, KCOL_NT, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            n = 0;
+        }
+        return n;
+    }();
+    return b;
+}
+
+template <int T, int R>
+inline int kernel_blocks_r(const int ncols) {
+    switch (ncols) {
+        case 1:  return kernel_blocks_nc<T, 1, R>();
+        case 2:  return kernel_blocks_nc<T, 2, R>();
+        case 3:  return kernel_blocks_nc<T, 3, R>();
+        case 4:  return kernel_blocks_nc<T, 4, R>();
+        case 5:  return kernel_blocks_nc<T, 5, R>();
+        case 6:  return kernel_blocks_nc<T, 6, R>();
+        case 7:  return kernel_blocks_nc<T, 7, R>();
+        default: return kernel_blocks_nc<T, 8, R>();
+    }
+}
+
+template <int T>
+inline int kernel_blocks(const int ncols, const int R) {
+    return R == 1 ? kernel_blocks_r<T, 1>(ncols) : kernel_blocks_r<T, 2>(ncols);
+}
+#endif // __CUDACC__
 
 // Bytes of the activation records of ncols columns.
 inline size_t records_bytes(const int t, const int K, const int ncols) {
