@@ -228,10 +228,27 @@ struct kv_writer {
     }
 };
 
+// LLAMA_ARCHS_VOCAB=<gguf>: the tokenizer and chat template of a real model (its tokenizer.* keys, read from the file's
+// header) instead of the dummy one, for tests that need real text: grammars, chat templates, tool calls
+static gguf_context_ptr archs_vocab() {
+    const char * path = getenv("LLAMA_ARCHS_VOCAB");
+    if (path == nullptr || path[0] == 0) {
+        return gguf_context_ptr();
+    }
+    gguf_init_params params = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context_ptr vctx(gguf_init_from_file(path, params));
+    if (!vctx || gguf_find_key(vctx.get(), "tokenizer.ggml.tokens") < 0) {
+        throw std::runtime_error(std::string("LLAMA_ARCHS_VOCAB: no tokenizer in ") + path);
+    }
+    return vctx;
+}
+
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
-    const uint32_t n_ctx = 256;
+    // LLAMA_ARCHS_N_CTX=<n>: a longer training context, for prompts such as a chat template's tool list
+    const uint32_t n_ctx = getenv("LLAMA_ARCHS_N_CTX") ? (uint32_t) atoi(getenv("LLAMA_ARCHS_N_CTX")) : 256;
+    const gguf_context_ptr vocab_ctx = archs_vocab();
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -305,6 +322,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
     } else if (arch == LLM_ARCH_HRM_TEXT) {
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
+    }
+    if (vocab_ctx) {
+        n_vocab = (uint32_t) gguf_get_arr_n(vocab_ctx.get(), gguf_find_key(vocab_ctx.get(), "tokenizer.ggml.tokens"));
     }
 
     uint32_t n_head_kv = n_head;
@@ -648,6 +668,18 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_MUDD_TAP_INDICES,            std::vector<int32_t>({-1, -1, -1, -1, 0, 2, 1, 3}));
     }
 
+    if (vocab_ctx) {
+        // the real model's tokenizer.* keys: copy them all, then drop the others
+        gguf_context_ptr tok(gguf_init_empty());
+        gguf_set_kv(tok.get(), vocab_ctx.get());
+        for (int64_t i = gguf_get_n_kv(tok.get()) - 1; i >= 0; --i) {
+            const std::string key = gguf_get_key(tok.get(), i);
+            if (key.rfind("tokenizer.", 0) != 0) {
+                gguf_remove_key(tok.get(), key.c_str());
+            }
+        }
+        gguf_set_kv(ret.get(), tok.get());
+    } else
     // dummy tokenizer: token ids are derived from fixed-size chunks and detokenized as hex ids
     {
         std::vector<std::string> tokenizer_list(n_vocab);
