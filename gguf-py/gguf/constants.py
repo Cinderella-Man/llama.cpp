@@ -6746,6 +6746,8 @@ class GGMLQuantizationType(IntEnum):
     F8_E4M3 = 43
     N2P     = 500
     N3P     = 501
+    N2P_128 = 502
+    N3P_128 = 503
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6978,6 +6980,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F8_E4M3: (1, 1),
     GGMLQuantizationType.N2P:     (256, 2 + 16 + 4 + 64),
     GGMLQuantizationType.N3P:     (256, 2 + 2 + 4 + 64 + 32),
+    GGMLQuantizationType.N2P_128: (128, 32 + 8 + 2 + 2),
+    GGMLQuantizationType.N3P_128: (128, 32 + 16 + 2 + 2 + 2),
 }
 
 

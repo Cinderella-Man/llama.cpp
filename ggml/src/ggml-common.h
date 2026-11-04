@@ -175,6 +175,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_N3P (QK_K / (4*QR_N3P))
 #define QR_N3P 4
 
+#define QI_NP128 (QK_NP128 / (4*QR_NP128))
+#define QR_NP128 4
+
 #endif // GGML_COMMON_DECL_CUDA || GGML_COMMON_DECL_HIP
 
 #ifdef _MSC_VER
@@ -491,6 +494,31 @@ typedef struct {
     uint8_t   qh[QK_K/8];      // third bits
 } block_n3p;
 static_assert(sizeof(block_n3p) == sizeof(ggml_half) + 2 + QK_K/64 + QK_K/4 + QK_K/8, "wrong n3p block size/padding");
+
+// N2P-128 and N3P-128: N2P and N3P in blocks of 128 weights, for rows whose width is a multiple of 128 but not of 256
+// (Qwen3.8-Flash-Next's 640-wide expert down projections). The same levels, sub-blocks, scales and code packing; the
+// 32-bit fields come first, so that each is word-aligned relative to its block.
+#define QK_NP128 128
+// N2P-128: 44 bytes (2.75 bpw), so every block starts 4-byte aligned; extra and d share the last word.
+typedef struct {
+    uint8_t   qs[QK_NP128/4];      // 2-bit codes
+    uint8_t   scales[QK_NP128/16]; // 4-bit scale + 8 per 8 weights, low nibble first
+    uint8_t   extra[QK_NP128/64];  // shift bit per 8 weights
+    ggml_half d;
+} block_n2p_128;
+static_assert(sizeof(block_n2p_128) == sizeof(ggml_half) + QK_NP128/16 + QK_NP128/64 + QK_NP128/4, "wrong n2p_128 block size/padding");
+
+// N3P-128: 54 bytes (3.375 bpw), blocks start 2-byte aligned. The word after the code planes is N3P's first word
+// (d | extra << 16 | scales_h << 24), the half-word after it N3P's scales_l.
+typedef struct {
+    uint8_t   qs[QK_NP128/4];        // low 2 bits of the codes
+    uint8_t   qh[QK_NP128/8];        // third bits
+    ggml_half d;
+    uint8_t   extra;                 // shift bit per 32 weights (bits 0-3)
+    uint8_t   scales_h;              // bit 4 of each 5-bit scale (bits 0-3)
+    uint8_t   scales_l[QK_NP128/64]; // low 4 bits of the 5-bit scales (scale + 16), low nibble first
+} block_n3p_128;
+static_assert(sizeof(block_n3p_128) == sizeof(ggml_half) + 2 + QK_NP128/64 + QK_NP128/4 + QK_NP128/8, "wrong n3p_128 block size/padding");
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL

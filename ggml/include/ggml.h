@@ -437,7 +437,9 @@ extern "C" {
         // mainline's (numbered in sequence) and ik_llama.cpp's (133-161, 202-399)
         GGML_TYPE_N2P     = 500, // 2.6875 bpw: 4 levels and a shifted copy, 4-bit scale and shift bit per 8 weights
         GGML_TYPE_N3P     = 501, // 3.25 bpw: 8 levels and a shifted copy, 5-bit scale and shift bit per 32 weights
-        GGML_TYPE_COUNT   = 502,
+        GGML_TYPE_N2P_128 = 502, // N2P in 128-weight blocks (rows of 640 weights): 2.75 bpw
+        GGML_TYPE_N3P_128 = 503, // N3P in 128-weight blocks: 3.375 bpw
+        GGML_TYPE_COUNT   = 504,
     };
 
     // [TAG_GGML_PREC]

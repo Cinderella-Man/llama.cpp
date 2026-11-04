@@ -5204,12 +5204,13 @@ static float n2p_n3p_fit_scale(int n, const float * GGML_RESTRICT x, const float
     return best_e;
 }
 
-// One super-block in sub-blocks of bs weights: nl levels per table (values holds the table, then its shifted copy),
-// sub-scales in [qlo, qhi]. Writes the FP16 scale, the sub-scales, the table choices and the codes.
-static void n2p_n3p_quantize_superblock(const float * GGML_RESTRICT x, const float * GGML_RESTRICT w, int bs, int nl,
+// One super-block of n weights (QK_K, or QK_NP128 for N2P-128 and N3P-128) in sub-blocks of bs weights: nl levels per
+// table (values holds the table, then its shifted copy), sub-scales in [qlo, qhi]. Writes the FP16 scale, the
+// sub-scales, the table choices and the codes.
+static void n2p_n3p_quantize_superblock(const float * GGML_RESTRICT x, const float * GGML_RESTRICT w, int n, int bs, int nl,
         const int8_t * GGML_RESTRICT values, int qlo, int qhi, ggml_half * d, int8_t * GGML_RESTRICT sc,
         uint8_t * GGML_RESTRICT shift, uint8_t * GGML_RESTRICT idx) {
-    const int nsub = QK_K/bs;
+    const int nsub = n/bs;
     float s[QK_K/8];
     float smax = 0, ext = 0;
     for (int ib = 0; ib < nsub; ++ib) {
@@ -5256,8 +5257,8 @@ static void n2p_n3p_quantize_superblock(const float * GGML_RESTRICT x, const flo
     }
 }
 
-static void n2p_n3p_weights(const float * GGML_RESTRICT x, const float * GGML_RESTRICT qw, float sigma2, float * GGML_RESTRICT w) {
-    for (int j = 0; j < QK_K; ++j) {
+static void n2p_n3p_weights(const float * GGML_RESTRICT x, const float * GGML_RESTRICT qw, float sigma2, float * GGML_RESTRICT w, int n) {
+    for (int j = 0; j < n; ++j) {
         w[j] = (qw ? qw[j] : 1.0f) * sqrtf(sigma2 + x[j]*x[j]);
     }
 }
@@ -5270,38 +5271,162 @@ static float n2p_n3p_sigma2(const float * GGML_RESTRICT x, int64_t n) {
     return (float) (sumx2/n);
 }
 
-size_t quantize_n2p(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_ASSERT(n_per_row%QK_K == 0);
-    const int64_t nblock = n_per_row/QK_K;
+// The fields of one N2P or N2P-128 block (n = QK_K or QK_NP128 weights), and of one N3P or N3P-128 block.
+typedef struct {
+    uint8_t   * qs;
+    uint8_t   * scales;
+    uint8_t   * extra;
+    ggml_half * d;
+} n2p_fields;
+
+typedef struct {
+    uint8_t   * qs;
+    uint8_t   * qh;
+    uint8_t   * scales_l;
+    uint8_t   * extra;
+    uint8_t   * scales_h;
+    ggml_half * d;
+} n3p_fields;
+
+static n2p_fields n2p_block_fields(void * blocks, int64_t i, int n) {
+    if (n == QK_K) {
+        block_n2p * y = (block_n2p *) blocks + i;
+        return (n2p_fields) { y->qs, y->scales, y->extra, &y->d };
+    }
+    block_n2p_128 * y = (block_n2p_128 *) blocks + i;
+    return (n2p_fields) { y->qs, y->scales, y->extra, &y->d };
+}
+
+static n3p_fields n3p_block_fields(void * blocks, int64_t i, int n) {
+    if (n == QK_K) {
+        block_n3p * y = (block_n3p *) blocks + i;
+        return (n3p_fields) { y->qs, y->qh, y->scales_l, &y->extra, &y->scales_h, &y->d };
+    }
+    block_n3p_128 * y = (block_n3p_128 *) blocks + i;
+    return (n3p_fields) { y->qs, y->qh, y->scales_l, &y->extra, &y->scales_h, &y->d };
+}
+
+// N2P and N2P-128 (n weights a block): 4-bit sub-scales and shift bits per 8 weights.
+static size_t quantize_n2p_n(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row,
+        const float * quant_weights, int n) {
+    GGML_ASSERT(n_per_row%n == 0);
+    const int64_t nblock = n_per_row/n;
+    const size_t  bsize  = n == QK_K ? sizeof(block_n2p) : sizeof(block_n2p_128);
     char * qrow = (char *)dst;
     float   w[QK_K];
     int8_t  sc[QK_K/8];
     uint8_t shift[QK_K/8];
     uint8_t idx[QK_K];
     for (int64_t row = 0; row < nrow; ++row) {
-        block_n2p * y = (block_n2p *)qrow;
         const float sigma2 = n2p_n3p_sigma2(src, n_per_row);
         for (int64_t ibl = 0; ibl < nblock; ++ibl) {
-            const float * x = src + QK_K*ibl;
-            n2p_n3p_weights(x, quant_weights ? quant_weights + QK_K*ibl : NULL, sigma2, w);
-            n2p_n3p_quantize_superblock(x, w, 8, 4, kvalues_n2p, -8, 7, &y[ibl].d, sc, shift, idx);
-            memset(y[ibl].scales, 0, sizeof(y[ibl].scales));
-            memset(y[ibl].extra,  0, sizeof(y[ibl].extra));
-            memset(y[ibl].qs,     0, sizeof(y[ibl].qs));
-            for (int ib = 0; ib < QK_K/8; ++ib) {
-                y[ibl].scales[ib/2] |= (uint8_t) ((sc[ib] + 8) << 4*(ib%2));
-                y[ibl].extra[ib/8]  |= (uint8_t) (shift[ib] << (ib%8));
+            const float * x = src + n*ibl;
+            const n2p_fields y = n2p_block_fields(qrow, ibl, n);
+            n2p_n3p_weights(x, quant_weights ? quant_weights + n*ibl : NULL, sigma2, w, n);
+            n2p_n3p_quantize_superblock(x, w, n, 8, 4, kvalues_n2p, -8, 7, y.d, sc, shift, idx);
+            memset(y.scales, 0, n/16);
+            memset(y.extra,  0, n/64);
+            memset(y.qs,     0, n/4);
+            for (int ib = 0; ib < n/8; ++ib) {
+                y.scales[ib/2] |= (uint8_t) ((sc[ib] + 8) << 4*(ib%2));
+                y.extra[ib/8]  |= (uint8_t) (shift[ib] << (ib%8));
             }
-            for (int j = 0; j < QK_K; ++j) {
+            for (int j = 0; j < n; ++j) {
                 const int c = j & 15, h = c >> 2;
                 const int p = 16*(h >> 1) + 4*(c & 3) + 2*(h & 1);
-                y[ibl].qs[4*(j >> 4) + (p >> 3)] |= (uint8_t) (idx[j] << (p & 7));
+                y.qs[4*(j >> 4) + (p >> 3)] |= (uint8_t) (idx[j] << (p & 7));
             }
         }
         src += n_per_row;
-        qrow += nblock*sizeof(block_n2p);
+        qrow += nblock*bsize;
     }
-    return nrow * nblock * sizeof(block_n2p);
+    return nrow * nblock * bsize;
+}
+
+static void dequantize_row_n2p_n(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k, int n) {
+    assert(k % n == 0);
+    const int64_t nb = k / n;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const n2p_fields x = n2p_block_fields((void *) vx, i, n);
+        const float d = GGML_FP16_TO_FP32(*x.d);
+        for (int ib = 0; ib < n/8; ++ib) {
+            const float dl = d * (((x.scales[ib/2] >> 4*(ib%2)) & 0xf) - 8);
+            const int8_t * L = kvalues_n2p + 4*((x.extra[ib/8] >> (ib%8)) & 1);
+            for (int j = 0; j < 8; ++j) {
+                y[j] = dl * L[ggml_n2p_code(x.qs, 8*ib + j)];
+            }
+            y += 8;
+        }
+    }
+}
+
+// N3P and N3P-128 (n weights a block): 5-bit sub-scales and shift bits per 32 weights.
+static size_t quantize_n3p_n(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row,
+        const float * quant_weights, int n) {
+    GGML_ASSERT(n_per_row%n == 0);
+    const int64_t nblock = n_per_row/n;
+    const size_t  bsize  = n == QK_K ? sizeof(block_n3p) : sizeof(block_n3p_128);
+    char * qrow = (char *)dst;
+    float   w[QK_K];
+    int8_t  sc[QK_K/32];
+    uint8_t shift[QK_K/32];
+    uint8_t idx[QK_K];
+    for (int64_t row = 0; row < nrow; ++row) {
+        const float sigma2 = n2p_n3p_sigma2(src, n_per_row);
+        for (int64_t ibl = 0; ibl < nblock; ++ibl) {
+            const float * x = src + n*ibl;
+            const n3p_fields y = n3p_block_fields(qrow, ibl, n);
+            n2p_n3p_weights(x, quant_weights ? quant_weights + n*ibl : NULL, sigma2, w, n);
+            n2p_n3p_quantize_superblock(x, w, n, 32, 8, kvalues_n3p, -16, 15, y.d, sc, shift, idx);
+            *y.extra    = 0;
+            *y.scales_h = 0;
+            memset(y.scales_l, 0, n/64);
+            memset(y.qs,       0, n/4);
+            memset(y.qh,       0, n/8);
+            for (int ib = 0; ib < n/32; ++ib) {
+                const int ls = sc[ib] + 16;
+                y.scales_l[ib/2] |= (uint8_t) ((ls & 0xf) << 4*(ib%2));
+                *y.scales_h      |= (uint8_t) ((ls >> 4) << ib);
+                *y.extra         |= (uint8_t) (shift[ib] << ib);
+            }
+            for (int j = 0; j < n; ++j) {
+                const int c = j & 15, h = c >> 2;
+                const int p = 16*(h >> 1) + 4*(c & 3) + 2*(h & 1);
+                y.qs[4*(j >> 4) + (p >> 3)] |= (uint8_t) ((idx[j] & 3) << (p & 7));
+                const int c3 = j & 31, g = c3 >> 2;
+                const int p3 = 16*(g >> 2) + 4*(c3 & 3) + (g & 3);
+                y.qh[4*(j >> 5) + (p3 >> 3)] |= (uint8_t) ((idx[j] >> 2) << (p3 & 7));
+            }
+        }
+        src += n_per_row;
+        qrow += nblock*bsize;
+    }
+    return nrow * nblock * bsize;
+}
+
+static void dequantize_row_n3p_n(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k, int n) {
+    assert(k % n == 0);
+    const int64_t nb = k / n;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const n3p_fields x = n3p_block_fields((void *) vx, i, n);
+        const float d = GGML_FP16_TO_FP32(*x.d);
+        for (int ib = 0; ib < n/32; ++ib) {
+            const int ls = ((x.scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((*x.scales_h >> ib) & 1) << 4);
+            const float dl = d * (ls - 16);
+            const int8_t * L = kvalues_n3p + 8*((*x.extra >> ib) & 1);
+            for (int j = 0; j < 32; ++j) {
+                const int jj = 32*ib + j;
+                y[j] = dl * L[ggml_n2p_code(x.qs, jj) | (ggml_n3p_hbit(x.qh, jj) << 2)];
+            }
+            y += 32;
+        }
+    }
+}
+
+size_t quantize_n2p(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    return quantize_n2p_n(src, dst, nrow, n_per_row, quant_weights, QK_K);
 }
 
 void quantize_row_n2p_ref(const float * GGML_RESTRICT x, block_n2p * GGML_RESTRICT y, int64_t k) {
@@ -5310,61 +5435,11 @@ void quantize_row_n2p_ref(const float * GGML_RESTRICT x, block_n2p * GGML_RESTRI
 }
 
 void dequantize_row_n2p(const block_n2p * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-
-    for (int64_t i = 0; i < nb; i++) {
-        const float d = GGML_FP16_TO_FP32(x[i].d);
-        for (int ib = 0; ib < QK_K/8; ++ib) {
-            const float dl = d * (((x[i].scales[ib/2] >> 4*(ib%2)) & 0xf) - 8);
-            const int8_t * L = kvalues_n2p + 4*((x[i].extra[ib/8] >> (ib%8)) & 1);
-            for (int j = 0; j < 8; ++j) {
-                y[j] = dl * L[ggml_n2p_code(x[i].qs, 8*ib + j)];
-            }
-            y += 8;
-        }
-    }
+    dequantize_row_n2p_n(x, y, k, QK_K);
 }
 
 size_t quantize_n3p(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_ASSERT(n_per_row%QK_K == 0);
-    const int64_t nblock = n_per_row/QK_K;
-    char * qrow = (char *)dst;
-    float   w[QK_K];
-    int8_t  sc[QK_K/32];
-    uint8_t shift[QK_K/32];
-    uint8_t idx[QK_K];
-    for (int64_t row = 0; row < nrow; ++row) {
-        block_n3p * y = (block_n3p *)qrow;
-        const float sigma2 = n2p_n3p_sigma2(src, n_per_row);
-        for (int64_t ibl = 0; ibl < nblock; ++ibl) {
-            const float * x = src + QK_K*ibl;
-            n2p_n3p_weights(x, quant_weights ? quant_weights + QK_K*ibl : NULL, sigma2, w);
-            n2p_n3p_quantize_superblock(x, w, 32, 8, kvalues_n3p, -16, 15, &y[ibl].d, sc, shift, idx);
-            y[ibl].extra    = 0;
-            y[ibl].scales_h = 0;
-            memset(y[ibl].scales_l, 0, sizeof(y[ibl].scales_l));
-            memset(y[ibl].qs,       0, sizeof(y[ibl].qs));
-            memset(y[ibl].qh,       0, sizeof(y[ibl].qh));
-            for (int ib = 0; ib < QK_K/32; ++ib) {
-                const int ls = sc[ib] + 16;
-                y[ibl].scales_l[ib/2] |= (uint8_t) ((ls & 0xf) << 4*(ib%2));
-                y[ibl].scales_h       |= (uint8_t) ((ls >> 4) << ib);
-                y[ibl].extra          |= (uint8_t) (shift[ib] << ib);
-            }
-            for (int j = 0; j < QK_K; ++j) {
-                const int c = j & 15, h = c >> 2;
-                const int p = 16*(h >> 1) + 4*(c & 3) + 2*(h & 1);
-                y[ibl].qs[4*(j >> 4) + (p >> 3)] |= (uint8_t) ((idx[j] & 3) << (p & 7));
-                const int c3 = j & 31, g = c3 >> 2;
-                const int p3 = 16*(g >> 2) + 4*(c3 & 3) + (g & 3);
-                y[ibl].qh[4*(j >> 5) + (p3 >> 3)] |= (uint8_t) ((idx[j] >> 2) << (p3 & 7));
-            }
-        }
-        src += n_per_row;
-        qrow += nblock*sizeof(block_n3p);
-    }
-    return nrow * nblock * sizeof(block_n3p);
+    return quantize_n3p_n(src, dst, nrow, n_per_row, quant_weights, QK_K);
 }
 
 void quantize_row_n3p_ref(const float * GGML_RESTRICT x, block_n3p * GGML_RESTRICT y, int64_t k) {
@@ -5373,22 +5448,33 @@ void quantize_row_n3p_ref(const float * GGML_RESTRICT x, block_n3p * GGML_RESTRI
 }
 
 void dequantize_row_n3p(const block_n3p * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
+    dequantize_row_n3p_n(x, y, k, QK_K);
+}
 
-    for (int64_t i = 0; i < nb; i++) {
-        const float d = GGML_FP16_TO_FP32(x[i].d);
-        for (int ib = 0; ib < QK_K/32; ++ib) {
-            const int ls = ((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> ib) & 1) << 4);
-            const float dl = d * (ls - 16);
-            const int8_t * L = kvalues_n3p + 8*((x[i].extra >> ib) & 1);
-            for (int j = 0; j < 32; ++j) {
-                const int jj = 32*ib + j;
-                y[j] = dl * L[ggml_n2p_code(x[i].qs, jj) | (ggml_n3p_hbit(x[i].qh, jj) << 2)];
-            }
-            y += 32;
-        }
-    }
+size_t quantize_n2p_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    return quantize_n2p_n(src, dst, nrow, n_per_row, quant_weights, QK_NP128);
+}
+
+void quantize_row_n2p_128_ref(const float * GGML_RESTRICT x, block_n2p_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NP128 == 0);
+    quantize_n2p_128(x, y, 1, k, NULL);
+}
+
+void dequantize_row_n2p_128(const block_n2p_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_n2p_n(x, y, k, QK_NP128);
+}
+
+size_t quantize_n3p_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    return quantize_n3p_n(src, dst, nrow, n_per_row, quant_weights, QK_NP128);
+}
+
+void quantize_row_n3p_128_ref(const float * GGML_RESTRICT x, block_n3p_128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NP128 == 0);
+    quantize_n3p_128(x, y, 1, k, NULL);
+}
+
+void dequantize_row_n3p_128(const block_n3p_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_n3p_n(x, y, k, QK_NP128);
 }
 
 // =============================== 2.5625 bpw
@@ -5806,6 +5892,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_N3P:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_n3p, data, nb);
+            } break;
+        case GGML_TYPE_N2P_128:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_n2p_128, data, nb);
+            } break;
+        case GGML_TYPE_N3P_128:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_n3p_128, data, nb);
             } break;
         case GGML_TYPE_Q5_0:
             {

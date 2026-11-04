@@ -45,6 +45,8 @@ GGML_API void quantize_row_iq2_s_ref  (const float * GGML_RESTRICT x, block_iq2_
 
 GGML_API void quantize_row_n2p_ref(const float * GGML_RESTRICT x, block_n2p * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_n3p_ref(const float * GGML_RESTRICT x, block_n3p * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_n2p_128_ref(const float * GGML_RESTRICT x, block_n2p_128 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_n3p_128_ref(const float * GGML_RESTRICT x, block_n3p_128 * GGML_RESTRICT y, int64_t k);
 
 // Dequantization
 GGML_API void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
@@ -82,6 +84,8 @@ GGML_API void dequantize_row_iq3_s  (const block_iq3_s   * GGML_RESTRICT x, floa
 
 GGML_API void dequantize_row_n2p(const block_n2p * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_n3p(const block_n3p * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_n2p_128(const block_n2p_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_n3p_128(const block_n3p_128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 // Quantization utilizing an importance matrix (a.k.a. "Activation aWare Quantization")
 GGML_API size_t quantize_iq2_xxs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
@@ -96,6 +100,8 @@ GGML_API size_t quantize_iq3_s  (const float * GGML_RESTRICT src, void * GGML_RE
 
 GGML_API size_t quantize_n2p(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_n3p(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_n2p_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API size_t quantize_n3p_128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
 // Code positions of N2P and N3P super-blocks (see block_n2p and block_n3p in ggml-common.h): the 2-bit code of weight
 // j (0..255) in qs, and the third bit of an N3P code in qh.
