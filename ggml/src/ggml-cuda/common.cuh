@@ -1197,6 +1197,22 @@ struct ggml_cuda_type_traits<GGML_TYPE_N3P> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_N2P_128> {
+    static constexpr int qk = QK_NP128;
+    static constexpr int qr = QR_NP128;
+    static constexpr int qi = QI_NP128;
+    static constexpr int bs = sizeof(block_n2p_128);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_N3P_128> {
+    static constexpr int qk = QK_NP128;
+    static constexpr int qr = QR_NP128;
+    static constexpr int qi = QI_NP128;
+    static constexpr int bs = sizeof(block_n3p_128);
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR3_S;

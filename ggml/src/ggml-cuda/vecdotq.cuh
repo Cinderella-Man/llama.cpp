@@ -1493,13 +1493,17 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
 #define VDR_N3P_Q8_1_MMVQ 2
 #define VDR_N2P_Q8_1_MMQ  4 // MMQ loads both into the Q8_0 tile layout
 #define VDR_N3P_Q8_1_MMQ  4
+#define VDR_N2P_128_Q8_1_MMVQ 2
+#define VDR_N3P_128_Q8_1_MMVQ 2
 
 // N2P: 32 weights per call (Q8_1 block iqs/2), four 8-weight sub-blocks. A code word shifted by 0, 2, 16 or 18 bits is
 // the __byte_perm selector of 4 consecutive weights; the table register is chosen per sub-block by its shift bit.
-static __device__ __forceinline__ float vec_dot_n2p_q8_1(
+// block_t: block_n2p or block_n2p_128.
+template <typename block_t>
+static __device__ __forceinline__ float vec_dot_n2p_block_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
-    const block_n2p * bq = (const block_n2p *) vbq + kbx;
+    const block_t * bq = (const block_t *) vbq + kbx;
     const int ib32 = iqs/2;
 
     const int sc = bq->scales[2*ib32] | (bq->scales[2*ib32 + 1] << 8); // scales of the four sub-blocks
@@ -1526,22 +1530,25 @@ static __device__ __forceinline__ float vec_dot_n2p_q8_1(
 // N3P: one 32-weight sub-block per call. The selector of weights 4g..4g+3 takes the low code bits from the 2-bit plane
 // shifted by {0, 2, 16, 18}[g%4] and the third bits from the 1-bit plane shifted by 16*(g/4) + g%4 - 2 (bit 3 of each
 // selector nibble is ignored by __byte_perm).
-static __device__ __forceinline__ float vec_dot_n3p_q8_1(
+// block_t: block_n3p (8-byte-aligned blocks) or block_n3p_128 (2-byte-aligned: 16-bit loads).
+template <typename block_t>
+static __device__ __forceinline__ float vec_dot_n3p_block_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
-    const block_n3p * bq = (const block_n3p *) vbq + kbx;
+    const block_t * bq = (const block_t *) vbq + kbx;
+    constexpr bool b4 = sizeof(block_t) % 4 == 0;
     const int ib = iqs/2;
 
     const int  ls = (((bq->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((bq->scales_h >> ib) & 1) << 4)) - 16;
     const bool sh = (bq->extra >> ib) & 1;
     const uint32_t ta = sh ? N3P_TAB1A : N3P_TAB0A;
     const uint32_t tb = sh ? N3P_TAB1B : N3P_TAB0B;
-    const uint32_t hi = get_int_b4(bq->qh, ib);
+    const uint32_t hi = b4 ? get_int_b4(bq->qh, ib) : get_int_b2(bq->qh, ib);
 
     int sumi = 0;
 #pragma unroll
     for (int g = 0; g < 8; ++g) {
-        const uint32_t lo  = get_int_b4(bq->qs, 2*ib + g/4);
+        const uint32_t lo  = b4 ? get_int_b4(bq->qs, 2*ib + g/4) : get_int_b2(bq->qs, 2*ib + g/4);
         const int      t   = 16*((g%4)/2) + 2*(g%2);
         const int      s   = 16*(g/4) + g%4 - 2;
         const uint32_t hs  = s >= 0 ? hi >> s : hi << -s;
@@ -1551,4 +1558,25 @@ static __device__ __forceinline__ float vec_dot_n3p_q8_1(
 
     const float d = __half2float(bq->d) * __low2float(bq8_1[ib].ds);
     return d * (ls * sumi);
+}
+
+static __device__ __forceinline__ float vec_dot_n2p_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_n2p_block_q8_1<block_n2p>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_n3p_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_n3p_block_q8_1<block_n3p>(vbq, bq8_1, kbx, iqs);
+}
+
+// N2P-128 and N3P-128: the same per call, four Q8_1 blocks per 128-weight block (iqs 0..6)
+static __device__ __forceinline__ float vec_dot_n2p_128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_n2p_block_q8_1<block_n2p_128>(vbq, bq8_1, kbx, iqs);
+}
+
+static __device__ __forceinline__ float vec_dot_n3p_128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    return vec_dot_n3p_block_q8_1<block_n3p_128>(vbq, bq8_1, kbx, iqs);
 }

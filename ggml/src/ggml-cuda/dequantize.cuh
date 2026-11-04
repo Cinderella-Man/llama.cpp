@@ -449,10 +449,10 @@ static __device__ __forceinline__ int n3p_hbit(const uint8_t * qh, const int j) 
     return (qh[4*(j >> 5) + (p >> 3)] >> (p & 7)) & 1;
 }
 
-// 32 threads per super-block, 8 weights each (one N2P sub-block, a quarter of an N3P sub-block)
-template<typename dst_t>
-static __device__ __forceinline__ void dequantize_n2p(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
-    const block_n2p * x = (const block_n2p *) vx + ibs;
+// 32 threads per super-block (N2P-128, N3P-128: 16), 8 weights each (one N2P sub-block, a quarter of an N3P sub-block)
+template<typename block_t, typename dst_t>
+static __device__ __forceinline__ void dequantize_n2p_block(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    const block_t * x = (const block_t *) vx + ibs;
 
     const int ib = tid;
     const float d = (float)x->d * (((x->scales[ib/2] >> 4*(ib%2)) & 0xf) - 8);
@@ -463,9 +463,9 @@ static __device__ __forceinline__ void dequantize_n2p(const void * vx, const int
     }
 }
 
-template<typename dst_t>
-static __device__ __forceinline__ void dequantize_n3p(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
-    const block_n3p * x = (const block_n3p *) vx + ibs;
+template<typename block_t, typename dst_t>
+static __device__ __forceinline__ void dequantize_n3p_block(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    const block_t * x = (const block_t *) vx + ibs;
 
     const int ib = tid/4;
     const int ls = (((x->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x->scales_h >> ib) & 1) << 4)) - 16;
@@ -476,6 +476,26 @@ static __device__ __forceinline__ void dequantize_n3p(const void * vx, const int
         const int jj = 8*tid + j;
         y[j] = ggml_cuda_cast<dst_t>(d * L[n2p_code(x->qs, jj) | (n3p_hbit(x->qh, jj) << 2)]);
     }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_n2p(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_n2p_block<block_n2p, dst_t>(vx, ibs, yy, tid);
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_n3p(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_n3p_block<block_n3p, dst_t>(vx, ibs, yy, tid);
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_n2p_128(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_n2p_block<block_n2p_128, dst_t>(vx, ibs, yy, tid);
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_n3p_128(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    dequantize_n3p_block<block_n3p_128, dst_t>(vx, ibs, yy, tid);
 }
 
 template<typename dst_t>

@@ -123,6 +123,8 @@ static __device__ __forceinline__ void mmvqp_init_tabs(uint32_t * tab) {
 }
 template <> struct mmvqp_traits<GGML_TYPE_N2P>    { static constexpr int bs = sizeof(block_n2p);    static constexpr int na = QK_K / QK8_1; };
 template <> struct mmvqp_traits<GGML_TYPE_N3P>    { static constexpr int bs = sizeof(block_n3p);    static constexpr int na = QK_K / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_N2P_128> { static constexpr int bs = sizeof(block_n2p_128); static constexpr int na = QK_NP128 / QK8_1; };
+template <> struct mmvqp_traits<GGML_TYPE_N3P_128> { static constexpr int bs = sizeof(block_n3p_128); static constexpr int na = QK_NP128 / QK8_1; };
 
 constexpr __host__ __device__ int mmvqp_gcd(const int a, const int b) {
     return b == 0 ? a : mmvqp_gcd(b, a % b);
@@ -286,7 +288,8 @@ static __device__ __forceinline__ void mmvqp_load_act(mmvqp_act<NA> & a, const c
             }
             S = d8 * (float) sum;
         }
-        if constexpr (type == GGML_TYPE_Q8_0 || mmvqp_grid_type<type>() || type == GGML_TYPE_N2P || type == GGML_TYPE_N3P) {
+        if constexpr (type == GGML_TYPE_Q8_0 || mmvqp_grid_type<type>() || type == GGML_TYPE_N2P || type == GGML_TYPE_N3P ||
+                      type == GGML_TYPE_N2P_128 || type == GGML_TYPE_N3P_128) {
             a.d[b] = d8;
             a.s[b] = 0.0f;
         } else if constexpr (type == GGML_TYPE_Q4_0) {
@@ -592,15 +595,18 @@ static __device__ __forceinline__ float mmvqp_dot_iq3_xxs(const uint32_t * w, co
 // 4 weights (N3P: a second shift and a LOP3 to merge its third bits). Their levels carry their own offset: no activation
 // sums.
 
-// One N2P super-block as 22 words (4-byte aligned here): qs words 0..15 (word k: weights 16k..16k+15), scale words
-// 16..19 (a nibble per 8 weights), shift bits word 20, d in the low half of word 21; activation blocks a0..a0+7.
-template <int NA>
+// One N2P super-block (NB = 8 blocks of 32 weights) as 22 words (4-byte aligned here): qs words 0..15 (word k: weights
+// 16k..16k+15), scale words 16..19 (a nibble per 8 weights), shift bits word 20, d in the low half of word 21. One N2P-128
+// block (NB = 4) as 11 words: qs words 0..7, scale words 8..9, word 10 the shift bits (low half) and d (high half).
+// Activation blocks a0..a0+NB-1.
+template <int NB, int NA>
 static __device__ __forceinline__ float mmvqp_dot_n2p(const uint32_t * w, const mmvqp_act<NA> & a, const int a0, float acc) {
-    const uint32_t ex = w[20];
+    static_assert(NB == 8 || NB == 4, "N2P: 256 or 128 weights");
+    const uint32_t ex = w[5*NB/2];
     float sumf = 0.0f;
 #pragma unroll
-    for (int ib = 0; ib < 8; ++ib) {
-        const uint32_t sc = w[16 + ib/2] >> 16*(ib%2); // scales of sub-blocks 4ib..4ib+3
+    for (int ib = 0; ib < NB; ++ib) {
+        const uint32_t sc = w[2*NB + ib/2] >> 16*(ib%2); // scales of sub-blocks 4ib..4ib+3
         int isum = 0;
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
@@ -615,28 +621,35 @@ static __device__ __forceinline__ float mmvqp_dot_n2p(const uint32_t * w, const 
         }
         sumf = fmaf(a.d[a0 + ib], (float) isum, sumf);
     }
-    return fmaf(mmvqp_h2f_lo(w[21]), sumf, acc);
+    return fmaf(NB == 8 ? mmvqp_h2f_lo(w[21]) : mmvqp_h2f_hi(w[10]), sumf, acc);
 }
 
-// One N3P super-block as 26 words: d | extra << 16 | scales_h << 24, scales_l, qs words 2..17 (two per 32 weights), qh
-// words 18..25 (one per 32 weights); activation blocks a0..a0+7. The selector of weights 4g..4g+3 of a sub-block takes
-// the low code bits from qs shifted by {0, 2, 16, 18}[g%4] and the third bits from qh shifted by 16*(g/4) + g%4 - 2;
-// bit 3 of each selector nibble, which the merge fills with a neighbour's third bit, is ignored by __byte_perm.
-template <int NA>
+// One N3P super-block (NB = 8) as 26 words: d | extra << 16 | scales_h << 24, scales_l, qs words 2..17 (two per 32
+// weights), qh words 18..25 (one per 32 weights). One N3P-128 block (NB = 4) as 14 words: qs words 0..7, qh words 8..11,
+// then N3P's first word (12) and scales_l (the low half of word 13). Activation blocks a0..a0+NB-1. The selector of
+// weights 4g..4g+3 of a sub-block takes the low code bits from qs shifted by {0, 2, 16, 18}[g%4] and the third bits from
+// qh shifted by 16*(g/4) + g%4 - 2; bit 3 of each selector nibble, which the merge fills with a neighbour's third bit, is
+// ignored by __byte_perm.
+template <int NB, int NA>
 static __device__ __forceinline__ float mmvqp_dot_n3p(const uint32_t * w, const mmvqp_act<NA> & a, const int a0, float acc) {
-    const uint32_t w0 = w[0];
-    const uint32_t sl = w[1];
+    static_assert(NB == 8 || NB == 4, "N3P: 256 or 128 weights");
+    constexpr int QS = NB == 8 ?  2 :  0; // first qs word
+    constexpr int QH = NB == 8 ? 18 :  8; // first qh word
+    constexpr int W0 = NB == 8 ?  0 : 12; // d | extra << 16 | scales_h << 24
+    constexpr int SL = NB == 8 ?  1 : 13; // scales_l
+    const uint32_t w0 = w[W0];
+    const uint32_t sl = w[SL];
     float sumf = 0.0f;
 #pragma unroll
-    for (int ib = 0; ib < 8; ++ib) {
+    for (int ib = 0; ib < NB; ++ib) {
         const bool     sh = (w0 >> (16 + ib)) & 1;
         const uint32_t ta = sh ? N3P_TAB1A : N3P_TAB0A;
         const uint32_t tb = sh ? N3P_TAB1B : N3P_TAB0B;
-        const uint32_t hi = w[18 + ib];
+        const uint32_t hi = w[QH + ib];
         int isum = 0;
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
-            const uint32_t lo  = w[2 + 2*ib + g/4];
+            const uint32_t lo  = w[QS + 2*ib + g/4];
             const int      t   = 16*((g%4)/2) + 2*(g%2);
             const int      s   = 16*(g/4) + g%4 - 2;
             const uint32_t hs  = s >= 0 ? hi >> s : hi << -s;
@@ -691,9 +704,15 @@ static __device__ __forceinline__ float mmvqp_dot(const uint32_t * w, const mmvq
             acc = fmaf(d, fmaf((float) i1, a.d[2*b + 1], (float) i0 * a.d[2*b + 0]), acc);
         } else if constexpr (type == GGML_TYPE_N2P) {
             static_assert(C == 1, "N2P: one super-block per lane");
-            acc = mmvqp_dot_n2p(w, a, 8*b, acc);
+            acc = mmvqp_dot_n2p<8>(w, a, 8*b, acc);
         } else if constexpr (type == GGML_TYPE_N3P) {
-            acc = mmvqp_dot_n3p(w + o/4, a, 8*b, acc);
+            acc = mmvqp_dot_n3p<8>(w + o/4, a, 8*b, acc);
+        } else if constexpr (type == GGML_TYPE_N2P_128) {
+            static_assert(C == 1, "N2P-128: one block per lane");
+            acc = mmvqp_dot_n2p<4>(w, a, 0, acc);
+        } else if constexpr (type == GGML_TYPE_N3P_128) {
+            static_assert(C == 1, "N3P-128: one block per lane");
+            acc = mmvqp_dot_n3p<4>(w, a, 0, acc);
         } else if constexpr (type == GGML_TYPE_Q4_1) {
             const uint32_t dm = mmvqp_word_at(w, o);
             const int isum = mmvqp_q4_isum16(mmvqp_word_at(w, o + 4), mmvqp_word_at(w, o + 8), mmvqp_word_at(w, o + 12),
@@ -761,6 +780,11 @@ static constexpr mmvqp_shape mmvqp_choose(const ggml_type type, const bool gate)
         case GGML_TYPE_N2P:
         case GGML_TYPE_N3P:
             return { 1, 1, true };
+        // N2P-128 and N3P-128 (Qwen3.8-Flash-Next's routed down projections, K = 640: 220- and 270-byte rows): one block per
+        // lane; rows whose segments can't be staged are staged a warp tile at a time (chosen on the host), as Q2_0's
+        case GGML_TYPE_N2P_128:
+        case GGML_TYPE_N3P_128:
+            return gate ? mmvqp_shape{ 1, 1, true } : mmvqp_shape{ 1, 1, true, true };
         // Qwen3.8-Flash-Next's routed experts (gate/up K = 2560, down K = 640): two blocks per lane keep the 18-byte
         // blocks' chunks 4-byte aligned; down's 180-byte rows are staged a warp tile at a time (chosen on the host).
         // Not yet measured on a P106 (bench/mmvq_pascal --q2_0 and GGML_CUDA_MMVQ_PASCAL_Q2_0 sweep the alternatives).

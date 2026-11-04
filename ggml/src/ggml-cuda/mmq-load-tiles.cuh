@@ -1556,7 +1556,8 @@ static __device__ __forceinline__ int mmq_n2p_scale4(const uint32_t lv, const in
     return out;
 }
 
-static __device__ __forceinline__ int mmq_n2p_smax(const block_n2p * bxi, const int g32) {
+template <typename block_t>
+static __device__ __forceinline__ int mmq_n2p_smax(const block_t * bxi, const int g32) {
     const int sc = bxi->scales[2*g32] | (bxi->scales[2*g32 + 1] << 8);
     int smax = 0;
 #pragma unroll
@@ -1569,6 +1570,9 @@ static __device__ __forceinline__ int mmq_n2p_smax(const block_n2p * bxi, const 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_n2p(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     GGML_UNUSED(x_gate);
+    // N2P-128: a 256-weight iteration spans two blocks
+    using block_t = std::conditional_t<type == GGML_TYPE_N2P_128, block_n2p_128, block_n2p>;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
@@ -1579,7 +1583,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
 #else
-    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_N2P, I);
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + txs.qs);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -1597,14 +1601,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_n2p * bxi = (const block_n2p *) x + kbx0 + i*stride;
+        const block_t * bxi = (const block_t *) x + kbx0 + i*stride + kqsx/(qk/8);
+        const int       ks  = kqsx % (qk/8); // the thread's 8-weight sub-block of its block
 
-        const int      smax = mmq_n2p_smax(bxi, kqsx/4);
+        const int      smax = mmq_n2p_smax(bxi, ks/4);
         const float    f    = smax > 0 ? 127.0f / (124*smax) : 0.0f;
-        const int      sc   = ((bxi->scales[kqsx/2] >> 4*(kqsx%2)) & 0xF) - 8;
-        const uint32_t T    = (bxi->extra[kqsx/8] >> (kqsx%8)) & 1 ? N2P_TAB1 : N2P_TAB0;
-        const uint32_t q    = get_int_b2(bxi->qs, kqsx/2);
-        const int      sh   = 16*(kqsx%2);
+        const int      sc   = ((bxi->scales[ks/2] >> 4*(ks%2)) & 0xF) - 8;
+        const uint32_t T    = (bxi->extra[ks/8] >> (ks%8)) & 1 ? N2P_TAB1 : N2P_TAB0;
+        const uint32_t q    = get_int_b2(bxi->qs, ks/2);
+        const int      sh   = 16*(ks%2);
         const int      v0   = mmq_n2p_scale4(__byte_perm(T, T, q >> sh),       sc, f);
         const int      v1   = mmq_n2p_scale4(__byte_perm(T, T, q >> (sh + 2)), sc, f);
 
@@ -1626,9 +1631,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_n2p * bxi = (const block_n2p *) x + kbx0 + i*stride;
+        const int       g32 = threadIdx.x % 8; // the 32-weight group of the iteration
+        const block_t * bxi = (const block_t *) x + kbx0 + i*stride + g32/(qk/32);
 
-        const float ds = __half2float(bxi->d) * (124.0f/127.0f) * mmq_n2p_smax(bxi, threadIdx.x % 8);
+        const float ds = __half2float(bxi->d) * (124.0f/127.0f) * mmq_n2p_smax(bxi, g32 % (qk/32));
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride             + threadIdx.x % 8] = ds;
@@ -1641,6 +1647,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_n3p(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     GGML_UNUSED(x_gate);
+    // N3P-128: a 256-weight iteration spans two (2-byte-aligned) blocks
+    using block_t = std::conditional_t<type == GGML_TYPE_N3P_128, block_n3p_128, block_n3p>;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
@@ -1651,7 +1660,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
 #else
-    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_N3P, I);
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + txs.qs);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -1669,14 +1678,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_n3p * bxi = (const block_n3p *) x + kbx0 + i*stride;
+        const block_t * bxi = (const block_t *) x + kbx0 + i*stride + kqsx/(qk/8);
 
-        const int      ib = kqsx/4;
+        const int      ib = (kqsx % (qk/8))/4; // the thread's 32-weight sub-block of its block
         const bool     sh = (bxi->extra >> ib) & 1;
         const uint32_t ta = sh ? N3P_TAB1A : N3P_TAB0A;
         const uint32_t tb = sh ? N3P_TAB1B : N3P_TAB0B;
-        const uint32_t lo = get_int_b4(bxi->qs, 2*ib + (kqsx%4)/2);
-        const uint32_t hi = get_int_b4(bxi->qh, ib);
+        constexpr bool b4 = sizeof(block_t) % 4 == 0;
+        const uint32_t lo = b4 ? get_int_b4(bxi->qs, 2*ib + (kqsx%4)/2) : get_int_b2(bxi->qs, 2*ib + (kqsx%4)/2);
+        const uint32_t hi = b4 ? get_int_b4(bxi->qh, ib) : get_int_b2(bxi->qh, ib);
         int v[2];
 #pragma unroll
         for (int l = 0; l < 2; ++l) {
@@ -1705,9 +1715,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_n3p * bxi = (const block_n3p *) x + kbx0 + i*stride;
+        const block_t * bxi = (const block_t *) x + kbx0 + i*stride + (threadIdx.x % 8)/(qk/32);
 
-        const int ib = threadIdx.x % 8;
+        const int ib = (threadIdx.x % 8) % (qk/32);
         const int ls = (((bxi->scales_l[ib/2] >> 4*(ib%2)) & 0xF) | (((bxi->scales_h >> ib) & 1) << 4)) - 16;
         const float d = __half2float(bxi->d) * ls;
 

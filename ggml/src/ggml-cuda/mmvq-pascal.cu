@@ -108,16 +108,16 @@ struct mmvqp_args_mc : mmvqp_args {
 enum mmvqp_fusion { MMVQP_PLAIN = 0, MMVQP_BIAS = 1, MMVQP_GATE = 2 };
 
 // Types whose blocks start at 2-byte boundaries (Q6_K 210 bytes, IQ2_S 82, IQ3_XXS 98, IQ2_XXS 66, IQ2_XS 74, IQ3_S
-// 110, N2P 86): staged only, one super-block per lane, read from shared memory with mmvqp_lds_h.
+// 110, N2P 86, N3P-128 54): staged only, one super-block per lane, read from shared memory with mmvqp_lds_h.
 template <ggml_type type> constexpr __host__ __device__ bool mmvqp_halfword() {
-    return type == GGML_TYPE_Q6_K || mmvqp_grid_type<type>() || type == GGML_TYPE_N2P;
+    return type == GGML_TYPE_Q6_K || mmvqp_grid_type<type>() || type == GGML_TYPE_N2P || type == GGML_TYPE_N3P_128;
 }
 static bool mmvqp_grid_type_of(const ggml_type type) {
     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
         type == GGML_TYPE_IQ3_S;
 }
 static bool mmvqp_halfword_type(const ggml_type type) {
-    return type == GGML_TYPE_Q6_K || mmvqp_grid_type_of(type) || type == GGML_TYPE_N2P;
+    return type == GGML_TYPE_Q6_K || mmvqp_grid_type_of(type) || type == GGML_TYPE_N2P || type == GGML_TYPE_N3P_128;
 }
 
 // Staged weights: matrices staged at a time (the half-word types' gate and up one after the other: half the staging
@@ -809,7 +809,10 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
         MMVQP_CASE(2, 2, true)
         MMVQP_CASE(2, 2, false)
     } else if constexpr (mmvqp_halfword<type>()) {
-        if (s.R == 1 && s.C == 1 && s.staged) {
+        if constexpr (type == GGML_TYPE_N3P_128) {
+            MMVQP_TILE_CASE(1, 1)
+        }
+        if (!s.tile && s.R == 1 && s.C == 1 && s.staged) {
             switch (su) {
                 case 16: mmvqp_launch<type, 1, 1, true, 16>(p, fusion, fk, grid, stream); return;
                 case 8:  mmvqp_launch<type, 1, 1, true, 8>(p, fusion, fk, grid, stream);  return;
@@ -839,6 +842,10 @@ static void mmvqp_launch_shape(const mmvqp_shape s, const mmvqp_args_mc & p, con
         MMVQP_CASE(2, 2, true)
         MMVQP_CASE(2, 2, false)
     } else if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_N3P) {
+        MMVQP_CASE(1, 1, true)
+        MMVQP_CASE(1, 1, false)
+    } else if constexpr (type == GGML_TYPE_N2P_128) {
+        MMVQP_TILE_CASE(1, 1)
         MMVQP_CASE(1, 1, true)
         MMVQP_CASE(1, 1, false)
     } else {
@@ -966,7 +973,8 @@ bool ggml_cuda_mmvq_pascal(
     }
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 && type != GGML_TYPE_Q8_0 &&
             type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K && type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_Q6_K &&
-            type != GGML_TYPE_Q2_0 && !mmvqp_grid_type_of(type) && type != GGML_TYPE_N2P && type != GGML_TYPE_N3P) {
+            type != GGML_TYPE_Q2_0 && !mmvqp_grid_type_of(type) && type != GGML_TYPE_N2P && type != GGML_TYPE_N3P &&
+            type != GGML_TYPE_N2P_128 && type != GGML_TYPE_N3P_128) {
         return false;
     }
     if (mmvqp_skip_type(type)) {
@@ -1017,6 +1025,17 @@ bool ggml_cuda_mmvq_pascal(
     };
     int su   = 16;
     int smem = 0; // tile staging: the block's warp tiles
+    // tile staging (shapes that allow it, no fused gate): the warp's rows must be contiguous, whole 16-byte units and fit,
+    // and every matrix must end at a 16-byte boundary so that the last tile reads nothing past it
+    const auto tile_smem = [&]() -> int {
+        const int64_t wbytes = (int64_t) (WARP_SIZE >> lpr_log2) * s.R * row_bytes;
+        if (stride_row_x == blocks && wbytes % 16 == 0 && (nrows_x * row_bytes) % 16 == 0 && mmvqp_aligned(vx, 16) &&
+                (stride_channel_x * bs) % 16 == 0 && (stride_sample_x * bs) % 16 == 0 &&
+                MMVQ_PASCAL_NWARPS * wbytes <= MMVQP_TILE_MAX_BYTES) {
+            return (int) (MMVQ_PASCAL_NWARPS * wbytes);
+        }
+        return 0;
+    };
     if (mmvqp_halfword_type(type)) {
         // staged only (2-byte-aligned blocks), with the widest loads the rows and the segment allow
         su = 0;
@@ -1026,21 +1045,19 @@ bool ggml_cuda_mmvq_pascal(
                 break;
             }
         }
-        if (su == 0 || row_bytes > INT_MAX) {
+        // rows of an odd number of half-word segments (N3P-128 at K = 640: 270-byte rows) as warp tiles
+        if (su == 0 && s.staged && s.tile && !gate) {
+            smem = tile_smem();
+        }
+        s.tile = smem > 0;
+        if ((su == 0 && !s.tile) || row_bytes > INT_MAX) {
             return false;
         }
     } else {
         const bool seg_ok = ((s.C * bs) << lpr_log2) % 16 == 0 && x_aligned(16);
-        // tile staging (shapes that allow it, no fused gate): the warp's rows must be contiguous, whole 16-byte units and
-        // fit, and every matrix must end at a 16-byte boundary so that the last tile reads nothing past it
-        const int tile_mode = type == GGML_TYPE_Q2_0 ? mmvqp_q2_0_config().tile : 0;
+        const int tile_mode = type == GGML_TYPE_Q2_0 ? mmvqp_q2_0_config().tile : type == GGML_TYPE_N2P_128 ? 1 : 0;
         if (s.staged && s.tile && !gate && (tile_mode == 2 || (tile_mode == 1 && !seg_ok))) {
-            const int64_t wbytes = (int64_t) (WARP_SIZE >> lpr_log2) * s.R * row_bytes;
-            if (stride_row_x == blocks && wbytes % 16 == 0 && (nrows_x * row_bytes) % 16 == 0 && mmvqp_aligned(vx, 16) &&
-                    (stride_channel_x * bs) % 16 == 0 && (stride_sample_x * bs) % 16 == 0 &&
-                    MMVQ_PASCAL_NWARPS * wbytes <= MMVQP_TILE_MAX_BYTES) {
-                smem = (int) (MMVQ_PASCAL_NWARPS * wbytes);
-            }
+            smem = tile_smem();
         }
         s.tile = smem > 0;
         if (s.staged && !s.tile && !seg_ok) {
@@ -1134,6 +1151,8 @@ bool ggml_cuda_mmvq_pascal(
         case GGML_TYPE_IQ3_S:   mmvqp_launch_shape<GGML_TYPE_IQ3_S>(s, p, fusion, fk, grid, stream, su, smem);   break;
         case GGML_TYPE_N2P:  mmvqp_launch_shape<GGML_TYPE_N2P>(s, p, fusion, fk, grid, stream, su, smem); break;
         case GGML_TYPE_N3P:  mmvqp_launch_shape<GGML_TYPE_N3P>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_N2P_128: mmvqp_launch_shape<GGML_TYPE_N2P_128>(s, p, fusion, fk, grid, stream, su, smem); break;
+        case GGML_TYPE_N3P_128: mmvqp_launch_shape<GGML_TYPE_N3P_128>(s, p, fusion, fk, grid, stream, su, smem); break;
         default:             GGML_ABORT("fatal error");
     }
     return true;
