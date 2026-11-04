@@ -1860,15 +1860,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
-            // MoE expert weight scales (per-expert, shape {n_expert})
+            // MoE expert weight scales (per-expert, shape {n_expert}; a tier's own count with a cold tier)
             if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {layer.ffn_gate_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {layer.ffn_down_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {layer.ffn_up_exps->ne[2]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_gate_exps_cold_s && layer.ffn_gate_exps_cold) {
+                layer.ffn_gate_exps_cold_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "scale", i), {layer.ffn_gate_exps_cold->ne[2]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_down_exps_cold_s && layer.ffn_down_exps_cold) {
+                layer.ffn_down_exps_cold_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "scale", i), {layer.ffn_down_exps_cold->ne[2]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_up_exps_cold_s && layer.ffn_up_exps_cold) {
+                layer.ffn_up_exps_cold_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD, "scale", i), {layer.ffn_up_exps_cold->ne[2]}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -1920,13 +1929,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {layer.ffn_gate_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_exps_in_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {layer.ffn_down_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {layer.ffn_up_exps->ne[2]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_gate_exps_cold_in_s && layer.ffn_gate_exps_cold) {
+                layer.ffn_gate_exps_cold_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "input_scale", i), {layer.ffn_gate_exps_cold->ne[2]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_down_exps_cold_in_s && layer.ffn_down_exps_cold) {
+                layer.ffn_down_exps_cold_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "input_scale", i), {layer.ffn_down_exps_cold->ne[2]}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_up_exps_cold_in_s && layer.ffn_up_exps_cold) {
+                layer.ffn_up_exps_cold_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD, "input_scale", i), {layer.ffn_up_exps_cold->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
                 layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
@@ -4029,6 +4047,52 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
     }
+}
+
+int64_t llama_model_base::create_tensor_exps_cold(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+    GGML_ASSERT(ml != nullptr);
+    const std::string down_name = tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", bid).str();
+    const llama_model_loader::llama_tensor_weight * down = ml->get_weight(down_name.c_str());
+    if (down == nullptr) {
+        return n_expert_;
+    }
+
+    // the router still scores every expert: the two tiers split them
+    const int64_t n_cold = down->tensor->ne[2];
+    if (n_cold < 1 || n_cold >= n_expert_) {
+        throw std::runtime_error(format("%s holds %" PRId64 " experts, but the cold tier needs 1 to %" PRId64,
+                                        down_name.c_str(), n_cold, n_expert_ - 1));
+    }
+
+    if (flags & TENSOR_SKIP) {
+        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+
+        create_tensor(tn(LLM_TENSOR_FFN_EXPS_TIER,         "weight", bid), {n_expert_},                skip);
+        create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD,    "weight", bid), {n_ff_, n_embd_, n_cold},   skip);
+        create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS_COLD, "weight", bid), {n_embd_, n_ff_ * 2, n_cold}, skip);
+        create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD,    "weight", bid), {n_embd_, n_ff_, n_cold},   skip);
+        create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,      "weight", bid), {n_embd_, n_ff_, n_cold},   skip);
+        return n_expert_ - n_cold;
+    }
+
+    layer.ffn_exps_tier      = create_tensor(tn(LLM_TENSOR_FFN_EXPS_TIER,      "weight", bid), {n_expert_},              flags);
+    layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", bid), {n_ff_, n_embd_, n_cold}, flags);
+
+    layer.ffn_gate_up_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS_COLD, "weight", bid), {n_embd_, n_ff_ * 2, n_cold}, TENSOR_NOT_REQUIRED);
+    if (layer.ffn_gate_up_exps_cold == nullptr) {
+        layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", bid), {n_embd_, n_ff_, n_cold}, flags);
+        layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", bid), {n_embd_, n_ff_, n_cold}, flags);
+    }
+    // the plain *_exps tensors hold only the hot tier, so the cold tier cannot be ignored
+    if (layer.ffn_exps_tier == nullptr || layer.ffn_down_exps_cold == nullptr) {
+        throw std::runtime_error(format("layer %d has %s but not the whole cold tier (%s)", bid, down_name.c_str(),
+                                        tn(LLM_TENSOR_FFN_EXPS_TIER, "weight", bid).str().c_str()));
+    }
+    if (layer.ffn_exps_tier->type != GGML_TYPE_F32) {
+        throw std::runtime_error(format("%s must be F32", layer.ffn_exps_tier->name));
+    }
+
+    return n_expert_ - n_cold;
 }
 
 void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,

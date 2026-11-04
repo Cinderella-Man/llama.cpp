@@ -1108,6 +1108,20 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// a layer's routed experts in two tiers of tensors, each in its own type (llama_layer::ffn_exps_tier and the
+// *_exps_cold tensors): the router scores every expert, tier[e] (F32) is expert e's slot in the plain *_exps tensors,
+// below their expert count n_hot, or n_hot + its slot in these
+struct llm_moe_cold_tier {
+    ggml_tensor * tier    = nullptr;
+    ggml_tensor * up      = nullptr;
+    ggml_tensor * gate    = nullptr;
+    ggml_tensor * down    = nullptr;
+    ggml_tensor * gate_up = nullptr;
+    ggml_tensor * up_s    = nullptr; // per-expert scales of the cold tensors, if they have them
+    ggml_tensor * gate_s  = nullptr;
+    ggml_tensor * down_s  = nullptr;
+};
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1295,7 +1309,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+    const llm_moe_cold_tier * cold = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1323,7 +1338,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+    const llm_moe_cold_tier * cold = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(

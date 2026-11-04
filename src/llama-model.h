@@ -358,6 +358,20 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_b     = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
 
+    // ff MoE cold tier: some of the routed experts in tensors of their own (their own type); ffn_exps_tier holds each
+    // expert id's slot, below n_hot for the plain *_exps tensors, n_hot + slot for these (llm_moe_cold_tier)
+    struct ggml_tensor * ffn_exps_tier         = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold    = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold    = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold      = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_cold = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold_s    = nullptr; // per-expert scales of the cold tier
+    struct ggml_tensor * ffn_down_exps_cold_s    = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold_s      = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold_in_s = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold_in_s = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold_in_s   = nullptr;
+
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
@@ -1027,6 +1041,10 @@ struct llama_model_base : public llama_model {
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
+
+    // the cold tier of a layer's routed experts, if the file has one (ffn_down_exps_cold); returns the expert count of
+    // the plain *_exps tensors, n_expert_ without a cold tier
+    int64_t create_tensor_exps_cold(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,
