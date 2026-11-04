@@ -1273,8 +1273,8 @@ static uint64_t rr_hash(const std::string & s) { // FNV-1a
     return h;
 }
 
-static std::string rr_case_path(const std::string & dir, size_t index, const char * ext) {
-    return dir + "/cases/" + std::to_string(index) + ext;
+static std::string rr_case_path(const std::string & dir, const std::string & id, const char * ext) {
+    return dir + "/cases/" + id + ext;
 }
 
 static std::string rr_shape(const ggml_tensor * t) {
@@ -1527,8 +1527,12 @@ struct test_case {
     std::string current_op_name;
     bool contains_f16 = false;
 
-    // the case's position in the full case list, which names its record
-    size_t case_index = 0;
+    // the case's position in the full case list, and the name of its record: the md5 of its class, its parameters and
+    // how many cases of the list before it have both (test_backend sets them), so that a record stays valid when a
+    // branch adds or removes other cases
+    size_t      case_index = 0;
+    std::string case_key;
+    std::string case_id;
 
     // the check of one node: t1 on the tested backend against the reference backend's values f2 and, for a node
     // without an op (a sentinel or a parameter, which must stay unchanged), its bytes raw2; err is the case's error, -1
@@ -1824,14 +1828,14 @@ struct test_case {
         if (recording && g_rr.sample > 1 && rr_hash(case_name) % g_rr.sample != 0) {
             return test_status_t::SKIPPED;
         }
-        if (recording && !g_rr.dry && tbo_file_exists(rr_case_path(g_rr.record, case_index, ".meta"))) {
+        if (recording && !g_rr.dry && tbo_file_exists(rr_case_path(g_rr.record, case_id, ".meta"))) {
             // recorded by an earlier run into the same folder (another filter, or a run that stopped): kept as it is
             g_rr_kept++;
             return test_status_t::SKIPPED;
         }
         tbo_meta rmeta;
         if (replaying) {
-            const std::string mp = rr_case_path(g_rr.replay, case_index, ".meta");
+            const std::string mp = rr_case_path(g_rr.replay, case_id, ".meta");
             if (!tbo_file_exists(mp)) {
                 g_rr_missing++;
                 if (!g_rr.allow_missing) {
@@ -1922,7 +1926,7 @@ struct test_case {
         // randomize tensors, or restore the recorded ones
         if (replaying) {
             std::string why;
-            if (!rr_restore(rmeta, rr_case_path(g_rr.replay, case_index, ".in"), ctx.get(), ctx_weights.get(), why)) {
+            if (!rr_restore(rmeta, rr_case_path(g_rr.replay, case_id, ".in"), ctx.get(), ctx_weights.get(), why)) {
                 printf("record mismatch: %s ", why.c_str());
                 test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "record mismatch");
                 print_test_result_locked(output_printer, result);
@@ -1939,7 +1943,7 @@ struct test_case {
         std::unique_ptr<tbo_writer> rr_in;
         std::vector<std::string>    rr_tensor_lines;
         if (recording) {
-            rr_in.reset(new tbo_writer(rr_case_path(g_rr.record, case_index, ".in")));
+            rr_in.reset(new tbo_writer(rr_case_path(g_rr.record, case_id, ".in")));
             std::vector<uint8_t> chunk;
             for (size_t i = 0; i < rr_ts.size(); i++) {
                 ggml_tensor * t = rr_ts[i];
@@ -2017,7 +2021,7 @@ struct test_case {
         };
 
         auto write_record = [&](const rr_refs & refs, const std::string & live) {
-            tbo_writer ref(rr_case_path(g_rr.record, case_index, ".ref"));
+            tbo_writer ref(rr_case_path(g_rr.record, case_id, ".ref"));
             std::string nodes;
             for (size_t k = 0; k < refs.nodes.size(); k++) {
                 const rr_refs::node & r = refs.nodes[k];
@@ -2031,8 +2035,8 @@ struct test_case {
             }
             char max_err_s[32];
             snprintf(max_err_s, sizeof(max_err_s), "%.9g", max_err(backend1));
-            std::string meta = "tbo-record\t1\nname\t" + case_name + "\nindex\t" + std::to_string(case_index) +
-                "\nclass\t" + typeid(*this).name() + "\nmode\t" + (fused_nodes_to_verify.empty() ? "nodes" : "graph") +
+            std::string meta = "tbo-record\t1\nname\t" + case_name + "\nkey\t" + case_key + "\nindex\t" +
+                std::to_string(case_index) + "\nclass\t" + typeid(*this).name() + "\nmode\t" + (fused_nodes_to_verify.empty() ? "nodes" : "graph") +
                 "\nmax_err\t" + max_err_s + "\nreference\t" + ggml_backend_name(backend2) +
                 "\ninputs\tstd::random_device draws, stored (not reproducible from a seed)" +
                 "\nin\t" + std::to_string(rr_in->n) + "\t" + rr_in->md5.hex() + "\nref\t" + std::to_string(ref.n) + "\t" + ref.md5.hex() + "\n";
@@ -2040,7 +2044,7 @@ struct test_case {
                 meta += l + "\n";
             }
             meta += nodes + live;
-            tbo_writer mw(rr_case_path(g_rr.record, case_index, ".meta"));
+            tbo_writer mw(rr_case_path(g_rr.record, case_id, ".meta"));
             mw.write(meta.data(), meta.size());
             return mw.close();
         };
@@ -2049,7 +2053,7 @@ struct test_case {
             const char * bn2 = ggml_backend_name(backend2);
             rr_refs ref;
             std::string why;
-            if (!rr_read_refs(rmeta, rr_case_path(g_rr.replay, case_index, ".ref"), ref, why)) {
+            if (!rr_read_refs(rmeta, rr_case_path(g_rr.replay, case_id, ".ref"), ref, why)) {
                 printf("record mismatch: %s ", why.c_str());
                 test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "record mismatch");
                 print_test_result_locked(output_printer, result);
@@ -2094,7 +2098,7 @@ struct test_case {
                 ud.refs = nullptr;
                 ud.errs.clear();
                 // the live check computed the outputs in place: the record's tensors again for the replay
-                if (!rr_restore(rmeta, rr_case_path(g_rr.replay, case_index, ".in"), ctx.get(), ctx_weights.get(), why)) {
+                if (!rr_restore(rmeta, rr_case_path(g_rr.replay, case_id, ".in"), ctx.get(), ctx_weights.get(), why)) {
                     printf("record mismatch: %s ", why.c_str());
                     test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "record mismatch");
                     print_test_result_locked(output_printer, result);
@@ -2123,7 +2127,7 @@ struct test_case {
             }
             if (g_rr_log_file) {
                 std::lock_guard<std::mutex> guard(g_test_output_mutex);
-                fprintf(g_rr_log_file, "%zu\t%s\t%s\t%s\n", case_index, case_name.c_str(), test_passed ? "OK" : "FAIL",
+                fprintf(g_rr_log_file, "%s\t%s\t%s\t%s\n", case_id.c_str(), case_name.c_str(), test_passed ? "OK" : "FAIL",
                         errs_str(errs).c_str());
                 fflush(g_rr_log_file);
             }
@@ -15594,8 +15598,16 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         test_cases = make_test_cases_from_file(test_file_path);
     }
 
+    // each case's record name (record and replay): its class and parameters, and which of the cases with both it is
+    std::unordered_map<std::string, int> rr_seen;
     for (size_t i = 0; i < test_cases.size(); i++) {
-        test_cases[i]->case_index = i;
+        test_case & tc = *test_cases[i];
+        const std::string k = std::string(typeid(tc).name()) + "|" + tc.vars();
+        tc.case_index = i;
+        tc.case_key   = k + "#" + std::to_string(rr_seen[k]++);
+        tbo_md5 h;
+        h.update(tc.case_key.data(), tc.case_key.size());
+        tc.case_id = h.hex().substr(0, 20);
     }
 
     filter_test_cases(test_cases, params_filter);

@@ -1,15 +1,17 @@
 // Record and replay of test-backend-ops cases (C372, Q931): the files and their checksums.
 //
 // A record of one case is three files in <dir>/cases/:
-//   <index>.in    the bytes of every tensor the case allocates, as its initialize_tensors left them (the inputs, the
-//                 sentinels, the outputs' initial contents), one after the other in context order
-//   <index>.ref   the reference backend's result of every node the live check compares, in graph order: the node's
-//                 bytes first for nodes without an op (sentinels and parameters, which must stay unchanged), then its
-//                 values as floats after the case's host_reference
-//   <index>.meta  text, one "key<TAB>fields" line each: the case string, its class, the threshold, the md5 and size of
-//                 both blobs, each tensor (name, type, shape, bytes) and each compared node (graph index, op, sizes)
-// <index> is the case's position in the full case list of the build, so a record replays on any build of the same
-// source; replay checks the case string, the tensor layout and both md5s before it trusts a record.
+//   <id>.in    the bytes of every tensor the case allocates, as its initialize_tensors left them (the inputs, the
+//              sentinels, the outputs' initial contents), one after the other in context order
+//   <id>.ref   the reference backend's result of every node the live check compares, in graph order: the node's bytes
+//              first for nodes without an op (sentinels and parameters, which must stay unchanged), then its values as
+//              floats after the case's host_reference
+//   <id>.meta  text, one "key<TAB>fields" line each: the case string, its key, its class, the threshold, the md5 and
+//              size of both blobs, each tensor (name, type, shape, bytes) and each compared node (graph index, op, sizes)
+// <id> is the first 20 hex digits of the md5 of the case's key: its class, its parameters and how many cases before it
+// in the full case list have both. A record therefore replays on any build whose case list holds the same case, also
+// after a branch adds or removes others; replay checks the case string, the tensor layout and both md5s before it
+// trusts a record.
 #pragma once
 
 #include <algorithm>
