@@ -2663,9 +2663,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    // after the scale, so that the fused top-k kernel still produces the weights the tail is cut from
+    // after the scale, so that the fused top-k kernel still produces the weights the tail is cut from; a tiered layer
+    // takes the graph-level cut (its tier lookup reads a row of ffn_exps_tier per id, so no id may be -1)
     if (cparams.moe_tail && n_expert_used > 1) {
-        if (cparams.moe_tail_graph) {
+        if (cparams.moe_tail_graph || cold != nullptr) {
             weights = build_moe_tail(weights, n_expert_used, n_tokens, il);
         } else {
             build_moe_tail_op(weights, selected_experts, n_expert_used, n_tokens, il);
