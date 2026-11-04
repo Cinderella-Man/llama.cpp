@@ -11,6 +11,8 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
@@ -54,6 +56,18 @@ private:
     } original_logger;
     ggml_log_level min_level;
 };
+
+// switches for the fit's two upstream fixes (Q706), on unless the variable is "0":
+//   LLAMA_FIT_DRAFT_CTX   a draft model is measured with a no-alloc context of the main model as its ctx_other (#31610),
+//                         so drafts that need the target's context (DFlash, EAGLE-3, Gemma 4 assistant) are counted, and
+//                         with LLAMA_DRAFT_SHARE without the tensors it reads from the target; 0 = measured alone (such
+//                         a draft fails to measure and the fit leaves it out, as before)
+//   LLAMA_FIT_NEXTN_SKIP  NextN layers that are not loaded (no MTP) still count for the loader's n_gpu_layers: the
+//                         fitted -ngl and -ts include them, on the output layer's device (#31569); 0 = left out, as before
+static bool common_fit_switch(const char * name) {
+    const char * s = getenv(name);
+    return s == nullptr || strcmp(s, "0") != 0;
+}
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
@@ -154,7 +168,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         hp_ngl    += llama_model_n_layer_nextn(model);
     }
     // without MTP the NextN layers hold no weights but the model loader still counts them for n_gpu_layers
-    hp_ngl_skip    = mparams->load_mtp ? 0 : llama_model_n_layer_nextn(model);
+    hp_ngl_skip    = mparams->load_mtp || !common_fit_switch("LLAMA_FIT_NEXTN_SKIP") ? 0 : llama_model_n_layer_nextn(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
@@ -307,23 +321,34 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
-                common_fit_log_scope log_scope(log_level);
-                llama_model_params mparams_main = *mparams;
-                mparams_main.no_alloc  = true;
-                mparams_main.load_mode = LLAMA_LOAD_MODE_NONE;
-                llama_model_ptr model_main(llama_model_load_from_file(path_model, mparams_main));
-                if (!model_main) {
-                    throw std::runtime_error("failed to load the main model");
-                }
-                llama_context_ptr ctx_main(llama_init_from_model(model_main.get(), *cparams));
-                if (!ctx_main) {
-                    throw std::runtime_error("failed to create llama_context for the main model");
-                }
+                if (common_fit_switch("LLAMA_FIT_DRAFT_CTX")) {
+                    common_fit_log_scope log_scope(log_level);
+                    llama_model_params mparams_main = *mparams;
+                    mparams_main.no_alloc  = true;
+                    mparams_main.load_mode = LLAMA_LOAD_MODE_NONE;
+                    llama_model_ptr model_main(llama_model_load_from_file(path_model, mparams_main));
+                    if (!model_main) {
+                        throw std::runtime_error("failed to load the main model");
+                    }
+                    llama_context_ptr ctx_main(llama_init_from_model(model_main.get(), *cparams));
+                    if (!ctx_main) {
+                        throw std::runtime_error("failed to create llama_context for the main model");
+                    }
 
-                llama_context_params cparams_extra = *extra->cparams;
-                cparams_extra.ctx_other = ctx_main.get();
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, &cparams_extra, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                    llama_context_params cparams_extra = *extra->cparams;
+                    cparams_extra.ctx_other = ctx_main.get();
+
+                    // a draft that reads tensors from the target (LLAMA_DRAFT_SHARE) is measured without them, as it loads
+                    llama_model_params mparams_extra = *extra->mparams;
+                    if (mparams_extra.share_tensors != 0) {
+                        mparams_extra.share_src = model_main.get();
+                    }
+                    measured = common_get_device_memory_data_impl(
+                        extra->path_model, &mparams_extra, &cparams_extra, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                } else {
+                    measured = common_get_device_memory_data_impl(
+                        extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                }
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());

@@ -49,6 +49,10 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // return true if the target and draft models have compatible vocabs
 bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
 
+// LLAMA_DRAFT_SHARE (Q564): the llama_share_tensor bits a draft model reads from the target instead of loading its own
+// copies (embd, head, all); 0 when unset
+uint32_t common_draft_share_from_env();
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);

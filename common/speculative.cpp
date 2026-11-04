@@ -2874,7 +2874,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 }
 
 // LLAMA_DRAFT_SHARE: a comma-separated list of "embd" (token embeddings), "head" (output head) or "all"
-static uint32_t common_draft_share_from_env() {
+uint32_t common_draft_share_from_env() {
     const char * s = getenv("LLAMA_DRAFT_SHARE");
     if (s == nullptr) {
         return 0;
