@@ -311,8 +311,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
     }
 }
 
-// Host function: returns the max batch size for the current arch+type at runtime.
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+// Host function: returns the max batch size for the current arch+type at runtime (llama.cpp's kernels).
+static int get_mmvq_mmid_max_batch_llama(ggml_type type, int cc) {
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -349,6 +349,15 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+// The same, except where the Pascal multi-token expert kernels take the type up to 8 tokens (mmvq-pascal-mtok.cu: the grid
+// types and IQ1_M, Q713); ggml_cuda_mul_mat_vec_q runs the products they decline in chunks within llama.cpp's limit.
+int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    if (ggml_cuda_mmvq_pascal_mtok_takes(type, cc)) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
+    return get_mmvq_mmid_max_batch_llama(type, cc);
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
@@ -1639,7 +1648,8 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    // 2 to 8 tokens of Q2_0 experts: each distinct expert read once for all the tokens that picked it
+    // 2 to 8 tokens of Q2_0 experts (and since Q713 the grid types' and IQ1_M's): each distinct expert read once for all the
+    // tokens that picked it
     if (ggml_cuda_mmvq_pascal_mtok(
             src0->data, src0->type, src1_q8, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y,
             stride_col_dst, ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13,
@@ -1652,6 +1662,33 @@ void ggml_cuda_mul_mat_vec_q(
             stride_col_dst, ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst, ne03, ne3, s03, s13,
             s3, ids_stride, stream)) {
         return;
+    }
+
+    // experts of more tokens than llama.cpp's kernels take for this type: a product the Pascal multi-token kernels declined
+    // although they raised the limit (get_mmvq_mmid_max_batch), run in chunks of tokens within llama.cpp's limit
+    if (ids_d) {
+        const int64_t lim = get_mmvq_mmid_max_batch_llama(src0->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+        if (ncols_dst > lim) {
+            for (int64_t t0 = 0; t0 < ncols_dst; t0 += lim) {
+                const int64_t n  = std::min(lim, ncols_dst - t0);
+                const char *  vy = (const char *) src1_q8 + t0 * stride_col_y * (int64_t) sizeof(block_q8_1);
+                ggml_cuda_mm_fusion_args_device fc = fusion_local;
+                if (fc.shared_dst) {
+                    fc.shared_dst += t0 * fc.shared_stride_col_dst;
+                }
+                if (!ggml_cuda_mmvq_pascal(
+                        src0->data, src0->type, vy, ids_d + t0 * ids_stride, fc, dst_d + t0 * stride_col_dst, ne00, ne01, n,
+                        s01, stride_col_y, stride_col_dst, ne02, nchannels_y, nchannels_dst, s02, stride_channel_y,
+                        stride_channel_dst, ne03, ne3, s03, s13, s3, ids_stride, stream)) {
+                    mul_mat_vec_q_switch_type(
+                        src0->data, src0->type, vy, ids_d + t0 * ids_stride, fc, dst_d + t0 * stride_col_dst, ne00,
+                        ne01,              n,             s01, stride_col_y,     stride_col_dst,
+                        ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+                }
+            }
+            return;
+        }
     }
 
     mul_mat_vec_q_switch_type(
