@@ -234,6 +234,8 @@ endif()
 llama_build(test-llama-archs.cpp)
 # the bytes-per-token switches (Q618, Q619) on a model file, e.g. one test-llama-archs wrote: run by hand
 llama_build(test-bytes-switches.cpp)
+# route once per verify block (Q860) on a model file, e.g. one test-llama-archs wrote: run by hand
+llama_build(test-route-once.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")

@@ -528,6 +528,47 @@ llama_context::llama_context(
         set_moe_tail(true, p, w, renorm, hist);
     }
 
+    // route once per block (Q860): LLAMA_MOE_ROUTE_ONCE=<k>[,max=<n>][,hist=<0|1>][,dry=<0|1>]; k = 0 is off (the
+    // default), 1 builds the masked path with every token its own block's first; max > 0 limits it to micro-batches of
+    // at most n tokens (verify batches, not prompts); hist (default 0: it reads the graph back after every
+    // micro-batch, so never for timing) counts the distinct experts per block and MoE layer; dry keeps the routing and
+    // only counts
+    cparams.moe_route_once      = 0;
+    cparams.moe_route_once_max  = 0;
+    cparams.moe_route_once_hist = false;
+    cparams.moe_route_once_dry  = false;
+    if (const char * LLAMA_MOE_ROUTE_ONCE = getenv("LLAMA_MOE_ROUTE_ONCE")) {
+        long k    = 0;
+        long max  = 0;
+        bool hist = false;
+        bool dry  = false;
+        std::stringstream ss(LLAMA_MOE_ROUTE_ONCE);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            const size_t eq = item.find('=');
+            const std::string key = eq == std::string::npos ? "k" : item.substr(0, eq);
+            const std::string val = eq == std::string::npos ? item : item.substr(eq + 1);
+            if (key == "k") {
+                k = std::stol(val);
+            } else if (key == "max") {
+                max = std::stol(val);
+            } else if (key == "hist") {
+                hist = std::stoi(val) != 0;
+            } else if (key == "dry") {
+                dry = std::stoi(val) != 0;
+            } else if (!key.empty()) {
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_ROUTE_ONCE: unknown item '%s' (k, max, hist, dry)\n", __func__,
+                        item.c_str());
+            }
+        }
+        if (k < 0 || max < 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_ROUTE_ONCE: k = %ld, max = %ld: negative, using 0\n", __func__, k, max);
+            k   = std::max(k, 0L);
+            max = std::max(max, 0L);
+        }
+        set_moe_route_once((uint32_t) std::min<long>(k, 1 << 20), (uint32_t) std::min<long>(max, 1 << 20), hist, dry);
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -775,6 +816,9 @@ llama_context::~llama_context() {
 
     if (cparams.moe_tail && moe_kept_tokens > 0) {
         moe_tail_log();
+    }
+    if (cparams.moe_route_once > 0 && cparams.moe_route_once_hist && ro.n_tokens > 0) {
+        moe_route_once_log(true);
     }
     if (head_bound) {
         head_bound_finish_row();
@@ -2004,6 +2048,261 @@ void llama_context::moe_tail_log() const {
             cparams.moe_tail_p, cparams.moe_tail_w, (int) cparams.moe_tail_renorm, moe_kept_tokens, n_pairs,
             n_kept/n_pairs, k, 100.0*n_kept/n_pairs/k, by_count.c_str());
     LLAMA_LOG_INFO("moe tail: mean experts kept per MoE layer:%s\n", by_layer.c_str());
+}
+
+void llama_context::set_moe_route_once(uint32_t k, uint32_t max, bool hist, bool dry) {
+    const auto & hparams = model.hparams;
+    if (k > 0 && hparams.n_expert == 0) {
+        LLAMA_LOG_WARN("%s: the model has no routed experts\n", __func__);
+        k = 0;
+    }
+    if (k > 0 && hparams.n_expert_groups > 1) {
+        LLAMA_LOG_WARN("%s: the model routes in expert groups, which route once does not handle: off\n", __func__);
+        k = 0;
+    }
+
+    // a change rebuilds the graph (llm_graph_params::allow_reuse)
+    cparams.moe_route_once      = k;
+    cparams.moe_route_once_max  = k > 0 ? max : 0;
+    cparams.moe_route_once_hist = k > 0 && hist;
+    cparams.moe_route_once_dry  = k > 0 && dry;
+
+    if (k > 0) {
+        LLAMA_LOG_INFO("%s: moe route once on: blocks of %u consecutive tokens%s; %s; histogram %s\n", __func__, k,
+                max > 0 ? format(" in micro-batches of at most %u tokens", max).c_str() : "",
+                dry ? "a dry run (the routing as it is, only counted)" :
+                      "a block's later tokens pick their routed experts among its first token's",
+                hist ? "on" : "off");
+    }
+}
+
+uint64_t llama_context::moe_route_once_counts(uint64_t * read, uint64_t * indep, int32_t n_counts,
+        uint64_t * n_outside) const {
+    for (int32_t d = 0; d < n_counts; ++d) {
+        if (read) {
+            read[d] = 0;
+        }
+        if (indep) {
+            indep[d] = 0;
+        }
+    }
+    uint64_t n = 0;
+    for (size_t l = 0; l < ro.read.size(); ++l) {
+        for (size_t d = 0; d < ro.read[l].size(); ++d) {
+            n += ro.read[l][d];
+            if (read && (int32_t) d < n_counts) {
+                read[d] += ro.read[l][d];
+            }
+        }
+        for (size_t d = 0; d < ro.indep[l].size(); ++d) {
+            if (indep && (int32_t) d < n_counts) {
+                indep[d] += ro.indep[l][d];
+            }
+        }
+    }
+    if (n_outside) {
+        *n_outside = ro.n_outside;
+    }
+    return n;
+}
+
+void llama_context::moe_route_once_collect(const llm_graph_result * res, const llama_ubatch & ubatch, uint32_t n_out) {
+    const auto & tr = res->t_moe_route_read;
+    const auto & ti = res->t_moe_route_free;
+    if (tr.empty()) {
+        return; // a micro-batch of one token, or above moe_route_once_max
+    }
+    GGML_ASSERT(tr.size() == ti.size());
+
+    const uint32_t k_blk    = cparams.moe_route_once;
+    const int64_t  n_used   = tr[0]->ne[0];
+    const size_t   n_expert = model.hparams.n_expert;
+    llama_route_once_leaders(ubatch, k_blk, n_out, ro.lead_all, ro.lead_out);
+
+    size_t n_all = 0;
+    for (const auto * t : tr) {
+        n_all += ggml_nelements(t);
+    }
+    ro.ids_read.resize(n_all);
+    ro.ids_indep.resize(n_all);
+
+    size_t off = 0;
+    for (size_t l = 0; l < tr.size(); ++l) {
+        GGML_ASSERT(tr[l]->type == GGML_TYPE_I32 && ti[l]->type == GGML_TYPE_I32 && ggml_are_same_shape(tr[l], ti[l]));
+        if (ggml_nelements(tr[l]) == 0) {
+            continue;
+        }
+        ggml_backend_t b_read  = ggml_backend_sched_get_tensor_backend(sched_res(), tr[l]);
+        ggml_backend_t b_indep = ggml_backend_sched_get_tensor_backend(sched_res(), ti[l]);
+        GGML_ASSERT(b_read != nullptr && b_indep != nullptr);
+        ggml_backend_tensor_get_async(b_read,  tr[l], ro.ids_read.data()  + off, 0, ggml_nbytes(tr[l]));
+        ggml_backend_tensor_get_async(b_indep, ti[l], ro.ids_indep.data() + off, 0, ggml_nbytes(ti[l]));
+        off += ggml_nelements(tr[l]);
+    }
+    ggml_backend_sched_synchronize(sched_res());
+
+    if (ro.seen_read.size() < n_expert) {
+        ro.seen_read .assign(n_expert, 0);
+        ro.seen_indep.assign(n_expert, 0);
+        ro.seen_lead .assign(n_expert, 0);
+    }
+    if (ro.read.size() < tr.size()) {
+        ro.read .resize(tr.size());
+        ro.indep.resize(tr.size());
+    }
+    auto bump = [](std::vector<uint64_t> & h, size_t c) {
+        if (h.size() <= c) {
+            h.resize(c + 1, 0);
+        }
+        h[c]++;
+    };
+
+    off = 0;
+    for (size_t l = 0; l < tr.size(); ++l) {
+        const int64_t n_rows = tr[l]->ne[1];
+        if (n_rows == 0) {
+            continue;
+        }
+        GGML_ASSERT(tr[l]->ne[0] == n_used);
+        const std::vector<int32_t> & lead = n_rows == (int64_t) ro.lead_all.size() ? ro.lead_all : ro.lead_out;
+        GGML_ASSERT((int64_t) lead.size() == n_rows);
+
+        const int32_t * r_ids = ro.ids_read.data()  + off;
+        const int32_t * i_ids = ro.ids_indep.data() + off;
+        for (int64_t i0 = 0; i0 < n_rows; ) {
+            int64_t i1 = i0 + 1;
+            while (i1 < n_rows && lead[i1] == lead[i0]) {
+                i1++;
+            }
+
+            // the block [i0, i1): its first row's experts, then every row's against them
+            const uint64_t s = ++ro.stamp;
+            for (int64_t e = 0; e < n_used; ++e) {
+                const int32_t x = r_ids[i0*n_used + e];
+                GGML_ASSERT(x >= 0 && (size_t) x < n_expert);
+                ro.seen_lead[x] = s;
+            }
+            uint32_t d_read  = 0;
+            uint32_t d_indep = 0;
+            for (int64_t i = i0; i < i1; ++i) {
+                bool     outside = false;
+                uint32_t own     = 0;
+                for (int64_t e = 0; e < n_used; ++e) {
+                    const int32_t x = r_ids[i*n_used + e];
+                    const int32_t y = i_ids[i*n_used + e];
+                    GGML_ASSERT(x >= 0 && (size_t) x < n_expert && y >= 0 && (size_t) y < n_expert);
+                    if (ro.seen_read[x] != s) {
+                        ro.seen_read[x] = s;
+                        d_read++;
+                    }
+                    if (ro.seen_indep[y] != s) {
+                        ro.seen_indep[y] = s;
+                        d_indep++;
+                    }
+                    outside = outside || ro.seen_lead[x] != s;
+                    own    += ro.seen_lead[y] == s;
+                }
+                if (i > i0) {
+                    ro.n_outside += outside;
+                    bump(ro.own, own);
+                }
+            }
+            if (i1 - i0 == (int64_t) k_blk) {
+                bump(ro.read[l],  d_read);
+                bump(ro.indep[l], d_indep);
+            } else {
+                ro.n_short++;
+            }
+            i0 = i1;
+        }
+        off += n_rows*n_used;
+    }
+
+    ro.n_tokens += ubatch.n_tokens;
+    if (ro.n_tokens >= ro.next_log) {
+        if (ro.next_log > 0) {
+            moe_route_once_log(false);
+        }
+        ro.next_log = (ro.n_tokens/65536 + 1)*65536;
+    }
+}
+
+void llama_context::moe_route_once_log(bool by_layer) const {
+    const uint32_t n_used = std::max<uint32_t>(model.hparams.n_expert_used_max(), 1);
+
+    auto mean = [](const std::vector<uint64_t> & h, uint64_t * n_out) {
+        uint64_t n = 0;
+        double   s = 0.0;
+        for (size_t c = 0; c < h.size(); ++c) {
+            n += h[c];
+            s += (double) c*h[c];
+        }
+        if (n_out) {
+            *n_out = n;
+        }
+        return n > 0 ? s/n : 0.0;
+    };
+    auto by_count = [](const std::vector<uint64_t> & h) {
+        uint64_t n = 0;
+        for (const uint64_t c : h) {
+            n += c;
+        }
+        std::string s;
+        for (size_t c = 0; c < h.size(); ++c) {
+            if (h[c] > 0) {
+                s += format(" %zu: %.2f %%", c, 100.0*h[c]/n);
+            }
+        }
+        return s;
+    };
+
+    auto add = [](std::vector<uint64_t> & dst, const std::vector<uint64_t> & src) {
+        if (dst.size() < src.size()) {
+            dst.resize(src.size(), 0);
+        }
+        for (size_t c = 0; c < src.size(); ++c) {
+            dst[c] += src[c];
+        }
+    };
+
+    std::vector<uint64_t> read;
+    std::vector<uint64_t> indep;
+    std::string per_layer;
+    for (size_t l = 0; l < ro.read.size(); ++l) {
+        add(read,  ro.read[l]);
+        add(indep, ro.indep[l]);
+        per_layer += format(" %.2f/%.2f", mean(ro.read[l], nullptr), mean(ro.indep[l], nullptr));
+    }
+
+    uint64_t n_pairs = 0;
+    uint64_t n_later = 0;
+    const double m_read  = mean(read, &n_pairs);
+    const double m_indep = mean(indep, nullptr);
+    const double m_own   = mean(ro.own, &n_later);
+    if (n_pairs == 0 && ro.n_short == 0) {
+        return;
+    }
+
+    LLAMA_LOG_INFO("moe route once (k = %u, max %u, dry %d): %" PRIu64 " tokens, %" PRIu64 " full blocks x MoE layers "
+            "(%" PRIu64 " shorter); distinct routed experts per block and layer: read mean %.2f, independent routing "
+            "mean %.2f (%.2f x a token's %u); the later tokens' own top-%u inside their block's first token's set: "
+            "mean %.2f; later tokens reading outside it: %" PRIu64 " of %" PRIu64 " token-layers\n",
+            cparams.moe_route_once, cparams.moe_route_once_max, (int) cparams.moe_route_once_dry, ro.n_tokens, n_pairs,
+            ro.n_short, m_read, m_indep, m_indep/n_used, n_used, n_used, m_own, ro.n_outside, n_later);
+    LLAMA_LOG_INFO("moe route once: distinct experts read per full block and layer, by count:%s\n",
+            by_count(read).c_str());
+    LLAMA_LOG_INFO("moe route once: distinct experts under independent routing, by count:%s\n",
+            by_count(indep).c_str());
+    LLAMA_LOG_INFO("moe route once: later tokens' own experts inside their block's set, by count:%s\n",
+            by_count(ro.own).c_str());
+    LLAMA_LOG_INFO("moe route once: mean distinct experts per MoE layer (graph order), read/independent:%s\n",
+            per_layer.c_str());
+    if (by_layer) {
+        for (size_t l = 0; l < ro.indep.size(); ++l) {
+            LLAMA_LOG_INFO("moe route once: MoE layer %zu, distinct experts under independent routing, by count:%s\n",
+                    l, by_count(ro.indep[l]).c_str());
+        }
+    }
 }
 
 bool llama_context::head_bound_init() {
@@ -3569,6 +3868,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // the routed experts kept per token (a synchronous read)
         if (cparams.moe_tail && cparams.moe_tail_hist) {
             moe_tail_collect(res, ubatch.n_tokens);
+        }
+
+        // the distinct routed experts per block of route once (a synchronous read)
+        if (cparams.moe_route_once > 0 && cparams.moe_route_once_hist) {
+            moe_route_once_collect(res, ubatch, n_outputs);
         }
 
         // extract embeddings
@@ -6265,6 +6569,15 @@ void llama_set_moe_tail(llama_context * ctx, bool on, float p, float w, bool ren
 
 uint64_t llama_moe_tail_counts(const llama_context * ctx, uint64_t * counts, int32_t n_counts) {
     return ctx->moe_tail_counts(counts, n_counts);
+}
+
+void llama_set_moe_route_once(llama_context * ctx, uint32_t k, uint32_t max, bool hist, bool dry) {
+    ctx->set_moe_route_once(k, max, hist, dry);
+}
+
+uint64_t llama_moe_route_once_counts(const llama_context * ctx, uint64_t * read, uint64_t * indep, int32_t n_counts,
+        uint64_t * n_outside) {
+    return ctx->moe_route_once_counts(read, indep, n_counts, n_outside);
 }
 
 uint32_t llama_model_screen_head_m(const llama_model * model) {

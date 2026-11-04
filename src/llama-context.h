@@ -171,6 +171,11 @@ struct llama_context {
     uint64_t moe_tail_counts(uint64_t * counts, int32_t n_counts) const;
     void     moe_tail_log() const;
 
+    // route once per verify block (llama_set_moe_route_once)
+    void     set_moe_route_once(uint32_t k, uint32_t max, bool hist, bool dry);
+    uint64_t moe_route_once_counts(uint64_t * read, uint64_t * indep, int32_t n_counts, uint64_t * n_outside) const;
+    void     moe_route_once_log(bool by_layer) const;
+
     // the main model's shortlist head with an exact bound (llama_head_bound_*)
     bool  head_bound_init();
     void  set_head_bound(bool value);
@@ -605,6 +610,29 @@ private:
     std::vector<float>    moe_kept_buf;
     uint64_t              moe_kept_tokens   = 0;
     uint64_t              moe_kept_next_log = 0;
+
+    // the distinct routed experts per block of route once and MoE layer (cparams.moe_route_once_hist), counted over
+    // the full blocks (k tokens): read[d] / indep[d] the (block, layer) pairs whose tokens read d distinct experts /
+    // would read them under independent routing (the router's own top-k), per MoE layer in graph order; own[c] the
+    // later tokens' (token, layer) pairs whose own top-k has c experts in their block's first token's set
+    void moe_route_once_collect(const llm_graph_result * res, const llama_ubatch & ubatch, uint32_t n_out);
+    struct route_once_stats {
+        std::vector<std::vector<uint64_t>> read;
+        std::vector<std::vector<uint64_t>> indep;
+        std::vector<uint64_t> own;
+        std::vector<int32_t>  ids_read;
+        std::vector<int32_t>  ids_indep;
+        std::vector<int32_t>  lead_all;
+        std::vector<int32_t>  lead_out;
+        std::vector<uint64_t> seen_read;  // per expert: the stamp of the last block that counted it
+        std::vector<uint64_t> seen_indep;
+        std::vector<uint64_t> seen_lead;  // per expert: the stamp of the block whose first token's set holds it
+        uint64_t stamp      = 0;
+        uint64_t n_tokens   = 0;
+        uint64_t n_short    = 0; // (block, layer) pairs of shorter blocks (a micro-batch's or a sequence's end)
+        uint64_t n_outside  = 0; // later tokens' (token, layer) pairs that read an expert outside their block's set
+        uint64_t next_log   = 0;
+    } ro;
 
     // how the slots upload their host inputs (ggml_backend_sched_set_input_upload, LLAMA_PIPE_UPLOAD)
     int pipe_upload = 2;

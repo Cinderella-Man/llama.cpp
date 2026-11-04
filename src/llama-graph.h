@@ -268,6 +268,34 @@ public:
     const uint32_t n_outputs;
 };
 
+// route once per block (cparams.moe_route_once = k): a block is a run of up to k consecutive tokens of the micro-batch
+// with one sequence and consecutive positions; lead[i] is the index of token i's block's first token. A layer cropped
+// to the output rows (the last one) has its own list over those rows: a block's first row there is its first output
+// (the block's first token when that one is an output).
+void llama_route_once_leaders(const llama_ubatch & ubatch, uint32_t k, uint32_t n_outputs,
+        std::vector<int32_t> & lead_all, std::vector<int32_t> & lead_out);
+
+class llm_graph_input_route_once : public llm_graph_input_i {
+public:
+    llm_graph_input_route_once(uint32_t k, uint32_t n_tokens, uint32_t n_outputs) :
+        k(k), n_tokens(n_tokens), n_outputs(n_outputs) {}
+    virtual ~llm_graph_input_route_once() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * lead_all = nullptr; // I32 [n_tokens]
+    ggml_tensor * lead_out = nullptr; // I32 [n_outputs] (nullptr when n_outputs == n_tokens: lead_all serves both)
+
+    const uint32_t k;
+    const uint32_t n_tokens;
+    const uint32_t n_outputs;
+
+    std::vector<int32_t> buf_all;
+    std::vector<int32_t> buf_out;
+};
+
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
@@ -983,6 +1011,10 @@ struct llm_graph_params {
             cparams.moe_tail_w              == other.cparams.moe_tail_w              &&
             cparams.moe_tail_renorm         == other.cparams.moe_tail_renorm         &&
             cparams.moe_tail_hist           == other.cparams.moe_tail_hist           &&
+            cparams.moe_route_once          == other.cparams.moe_route_once          &&
+            cparams.moe_route_once_max      == other.cparams.moe_route_once_max      &&
+            cparams.moe_route_once_hist     == other.cparams.moe_route_once_hist     &&
+            cparams.moe_route_once_dry      == other.cparams.moe_route_once_dry      &&
             cparams.head_bound_on           == other.cparams.head_bound_on           &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -1053,6 +1085,10 @@ public:
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_moe_kept; // F32 [1, n_tokens] per MoE layer: the routed experts kept (cparams.moe_tail_hist)
+    // I32 [n_expert_used, n_tokens of the layer] per MoE layer (cparams.moe_route_once_hist): the experts the layer
+    // reads, and the experts independent routing picks (the router's own top-k; the same tensor in a dry run)
+    std::vector<ggml_tensor *> t_moe_route_read;
+    std::vector<ggml_tensor *> t_moe_route_free;
     ggml_tensor * t_head_h = nullptr;      // [n_embd, 1] the input row of a shortlist head (cparams.head_bound_on)
 
     std::vector<ggml_tensor *> t_sampled;
@@ -1167,6 +1203,9 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // the block leaders of route once (build_inp_route_once), one input per graph, made by the first MoE layer
+    mutable llm_graph_input_route_once * inp_route_once = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1337,6 +1376,19 @@ struct llm_graph_context {
              ggml_tensor * weights,
                  int64_t   n_expert_used,
                  int64_t   n_tokens,
+                     int   il) const;
+
+    // route once per block (cparams.moe_route_once): the block leaders for a layer of n_tokens_layer rows (the
+    // micro-batch's tokens, or its outputs in a cropped layer), I32 [n_tokens_layer]; nullptr when the layer has
+    // neither count
+    ggml_tensor * build_inp_route_once(int64_t n_tokens_layer) const;
+
+    // the selection scores [n_expert, n_tokens] masked to -inf outside the experts of each token's block leader (its
+    // top n_expert_used of the same scores), so that the router's top-k picks among those only
+    ggml_tensor * build_moe_route_once(
+             ggml_tensor * selection_probs,
+             ggml_tensor * lead,
+                 int64_t   n_expert_used,
                      int   il) const;
 
     //
