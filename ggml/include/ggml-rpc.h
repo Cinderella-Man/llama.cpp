@@ -6,12 +6,16 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+// Miner Llama (the Pascal fork) adds two ops to stock ggml: GGML_OP_GDN_CONV before GGML_OP_UNARY and GGML_OP_KQ_MASK
+// after GGML_OP_GLU. Every op from GGML_OP_UNARY on therefore has another number than in stock llama.cpp, and a graph
+// sent between a fork build and a stock build would run the wrong ops. The fork's major version (stock 8 + 100) makes
+// each side refuse the other at the handshake: a client accepts only a server with its own major version.
+#define RPC_PROTO_MAJOR_VERSION    108
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    2
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
