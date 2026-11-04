@@ -5306,6 +5306,41 @@ static n3p_fields n3p_block_fields(void * blocks, int64_t i, int n) {
     return (n3p_fields) { y->qs, y->qh, y->scales_l, &y->extra, &y->scales_h, &y->d };
 }
 
+// The same, read only.
+typedef struct {
+    const uint8_t   * qs;
+    const uint8_t   * scales;
+    const uint8_t   * extra;
+    const ggml_half * d;
+} n2p_cfields;
+
+typedef struct {
+    const uint8_t   * qs;
+    const uint8_t   * qh;
+    const uint8_t   * scales_l;
+    const uint8_t   * extra;
+    const uint8_t   * scales_h;
+    const ggml_half * d;
+} n3p_cfields;
+
+static n2p_cfields n2p_block_cfields(const void * blocks, int64_t i, int n) {
+    if (n == QK_K) {
+        const block_n2p * x = (const block_n2p *) blocks + i;
+        return (n2p_cfields) { x->qs, x->scales, x->extra, &x->d };
+    }
+    const block_n2p_128 * x = (const block_n2p_128 *) blocks + i;
+    return (n2p_cfields) { x->qs, x->scales, x->extra, &x->d };
+}
+
+static n3p_cfields n3p_block_cfields(const void * blocks, int64_t i, int n) {
+    if (n == QK_K) {
+        const block_n3p * x = (const block_n3p *) blocks + i;
+        return (n3p_cfields) { x->qs, x->qh, x->scales_l, &x->extra, &x->scales_h, &x->d };
+    }
+    const block_n3p_128 * x = (const block_n3p_128 *) blocks + i;
+    return (n3p_cfields) { x->qs, x->qh, x->scales_l, &x->extra, &x->scales_h, &x->d };
+}
+
 // N2P and N2P-128 (n weights a block): 4-bit sub-scales and shift bits per 8 weights.
 static size_t quantize_n2p_n(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row,
         const float * quant_weights, int n) {
@@ -5348,7 +5383,7 @@ static void dequantize_row_n2p_n(const void * GGML_RESTRICT vx, float * GGML_RES
     const int64_t nb = k / n;
 
     for (int64_t i = 0; i < nb; i++) {
-        const n2p_fields x = n2p_block_fields((void *) vx, i, n);
+        const n2p_cfields x = n2p_block_cfields(vx, i, n);
         const float d = GGML_FP16_TO_FP32(*x.d);
         for (int ib = 0; ib < n/8; ++ib) {
             const float dl = d * (((x.scales[ib/2] >> 4*(ib%2)) & 0xf) - 8);
@@ -5410,7 +5445,7 @@ static void dequantize_row_n3p_n(const void * GGML_RESTRICT vx, float * GGML_RES
     const int64_t nb = k / n;
 
     for (int64_t i = 0; i < nb; i++) {
-        const n3p_fields x = n3p_block_fields((void *) vx, i, n);
+        const n3p_cfields x = n3p_block_cfields(vx, i, n);
         const float d = GGML_FP16_TO_FP32(*x.d);
         for (int ib = 0; ib < n/32; ++ib) {
             const int ls = ((x.scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((*x.scales_h >> ib) & 1) << 4);
