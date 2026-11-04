@@ -2686,7 +2686,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the routed FFN of one set of expert tensors, read at ids (their slots in it): [n_embd, n_expert_used, n_tokens]
     auto build_exps = [&](ggml_tensor * cur, ggml_tensor * up_exps, ggml_tensor * gate_exps, ggml_tensor * down_exps,
-                          ggml_tensor * gate_up_exps, ggml_tensor * ids, ggml_tensor * slots) -> ggml_tensor * {
+                          ggml_tensor * gate_up_exps, ggml_tensor * up_exps_s, ggml_tensor * gate_exps_s,
+                          ggml_tensor * down_exps_s, ggml_tensor * ids, ggml_tensor * slots) -> ggml_tensor * {
         ggml_tensor * up = nullptr;
         ggml_tensor * experts = nullptr;
 
@@ -2860,11 +2861,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * experts = nullptr;
     if (cold == nullptr) {
-        experts = build_exps(cur, up_exps, gate_exps, down_exps, gate_up_exps, selected_experts, slots);
+        experts = build_exps(cur, up_exps, gate_exps, down_exps, gate_up_exps, up_exps_s, gate_exps_s, down_exps_s,
+                             selected_experts, slots);
     } else {
-        // per-expert biases and scales are indexed by the router's ids, not by the slots of a tier
+        // per-expert biases are indexed by the router's ids, not by the slots of a tier (each tier has its own scales)
         GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && "a cold tier has no expert biases");
-        GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s && "a cold tier has no expert scales");
         GGML_ASSERT(selected_experts->ne[0] == n_expert_used);
 
         const int64_t n_hot = down_exps->ne[2];
@@ -2894,8 +2895,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         sel = ggml_cast(ctx0, sel, GGML_TYPE_I32);
         cb(sel, "ffn_moe_tier_sel", il);
 
-        ggml_tensor * hot_out  = build_exps(cur, up_exps,   gate_exps,   down_exps,   gate_up_exps,   ids_hot,  nullptr);
-        ggml_tensor * cold_out = build_exps(cur, cold->up,  cold->gate,  cold->down,  cold->gate_up,  ids_cold, nullptr);
+        ggml_tensor * hot_out  = build_exps(cur, up_exps,  gate_exps,  down_exps,  gate_up_exps,  up_exps_s,  gate_exps_s,  down_exps_s,
+                                            ids_hot, nullptr);
+        ggml_tensor * cold_out = build_exps(cur, cold->up, cold->gate, cold->down, cold->gate_up, cold->up_s, cold->gate_s, cold->down_s,
+                                            ids_cold, nullptr);
 
         // a select, so the dropped outputs never enter the sum
         experts = ggml_get_rows(ctx0, ggml_concat(ctx0, hot_out, cold_out, 1), sel); // [n_embd, n_expert_used, n_tokens]

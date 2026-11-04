@@ -1348,6 +1348,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     const auto & layer = model.layers[il];
     const llm_moe_cold_tier cold = {
         layer.ffn_exps_tier, layer.ffn_up_exps_cold, layer.ffn_gate_exps_cold, layer.ffn_down_exps_cold, layer.ffn_gate_up_exps_cold,
+        layer.ffn_up_exps_cold_s, layer.ffn_gate_exps_cold_s, layer.ffn_down_exps_cold_s,
     };
 
     ggml_tensor * moe_out =

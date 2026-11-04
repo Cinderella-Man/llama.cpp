@@ -1114,6 +1114,9 @@ struct llm_moe_cold_tier {
     ggml_tensor * gate    = nullptr;
     ggml_tensor * down    = nullptr;
     ggml_tensor * gate_up = nullptr;
+    ggml_tensor * up_s    = nullptr; // per-expert scales of the cold tensors, if they have them
+    ggml_tensor * gate_s  = nullptr;
+    ggml_tensor * down_s  = nullptr;
 };
 
 struct llm_graph_context {

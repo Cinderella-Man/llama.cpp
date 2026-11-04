@@ -365,6 +365,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_cold    = nullptr;
     struct ggml_tensor * ffn_up_exps_cold      = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_cold = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold_s    = nullptr; // per-expert scales of the cold tier
+    struct ggml_tensor * ffn_down_exps_cold_s    = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold_s      = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold_in_s = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold_in_s = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold_in_s   = nullptr;
 
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
