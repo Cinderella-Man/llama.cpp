@@ -11,6 +11,8 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
@@ -55,12 +57,25 @@ private:
     ggml_log_level min_level;
 };
 
+// switches for the fit's two upstream fixes (Q706), on unless the variable is "0":
+//   LLAMA_FIT_DRAFT_CTX   a draft model is measured with a no-alloc context of the main model as its ctx_other (#31610),
+//                         so drafts that need the target's context (DFlash, EAGLE-3, Gemma 4 assistant) are counted, and
+//                         with LLAMA_DRAFT_SHARE without the tensors it reads from the target; 0 = measured alone (such
+//                         a draft fails to measure and the fit leaves it out, as before)
+//   LLAMA_FIT_NEXTN_SKIP  NextN layers that are not loaded (no MTP) still count for the loader's n_gpu_layers: the
+//                         fitted -ngl and -ts include them, on the output layer's device (#31569); 0 = left out, as before
+static bool common_fit_switch(const char * name) {
+    const char * s = getenv(name);
+    return s == nullptr || strcmp(s, "0") != 0;
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
         std::vector<ggml_backend_dev_t> & devs,
         uint32_t & hp_ngl,
+        uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
@@ -152,6 +167,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     if (mparams->load_mtp) {
         hp_ngl    += llama_model_n_layer_nextn(model);
     }
+    // without MTP the NextN layers hold no weights but the model loader still counts them for n_gpu_layers
+    hp_ngl_skip    = mparams->load_mtp || !common_fit_switch("LLAMA_FIT_NEXTN_SKIP") ? 0 : llama_model_n_layer_nextn(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
@@ -240,11 +257,12 @@ common_device_memory_data_vec common_get_device_memory_data(
         const llama_context_params * cparams,
         std::vector<ggml_backend_dev_t> & devs,
         uint32_t & hp_ngl,
+        uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_ngl_skip, hp_n_ctx_train, hp_n_expert, log_level);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -270,6 +288,7 @@ static void common_params_fit_impl(
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+    uint32_t hp_nsk = 0; // number of skipped NextN layers, counted by the model loader but not by hp_ngl
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
@@ -291,6 +310,7 @@ static void common_params_fit_impl(
         if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
+            uint32_t nsk_extra = 0;
             uint32_t nct_extra = 0;
             uint32_t nex_extra = 0;
 
@@ -301,8 +321,34 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                if (common_fit_switch("LLAMA_FIT_DRAFT_CTX")) {
+                    common_fit_log_scope log_scope(log_level);
+                    llama_model_params mparams_main = *mparams;
+                    mparams_main.no_alloc  = true;
+                    mparams_main.load_mode = LLAMA_LOAD_MODE_NONE;
+                    llama_model_ptr model_main(llama_model_load_from_file(path_model, mparams_main));
+                    if (!model_main) {
+                        throw std::runtime_error("failed to load the main model");
+                    }
+                    llama_context_ptr ctx_main(llama_init_from_model(model_main.get(), *cparams));
+                    if (!ctx_main) {
+                        throw std::runtime_error("failed to create llama_context for the main model");
+                    }
+
+                    llama_context_params cparams_extra = *extra->cparams;
+                    cparams_extra.ctx_other = ctx_main.get();
+
+                    // a draft that reads tensors from the target (LLAMA_DRAFT_SHARE) is measured without them, as it loads
+                    llama_model_params mparams_extra = *extra->mparams;
+                    if (mparams_extra.share_tensors != 0) {
+                        mparams_extra.share_src = model_main.get();
+                    }
+                    measured = common_get_device_memory_data_impl(
+                        extra->path_model, &mparams_extra, &cparams_extra, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                } else {
+                    measured = common_get_device_memory_data_impl(
+                        extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                }
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
@@ -342,7 +388,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -354,7 +400,7 @@ static void common_params_fit_impl(
         if (n_streams > 1) {
             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_streams);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
         }
     }
     add_extra_memory(dmds_full);
@@ -493,7 +539,7 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min_total;
-                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
                     add_extra_memory(dmds_min_ctx);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
@@ -640,6 +686,20 @@ static void common_params_fit_impl(
         assert(uint32_t(mparams.n_gpu_layers) <= hp_ngl + 1);
         uint32_t il0 = hp_ngl + 1 - mparams.n_gpu_layers; // start index for tensor buft overrides
 
+        // the skipped NextN layers come right before the output layer, put them on the same device as the output layer
+        // so that the layers assigned by the model loader match the layers above
+        if (hp_nsk > 0 && mparams.n_gpu_layers > 0) {
+            mparams.n_gpu_layers += hp_nsk;
+            if (nd > 1) {
+                // the last devices have no layers if not even the output layer fits
+                size_t id_last = nd - 1;
+                while (ngl_per_device[id_last].n_layer == 0) {
+                    id_last--;
+                }
+                tensor_split[id_last] += hp_nsk;
+            }
+        }
+
         mparams.tensor_split = tensor_split;
 
         size_t itbo = 0;
@@ -675,7 +735,7 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
         add_extra_memory(dmd_nl);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
@@ -704,7 +764,7 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
         add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
@@ -1185,10 +1245,11 @@ void common_fit_print(
         llama_context_params * cparams) {
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+    uint32_t hp_nsk = 0; // number of skipped NextN layers, counted by the model loader but not by hp_ngl
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
-    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {

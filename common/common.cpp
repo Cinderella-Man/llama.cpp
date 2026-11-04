@@ -1289,6 +1289,11 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
     }
     cparams_dft.n_rs_seq = 0;
 
+    // a separate draft that reads the target's embeddings or head (LLAMA_DRAFT_SHARE): the fit measures it without them
+    // when it measures with the main model (LLAMA_FIT_DRAFT_CTX); without a source model the bits do nothing
+    mparams_dft.share_tensors = has_draft ? common_draft_share_from_env() : 0;
+    mparams_dft.share_src     = nullptr;
+
     const common_fit_extra_model extra = {
         /*.path_model   =*/ params_dft.model.path.c_str(),
         /*.mparams      =*/ &mparams_dft,
@@ -2779,7 +2784,7 @@ bool common_prompt_checkpoint::tgt_to_host(
         return true;
     }
 
-    std::vector<uint8_t> data(llama_state_seq_store_get_size_host(ctx, seq_id, store));
+    common_state_data data(llama_state_seq_store_get_size_host(ctx, seq_id, store));
 
     const size_t n = llama_state_seq_store_get_data_host(ctx, data_tgt.data(), data_tgt.size(), data.data(), data.size(), seq_id, store);
 

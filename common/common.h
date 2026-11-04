@@ -683,6 +683,7 @@ struct common_params {
     int32_t checkpoint_vram     = 0;     // newest context checkpoints of a slot kept in device memory; 0 = all on the host
     bool    checkpoint_vram_sync = false; // move an older one to the host at once, not in the background
     int32_t checkpoint_spread   = 0;     // context checkpoints at most N tokens apart inside a prompt, evicted by the smallest gap; 0 = off
+    bool    checkpoint_share    = false; // a slot, its prompt-cache entries and child slots share host checkpoints instead of copying them (#30137)
     bool    checkpoint_tail2    = false; // two checkpoints at a prompt's end (4 + n_ubatch and 4 tokens before it), as stock
 
     // agent sessions: checkpoints while generating, at tokens that end a reasoning block or start a tool call
@@ -1348,6 +1349,21 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// leave default-inserted elements uninitialized; callers must fill them before use (#30137: a state buffer is written
+// whole by llama_state_seq_get_data_ext right after it is sized, so zero-filling it first is a wasted pass)
+template <typename T>
+struct common_no_init_allocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = common_no_init_allocator<U>; };
+
+    common_no_init_allocator() = default;
+    template <typename U> common_no_init_allocator(const common_no_init_allocator<U> &) {}
+
+    template <typename U> void construct(U * p) { ::new ((void *) p) U; }
+};
+
+// sequence state data, filled by llama_state_seq_get_data_ext()
+using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1361,8 +1377,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_state_data data_tgt;
+    common_state_data data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <memory>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -683,10 +684,28 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+// a checkpoint does not change after it is created: a copy of a prompt (the prompt cache's entry, a child slot) can
+// share it instead of copying its data (#30137, --ctx-checkpoints-share); a checkpoint that does change (one in a device
+// store moving to the host) is replaced by a new one, and a store's checkpoint is never shared
+using server_prompt_checkpoint_ptr = std::shared_ptr<const common_prompt_checkpoint>;
+using server_prompt_checkpoints    = std::list<server_prompt_checkpoint_ptr>;
+
+// the checkpoints for a copy of a prompt: the same ones (share), or copies of their data
+static inline server_prompt_checkpoints server_prompt_checkpoints_copy(const server_prompt_checkpoints & cks, bool share) {
+    if (share) {
+        return cks;
+    }
+    server_prompt_checkpoints res;
+    for (const auto & ck : cks) {
+        res.push_back(std::make_shared<common_prompt_checkpoint>(*ck));
+    }
+    return res;
+}
+
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    server_prompt_checkpoints checkpoints;
 
     void clear() {
         tokens.clear();
@@ -697,17 +716,18 @@ struct server_prompt {
         return tokens.size();
     }
 
-    server_prompt clone() const {
+    // share: the copy shares the checkpoints (--ctx-checkpoints-share), else it gets copies of their data
+    server_prompt clone(bool share) const {
         return server_prompt {
             tokens.clone(),
-            checkpoints,
+            server_prompt_checkpoints_copy(checkpoints, share),
         };
     }
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_data main;
+    common_state_data drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -722,7 +742,7 @@ struct server_prompt_cache_state {
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
+            res += ckpt->size();
         }
 
         return res;
@@ -742,6 +762,10 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // an entry shares the saved prompt's checkpoints instead of copying them (--ctx-checkpoints-share); the size counts
+    // a shared checkpoint in every entry that holds it
+    bool share_checkpoints = false;
 
     size_t size() const;
 
