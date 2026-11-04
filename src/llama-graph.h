@@ -18,6 +18,7 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
+struct llama_embd_cache;
 struct llama_layer;
 struct llama_prec_policy;
 struct llama_hadamard;
@@ -167,6 +168,10 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
+
+    // set when the graph reads the token rows from a draft's row cache (llama_embd_cache): tokens then holds the
+    // batch's slots in it, which the context prepared for this micro-batch
+    const llama_embd_cache * row_cache = nullptr;
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
@@ -978,6 +983,7 @@ struct llm_graph_params {
             cparams.screen_head_m           == other.cparams.screen_head_m           &&
             cparams.head_short_on           == other.cparams.head_short_on           &&
             cparams.head_short_n            == other.cparams.head_short_n            &&
+            cparams.embd_cache_on           == other.cparams.embd_cache_on           &&
             cparams.moe_tail                == other.cparams.moe_tail                &&
             cparams.moe_tail_p              == other.cparams.moe_tail_p              &&
             cparams.moe_tail_w              == other.cparams.moe_tail_w              &&

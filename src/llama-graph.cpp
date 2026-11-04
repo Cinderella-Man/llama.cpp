@@ -5,6 +5,7 @@
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-embd-cache.h"
 #include "llama-sampler.h"
 
 #include "llama-kv-cache.h"
@@ -367,7 +368,11 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
-    if (ubatch->token) {
+    if (ubatch->token && row_cache) {
+        // the slots the context prepared for this micro-batch (llama_embd_cache::prepare)
+        GGML_ASSERT(row_cache->slots.size() == (size_t) n_tokens);
+        ggml_backend_tensor_set(tokens, row_cache->slots.data(), 0, n_tokens*ggml_element_size(tokens));
+    } else if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here

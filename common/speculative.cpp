@@ -1935,6 +1935,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_token>                   short_add; // scratch: the tokens of a batch to add to the list
     uint64_t                                   short_n_rounds = 0;
 
+    // the draft's token embedding rows on its layer's card (LLAMA_DRAFT_EMBD_CACHE, Q961)
+    bool     embd_cache_on       = false;
+    uint64_t embd_cache_n_rounds = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -2011,6 +2015,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         short_init();
+        embd_cache_init();
+    }
+
+    // LLAMA_DRAFT_EMBD_CACHE=<rows>[,<max tokens>]: batches of up to max tokens (default 16: the draft passes and the
+    // catch-up over a verify step's tokens) read their token rows from a cache on the draft layer's card, so that a
+    // pass with the table on another card (-otd token_embd=CUDA4) does not cross to it; prompts read the table
+    void embd_cache_init() {
+        const char * s = getenv("LLAMA_DRAFT_EMBD_CACHE");
+        if (s == nullptr || *s == '\0') {
+            return;
+        }
+        char * end = nullptr;
+        const long n_rows = strtol(s, &end, 10);
+        long max_tokens = 16;
+        if (end != nullptr && *end == ',') {
+            max_tokens = strtol(end + 1, &end, 10);
+        }
+        if (end == s || (end != nullptr && *end != '\0') || n_rows <= 0 || max_tokens <= 0) {
+            SPC_WRN("LLAMA_DRAFT_EMBD_CACHE='%s' is not <rows>[,<max tokens>]: the draft reads its table\n", s);
+            return;
+        }
+        if (!llama_embd_cache_init(this->params.ctx_dft, (uint32_t) n_rows, (uint32_t) std::min<long>(max_tokens, n_rows))) {
+            SPC_WRN("%s", "no embedding row cache for this draft: it reads its table\n");
+            return;
+        }
+        embd_cache_on = true;
+    }
+
+    void embd_cache_report() const {
+        uint64_t n_hit = 0;
+        uint64_t n_miss = 0;
+        uint64_t n_plain = 0;
+        llama_embd_cache_stats(this->params.ctx_dft, &n_hit, &n_miss, &n_plain);
+        SPC_INF("draft embedding row cache: %" PRIu64 " token rows read from it, %" PRIu64 " of them copied from the table "
+                "first; %" PRIu64 " batches read the table\n", n_hit + n_miss, n_miss, n_plain);
     }
 
     void short_init() {
@@ -2085,6 +2124,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     ~common_speculative_impl_draft_mtp() override {
         if (short_on) {
             short_report();
+        }
+        if (embd_cache_on) {
+            embd_cache_report();
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -2289,6 +2331,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+        }
+
+        if (embd_cache_on && n_drafting > 0 && ++embd_cache_n_rounds % 1000 == 0) {
+            embd_cache_report();
         }
 
         // the shortlisted head, unless a drafting sequence falls back: its target token (id_last) was outside the list

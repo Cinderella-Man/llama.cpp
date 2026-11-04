@@ -189,6 +189,15 @@ LLAMA_API bool     llama_head_shortlist_contains(const struct llama_context * ct
 LLAMA_API uint32_t llama_head_shortlist_size    (const struct llama_context * ctx); // ids in the list, 0 without one
 LLAMA_API void     llama_set_head_shortlist     (struct llama_context * ctx, bool value);
 
+// A draft context's token embedding rows on the card that runs its layer (Q961): n_rows rows of the table, in its own
+// type and bytes, which every batch of at most max_tokens tokens reads instead of the table (a row is copied from the
+// table when a token first needs it, into the slot read longest ago); larger batches read the table. So a draft pass
+// with the table on another card (-otd token_embd=CUDA<n>) runs on one card, with the same numbers. Supported by the
+// qwen4exp MTP draft; false when the context has no MTP layer or the layer's card can't read the table's type.
+LLAMA_API bool llama_embd_cache_init (struct llama_context * ctx, uint32_t n_rows, uint32_t max_tokens);
+// tokens read from the cache, of them copied from the table first, and batches that read the table; false without one
+LLAMA_API bool llama_embd_cache_stats(const struct llama_context * ctx, uint64_t * n_hit, uint64_t * n_miss, uint64_t * n_plain);
+
 // The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
 // logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
 // -INFINITY; llama_head_bound_ith(i) is then at least every left-out logit the full head would have computed (Cauchy-

@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-embd-cache.h"
 #include "llama-head-shortlist.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -637,7 +638,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_name(inp->h, "mtp_h_input");
 
     ggml_tensor * tok_embd;
-    if (ubatch.token) {
+    if (ubatch.token && cparams.embd_cache_on && cparams.embd_cache) {
+        // the rows from the row cache on this layer's card, the same bytes as the table's (llama_embd_cache, Q961):
+        // inp->tokens holds the batch's slots
+        inp->row_cache = cparams.embd_cache;
+        tok_embd = ggml_get_rows(ctx0, cparams.embd_cache->rows, inp->tokens);
+    } else if (ubatch.token) {
         tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     } else {
         tok_embd = inp->embd;
