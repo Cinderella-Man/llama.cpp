@@ -12792,6 +12792,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The grid types and IQ1_M in the k-column and multi-token kernels (Q713): 5 to 8 tokens of the grid types (1 to 4 are
+    // above), 1 to 8 of IQ1_M, which has no one-token Pascal kernel. Dense products (mmvq-pascal-kcol: one super-block per
+    // lane, 2-byte-aligned rows staged by the warp): K = 2560 (2 lanes per row), 6144 (8), 1024, 2048, 3072, an odd row
+    // count, rows that are views of wider rows, one-super-block rows (K = 256). Routed experts (mmvq-pascal-mtok-iq.cuh:
+    // each distinct expert read once): gate or up with one input for all slots and one per slot, K = 1024 (8-byte staging
+    // for IQ2_XXS and IQ3_S), the fused gate/up + SwiGLU (with a bias, with skipped slots), the routed + shared expert
+    // launch, duplicate routing, and consecutive tokens sharing experts (init_mul_mat_id_ids_overlap, partial row blocks
+    // at 641 rows). 32 of 64 experts at 5 to 8 tokens give more (token, slot) entries than the kernels take: those run in
+    // chunks of tokens on the earlier kernels. GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP=<types> and _KCOL_SKIP=<types> switch the
+    // new kernels off per type.
+    for (ggml_type type : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                            GGML_TYPE_IQ1_M }) {
+        const int64_t n0 = type == GGML_TYPE_IQ1_M ? 1 : 5;
+        for (int64_t n = n0; n <= 8; ++n) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 640, 2560 }, { 641, 2560 }, { 2560, 6144 }, { 1000, 1024 }, { 768, 2048 }, { 333, 3072 }, { 64, 256 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 640, n, 2560, { 1, 1 }, { 1, 1 },
+                                                     { 0, 1, 2, 3 }, 3072));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, true,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 10, false, 1000, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 32, 10, true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 256, 2560, true, 16, 10, true,
+                                                                true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 256, 2560, true, 16, 10, true,
+                                                                false, true, false, { 4, 2 }, true));
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, false, 256, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_dup(type, GGML_TYPE_F32, 28, 10, true, 256, n, 2560));
+            if (n >= 5) {
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 32, false, 256, n, 1024));
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 256, 1024, true, 64, 32,
+                                                                    true));
+            }
+        }
+        for (int64_t n : { 2, 3, 4, 5, 6, 7, 8 }) {
+            for (double keep : { 0.5, 1.0 }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion_overlap(type, n, 256, 2560, 32, 10, keep));
+                test_cases.emplace_back(new test_mul_mat_id_overlap(type, 32, 10, true, 256, n, 2560, keep));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion_overlap(type, n, 641, 2560, 16, 10, 0.5));
+            test_cases.emplace_back(new test_mul_mat_id_overlap(type, 32, 10, false, 1000, n, 1024, 0.5));
+        }
+    }
+
     // Q2_0 experts of 2 to 8 tokens (mmvq-pascal-mtok.cu: each distinct expert read once for all the tokens that picked
     // it): 5 to 8 tokens of the cases above (1 to 4 are there); routing where consecutive tokens share experts
     // (init_mul_mat_id_ids_overlap: groups of 1 to n entries) for the fused gate/up + SwiGLU (with and without a bias),
@@ -14155,6 +14202,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 64, 8, true));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 8, false, 3072, n, 1024));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
+    // the grid types at 5 to 8 tokens and IQ1_M at 1 to 8 (Q713: the k-column and multi-token kernels), the shapes below:
+    // compare with GGML_CUDA_MMVQ_PASCAL_KCOL_SKIP=<type> (dense) and GGML_CUDA_MMVQ_PASCAL_MTOK_SKIP=<type> (experts);
+    // bench/mmvq_pascal/iq_kcol_perf.sh runs both
+    for (ggml_type type : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                            GGML_TYPE_IQ1_M }) {
+        for (int64_t n = type == GGML_TYPE_IQ1_M ? 1 : 5; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560, true, 128, 10, true));
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    { 10240, 2560 }, { 12288, 2560 }, { 6144, 2560 }, { 2560, 6144 } }) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+            }
         }
     }
 
