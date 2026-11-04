@@ -77,6 +77,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml-cuda/moe-persistent.cuh"
+#include "ggml-cuda/hop-mailbox.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -818,6 +819,26 @@ static bool ggml_cuda_hop_staged_on(ggml_backend_cuda_context * ctx_dst, int dev
     return ctx_dst->hop_peer[dev_src] == 1;
 }
 
+// whether a copy between two backends on different physical cards takes the mailbox (GGML_CUDA_HOP_MAILBOX,
+// hop-mailbox.cuh): 1 between cards without peer access, 2 between any two
+static bool ggml_cuda_hop_mailbox_on(ggml_backend_cuda_context * ctx_dst, int dev_src, int src_physical, int dst_physical) {
+    if (ctx_dst->hop_mailbox < 0) {
+        ctx_dst->hop_mailbox = ggml_cuda_hop_env("GGML_CUDA_HOP_MAILBOX", 0, 0, 2);
+    }
+    if (ctx_dst->hop_mailbox == 0 || dev_src < 0 || dev_src >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    if (ctx_dst->hop_mailbox >= 2) {
+        return true;
+    }
+    if (ctx_dst->hop_peer[dev_src] == 0) {
+        int can = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dst_physical, src_physical));
+        ctx_dst->hop_peer[dev_src] = can ? 2 : 1;
+    }
+    return ctx_dst->hop_peer[dev_src] == 1;
+}
+
 static ggml_cuda_hop_ring * ggml_cuda_hop_ring_get(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst) {
     ggml_cuda_hop_ring *& r = ctx_dst->hop_rings[ctx_src->device];
     if (r != nullptr) {
@@ -944,6 +965,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        if (hop_mailboxes[i] != nullptr) {
+            ggml_cuda_hop_mailbox_free(hop_mailboxes[i], this);
+            hop_mailboxes[i] = nullptr;
+        }
         if (hop_rings[i] != nullptr) {
             ggml_cuda_hop_ring_free(hop_rings[i], name);
             hop_rings[i] = nullptr;
@@ -3145,6 +3170,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        } else if (ggml_cuda_hop_mailbox_on(cuda_ctx_dst, cuda_ctx_src->device, src_physical, dst_physical) &&
+                   ggml_cuda_hop_mailbox_copy(cuda_ctx_src, cuda_ctx_dst, (char *) dst->data, (const char *) src->data, ggml_nbytes(dst))) {
+            // GGML_CUDA_HOP_MAILBOX: a kernel on each card through this boundary's mailbox; the destination's stream is
+            // ordered after it. Copies it does not take fall through to the staged hop or the peer copy
+            return true;
         } else if (ggml_cuda_hop_staged_on(cuda_ctx_dst, cuda_ctx_src->device, src_physical, dst_physical)) {
             // GGML_CUDA_HOP_STAGED: through this boundary's pinned ring; the destination's stream is ordered after it
             ggml_cuda_hop_ring * ring = ggml_cuda_hop_ring_get(cuda_ctx_src, cuda_ctx_dst);

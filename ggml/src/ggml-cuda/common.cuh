@@ -1464,6 +1464,8 @@ struct ggml_cuda_stream_context {
 
 // the manual staged hop between two cards without peer access (GGML_CUDA_HOP_STAGED; ggml-cuda.cu)
 struct ggml_cuda_hop_ring;
+// the mailbox hop in mapped host memory (GGML_CUDA_HOP_MAILBOX; hop-mailbox.cu)
+struct ggml_cuda_hop_mailbox;
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1476,6 +1478,9 @@ struct ggml_backend_cuda_context {
     int                  hop_staged = -1;
     unsigned char        hop_peer[GGML_CUDA_MAX_DEVICES]  = {};
     ggml_cuda_hop_ring * hop_rings[GGML_CUDA_MAX_DEVICES] = {};
+    // the same for GGML_CUDA_HOP_MAILBOX (-1: not read yet) and its mailbox per source device
+    int                     hop_mailbox = -1;
+    ggml_cuda_hop_mailbox * hop_mailboxes[GGML_CUDA_MAX_DEVICES] = {};
     // the event the scheduler last made this card's stream wait on (ggml_backend_cuda_event_wait), which guards the
     // input copy it writes next: a hop on a copy stream waits on it too. Cleared by each graph evaluation and sync
     cudaEvent_t          hop_guard = nullptr;
