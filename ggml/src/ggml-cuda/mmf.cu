@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "mmf.cuh"
 #include "mmid.cuh"
+#include "moe-tail.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -10,7 +11,16 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
+static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+// ids that may hold -1 (skipped slots, moe-tail.cuh): the kernels read a copy without them, then the slots' rows become zeros
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    const ggml_cuda_skip_ids skip(ctx, ids, src0->ne[2]);
+    ggml_cuda_mul_mat_f_impl(ctx, src0, src1, skip.ids(), dst);
+    skip.zero_rows(ctx, dst);
+}
+
+static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);

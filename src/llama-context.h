@@ -168,6 +168,7 @@ struct llama_context {
 
     // fewer routed experts on confident tokens (llama_set_moe_tail)
     void     set_moe_tail(bool on, float p, float w, bool renorm, bool hist);
+    void     set_moe_tail_mode(bool graph, int skip, bool repeat);
     uint64_t moe_tail_counts(uint64_t * counts, int32_t n_counts) const;
     void     moe_tail_log() const;
 

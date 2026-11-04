@@ -30,6 +30,13 @@ static __global__ void k_get_rows(
             const int iybs = i00 - i00%qk; // dst block start index
             const int y_offset = qr == 1 ? 1 : qk/2;
 
+            if (i01 < 0) {
+                // row -1 (a skipped expert, ggml_moe_tail_ids): zeros
+                dst_row[iybs + iqs + 0]        = ggml_cuda_cast<dst_t>(0.0f);
+                dst_row[iybs + iqs + y_offset] = ggml_cuda_cast<dst_t>(0.0f);
+                continue;
+            }
+
             // dequantize
             float2 v;
             dequantize_kernel(src0_row, ib, iqs, v);
@@ -63,6 +70,16 @@ static __global__ void k_get_rows_kq(
         dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
         const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
+        if (i01 < 0) {
+            // row -1 (a skipped expert, ggml_moe_tail_ids): zeros
+            for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
+                for (int t = threadIdx.x; t < QK_K; t += blockDim.x) {
+                    dst_row[ib*QK_K + t] = ggml_cuda_cast<dst_t>(0.0f);
+                }
+            }
+            continue;
+        }
+
         for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
             dequantize_kq(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
         }
@@ -93,6 +110,17 @@ static __global__ void k_get_rows_float(
         const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
         dst_t * GGML_CUDA_RESTRICT dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        if (i01 < 0) {
+            // row -1 (a skipped expert, ggml_moe_tail_ids): -1 from I32 rows (MoE cache slots), else zeros
+            for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
+                if constexpr (std::is_same_v<src0_t, int32_t>) {
+                    dst_row[i00] = ggml_cuda_cast<dst_t>(src0_t(-1));
+                } else {
+                    dst_row[i00] = ggml_cuda_cast<dst_t>(0.0f);
+                }
+            }
+            continue;
+        }
         const src0_t * GGML_CUDA_RESTRICT src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
         for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
@@ -121,6 +149,14 @@ static __global__ void k_get_rows_float_vec(
         const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
 
         int4       * GGML_CUDA_RESTRICT dst_row  = (int4 *)      (dst_ptr + i10*s1 + i11*s2 + i12*s3);
+        if (i01 < 0) {
+            // row -1: -1 from I32 rows, zeros from float ones, as in k_get_rows_float
+            const int f = std::is_same_v<dst_t, int32_t> ? -1 : 0;
+            for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00v; i += gridDim.y*blockDim.x) {
+                dst_row[i] = make_int4(f, f, f, f);
+            }
+            continue;
+        }
         const int4 * GGML_CUDA_RESTRICT src0_row = (const int4 *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
 
         for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00v; i += gridDim.y*blockDim.x) {

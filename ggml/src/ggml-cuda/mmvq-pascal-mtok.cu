@@ -99,7 +99,22 @@ static __device__ __forceinline__ bool mtok_group(const mtok_args & p, const uin
     const int ty   = y / p.nslots;
     const int ey   = p.ids[(y - ty*p.nslots) + ty*p.ids_stride];
     if (ey < 0) {
-        return false; // a skipped slot
+        // a skipped slot (id -1, moe-tail.cuh): zeros in its rows of every row block of the block, and no expert's rows
+        // are read; no other entry matches it
+        float * dst = p.dst + sample_dst*p.stride_sample_dst + (y - ty*p.nslots)*p.stride_channel_dst + ty*p.stride_col_dst;
+        const int sl  = lane & ((1 << p.lpr_log2) - 1);
+        const int grp = lane >> p.lpr_log2;
+        for (int rbi = 0; rbi < p.rb; ++rbi) {
+            const int rblk = (int) blockIdx.x * p.rb + rbi;
+            if (rblk >= p.nrowblocks) {
+                break;
+            }
+            const int row0 = ((rblk * MMVQP_MTOK_NWARPS + (int) threadIdx.y) << (5 - p.lpr_log2)) + grp;
+            if (sl == 0 && row0 < p.nrows) {
+                dst[row0] = 0.0f;
+            }
+        }
+        return false;
     }
     int      rank = 0; // entries before y with the same expert
     uint32_t mk[4];    // entries from y on with the same expert, 32 per word

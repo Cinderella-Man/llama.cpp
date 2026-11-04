@@ -205,13 +205,19 @@ LLAMA_API void  llama_head_bound_stats(const struct llama_context * ctx, uint64_
 
 // Fewer routed experts on confident tokens (Q618): after the router's top-k, a slot's weight becomes 0 when the slots
 // ranked above it already hold a share p of the token's routed weight, or its own share is below w (w < 1/k); renorm
-// rescales the kept weights to the token's sum of its k weights. The experts are still computed (graph level: their
-// outputs are weighted 0). hist counts the experts kept per token and MoE layer (a synchronous read per decode),
-// logged every 65,536 tokens and when the context is freed. LLAMA_MOE_TAIL=p=<p>,w=<w>,renorm=<0|1>,hist=<0|1> turns
-// it on for every context. llama_moe_tail_counts fills counts[n] with the (token, layer) pairs that kept n experts,
+// rescales the kept weights to the token's sum of its k weights. hist counts the experts kept per token and MoE layer
+// (a synchronous read per decode), logged every 65,536 tokens and when the context is freed.
+// LLAMA_MOE_TAIL=p=<p>,w=<w>,renorm=<0|1>,hist=<0|1>[,graph=<0|1>,skip=<n>,repeat=<0|1>] turns it on for every context. llama_moe_tail_counts fills counts[n] with the (token, layer) pairs that kept n experts,
 // n < n_counts, and returns the pairs counted.
 LLAMA_API void     llama_set_moe_tail   (struct llama_context * ctx, bool on, float p, float w, bool renorm, bool hist);
 LLAMA_API uint64_t llama_moe_tail_counts(const struct llama_context * ctx, uint64_t * counts, int32_t n_counts);
+
+// How the cut runs (Q660, Q661): by default GGML_OP_MOE_TAIL gives a dropped slot the id -1 in micro-batches of up to
+// skip tokens (default 8), so that the expert kernels never read its rows, or with repeat its token's last kept expert
+// (read again, at weight 0); larger micro-batches keep every slot's expert at weight 0. graph keeps the graph-level ops
+// instead, which weight the dropped experts 0 and still compute them. LLAMA_MOE_TAIL's graph=<0|1>, skip=<n> and
+// repeat=<0|1> set it. Call it before llama_set_moe_tail.
+LLAMA_API void     llama_set_moe_tail_mode(struct llama_context * ctx, bool graph, int32_t skip, bool repeat);
 
 //
 // model/context data extraction

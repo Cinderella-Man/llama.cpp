@@ -4,6 +4,7 @@
 #include "mmvf.cuh"
 #include "mmvf-pascal.cuh"
 #include "mmf.cuh"
+#include "moe-tail.cuh"
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -631,7 +632,18 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion);
+
+// ids that may hold -1 (skipped slots, moe-tail.cuh): the kernels read a copy without them, then the slots' rows become zeros
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion) {
+    const ggml_cuda_skip_ids skip(ctx, ids, src0->ne[2]);
+    ggml_cuda_mul_mat_vec_f_impl(ctx, src0, src1, skip.ids(), dst, fusion);
+    skip.zero_rows(ctx, dst);
+}
+
+static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);

@@ -3,7 +3,10 @@
 //
 // - Q618, fewer routed experts on confident tokens (llama_set_moe_tail): at p = 1 the logits of a prompt equal the
 //   switch-off logits bit for bit and every token keeps all its experts; below it the logits deviate and the
-//   histogram counts fewer experts.
+//   histogram counts fewer experts. Q660: the cut as GGML_OP_MOE_TAIL (the default; -1 ids for micro-batches of up to
+//   8 tokens, which MUL_MAT_ID skips; with repeat the last kept expert instead; every slot's own expert in larger ones
+//   or with skip = 0) gives the graph-level ops' logits and histogram bit for bit, in micro-batches of 64, 4 and 1
+//   tokens.
 // - Q619, the shortlist head with an exact bound (llama_head_bound_*): greedy and sampled generations (top-k, min-p,
 //   temperature, penalties, a grammar) give the same tokens, with the same probabilities, with it on and off; the
 //   sampled tokens that kept the shortlist's row and those that fell back to the full head are counted. With
@@ -56,11 +59,11 @@ static std::vector<llama_token> make_prompt(int i, int n_vocab) {
     return p;
 }
 
-static llama_context * make_ctx(llama_model * model, int n_threads) {
+static llama_context * make_ctx(llama_model * model, int n_threads, int n_ubatch = 64) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx           = 256;
     cp.n_batch         = 256;
-    cp.n_ubatch        = 64;
+    cp.n_ubatch        = n_ubatch;
     cp.n_seq_max       = 1;
     cp.n_threads       = n_threads;
     cp.n_threads_batch = n_threads;
@@ -105,69 +108,104 @@ static void test_moe_tail(llama_model * model, const args_t & a) {
         return;
     }
 
-    llama_context * c_off  = make_ctx(model, a.n_threads);
-    llama_context * c_tail = make_ctx(model, a.n_threads);
-
     struct arm_t { float p; float w; bool renorm; };
     const arm_t arms[] = {
         { 1.00f, 0.00f, false }, // nothing dropped
         { 1.00f, 0.00f, true  },
         { 0.90f, 0.00f, false },
         { 0.90f, 0.00f, true  },
+        { 0.80f, 0.00f, true  },
         { 0.60f, 0.00f, true  },
         { 1.00f, 0.75f/k, true }, // a minimum share
     };
+    // how the cut runs: the graph-level ops (the reference), GGML_OP_MOE_TAIL with -1 ids up to 8 tokens, with the last
+    // kept expert up to 8 tokens (repeat), and with every slot's own expert (skip 0)
+    struct mode_t { const char * name; bool graph; int skip; bool repeat; };
+    const mode_t modes[] = {
+        { "graph",     true,  8, false },
+        { "op",        false, 8, false },
+        { "op-repeat", false, 8, true  },
+        { "op-skip0",  false, 0, false },
+    };
 
-    for (const auto & arm : arms) {
-        llama_free(c_tail);
-        c_tail = make_ctx(model, a.n_threads);
-        llama_set_moe_tail(c_tail, true, arm.p, arm.w, arm.renorm, true);
+    // micro-batches of 64 tokens (the last kept expert), 4 and 1 (-1 ids)
+    for (const int n_ubatch : { 64, 4, 1 }) {
+        llama_context * c_off = make_ctx(model, a.n_threads, n_ubatch);
 
-        double   max_diff = 0.0;
-        uint64_t n_pos = 0;
-        uint64_t n_same_top = 0;
-        bool     identical = true;
+        std::vector<std::vector<float>> l_off(a.n_prompts);
         for (int i = 0; i < a.n_prompts; ++i) {
-            const auto prompt = make_prompt(i, n_vocab);
-            const auto l_off  = prompt_logits(c_off,  prompt, n_vocab);
-            const auto l_tail = prompt_logits(c_tail, prompt, n_vocab);
-            identical = identical && memcmp(l_off.data(), l_tail.data(), l_off.size()*sizeof(float)) == 0;
-            for (size_t j = 0; j < prompt.size(); ++j) {
-                const float * x = l_off.data()  + j*n_vocab;
-                const float * y = l_tail.data() + j*n_vocab;
-                for (int t = 0; t < n_vocab; ++t) {
-                    max_diff = std::max(max_diff, (double) std::fabs(x[t] - y[t]));
+            l_off[i] = prompt_logits(c_off, make_prompt(i, n_vocab), n_vocab);
+        }
+
+        for (const auto & arm : arms) {
+            std::vector<std::vector<float>> l_graph;
+            std::vector<uint64_t> counts_graph;
+
+            for (const auto & mode : modes) {
+                llama_context * c_tail = make_ctx(model, a.n_threads, n_ubatch);
+                llama_set_moe_tail_mode(c_tail, mode.graph, mode.skip, mode.repeat);
+                llama_set_moe_tail(c_tail, true, arm.p, arm.w, arm.renorm, true);
+
+                double   max_diff = 0.0;
+                uint64_t n_pos = 0;
+                uint64_t n_same_top = 0;
+                bool     identical = true;  // to the switch off
+                bool     same_graph = true; // to the graph-level ops
+                std::vector<std::vector<float>> l_tail(a.n_prompts);
+                for (int i = 0; i < a.n_prompts; ++i) {
+                    const auto prompt = make_prompt(i, n_vocab);
+                    l_tail[i] = prompt_logits(c_tail, prompt, n_vocab);
+                    identical = identical && memcmp(l_off[i].data(), l_tail[i].data(), l_off[i].size()*sizeof(float)) == 0;
+                    if (!mode.graph) {
+                        same_graph = same_graph &&
+                            memcmp(l_graph[i].data(), l_tail[i].data(), l_tail[i].size()*sizeof(float)) == 0;
+                    }
+                    for (size_t j = 0; j < prompt.size(); ++j) {
+                        const float * x = l_off[i].data()  + j*n_vocab;
+                        const float * y = l_tail[i].data() + j*n_vocab;
+                        for (int t = 0; t < n_vocab; ++t) {
+                            max_diff = std::max(max_diff, (double) std::fabs(x[t] - y[t]));
+                        }
+                        n_same_top += argmax(x, n_vocab) == argmax(y, n_vocab);
+                        n_pos++;
+                    }
                 }
-                n_same_top += argmax(x, n_vocab) == argmax(y, n_vocab);
-                n_pos++;
+
+                std::vector<uint64_t> counts(k + 1, 0);
+                const uint64_t n_pairs = llama_moe_tail_counts(c_tail, counts.data(), k + 1);
+                double mean = 0.0;
+                for (int c = 0; c <= k; ++c) {
+                    mean += (double) c*counts[c];
+                }
+                mean /= std::max<uint64_t>(n_pairs, 1);
+
+                printf("moe tail p = %.2f, w = %.3f, renorm %d, ubatch %2d, %-9s: %s, max |diff| %.3g, same top token "
+                        "%.1f %% of %llu positions; %llu token-layers, mean %.2f of %d experts kept%s\n", arm.p, arm.w,
+                        (int) arm.renorm, n_ubatch, mode.name, identical ? "identical logits" : "logits differ",
+                        max_diff, 100.0*n_same_top/n_pos, (unsigned long long) n_pos, (unsigned long long) n_pairs,
+                        mean, k, mode.graph ? "" : same_graph ? "; the graph's logits" : "; logits DIFFER from the graph's");
+
+                CHECK(n_pairs > 0);
+                if (arm.p == 1.0f && arm.w == 0.0f) {
+                    // the switch on, nothing dropped: the same logits, every pair with all k experts
+                    CHECK(identical);
+                    CHECK(counts[k] == n_pairs);
+                } else {
+                    CHECK(mean < k);
+                }
+                if (mode.graph) {
+                    l_graph      = std::move(l_tail);
+                    counts_graph = counts;
+                } else {
+                    // the op drops the same slots with the same arithmetic, and a dropped expert adds 0 either way
+                    CHECK(same_graph);
+                    CHECK(counts == counts_graph);
+                }
+                llama_free(c_tail);
             }
         }
-
-        std::vector<uint64_t> counts(k + 1, 0);
-        const uint64_t n_pairs = llama_moe_tail_counts(c_tail, counts.data(), k + 1);
-        double mean = 0.0;
-        for (int c = 0; c <= k; ++c) {
-            mean += (double) c*counts[c];
-        }
-        mean /= std::max<uint64_t>(n_pairs, 1);
-
-        printf("moe tail p = %.2f, w = %.3f, renorm %d: %s, max |diff| %.3g, same top token %.1f %% of %llu positions; "
-                "%llu token-layers, mean %.2f of %d experts kept\n", arm.p, arm.w, (int) arm.renorm,
-                identical ? "identical logits" : "logits differ", max_diff, 100.0*n_same_top/n_pos,
-                (unsigned long long) n_pos, (unsigned long long) n_pairs, mean, k);
-
-        CHECK(n_pairs > 0);
-        if (arm.p == 1.0f && arm.w == 0.0f) {
-            // the switch on, nothing dropped: the same logits, every pair with all k experts
-            CHECK(identical);
-            CHECK(counts[k] == n_pairs);
-        } else {
-            CHECK(mean < k);
-        }
+        llama_free(c_off);
     }
-
-    llama_free(c_tail);
-    llama_free(c_off);
 }
 
 struct sampling_arm {

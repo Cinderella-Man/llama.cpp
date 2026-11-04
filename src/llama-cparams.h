@@ -80,6 +80,13 @@ struct llama_cparams {
     float moe_tail_w      = 0.0f;
     bool  moe_tail_renorm = false;
     bool  moe_tail_hist   = false;
+    // how the cut runs: GGML_OP_MOE_TAIL (the default), whose -1 ids for micro-batches of up to moe_tail_skip tokens make
+    // the expert kernels skip the dropped experts' reads (Q660; moe_tail_repeat: the dropped slots read their token's last
+    // kept expert again instead, Q661; larger micro-batches keep every slot's expert at weight 0), or (moe_tail_graph) the
+    // graph-level ops that weight the dropped experts 0
+    bool     moe_tail_graph  = false;
+    uint32_t moe_tail_skip   = 8;
+    bool     moe_tail_repeat = false;
 
     // the main model's head over the shortlist head_short with an exact bound on the other logits (Q619,
     // llama_head_bound_*): while head_bound_on, a decode with one output computes the shortlist's logits and keeps

@@ -609,6 +609,8 @@ extern "C" {
 
         GGML_OP_KQ_MASK,
 
+        GGML_OP_MOE_TAIL,
+
         GGML_OP_COUNT,
     };
 
@@ -1748,6 +1750,7 @@ extern "C" {
     // b I32 [n_rows, ne2, ne3, 1]
     //
     // return [n_embd, n_rows, ne2, ne3]
+    // row -1 (a skipped expert, ggml_moe_tail_ids) reads as zeros, or as -1 from I32 data (CPU and CUDA)
     GGML_API struct ggml_tensor * ggml_get_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
@@ -2507,6 +2510,33 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // the low-weight tail of each token's routed experts
+    // weights: F32 [1, k, n_tokens] or [k, n_tokens], contiguous, a token's k routed weights in the router's order
+    // ids:     I32 [k, n_tokens], their experts
+    // a slot is dropped when the shares (weight / the sum of the token's k weights) of the slots before it sum to p or
+    // more, or when its own share is below w
+    // ggml_moe_tail:     the weights, 0 for a dropped slot; renorm scales the kept ones back to the token's sum
+    // ggml_moe_tail_ids: the ids; when n_tokens <= n_skip, -1 for a dropped slot (no expert: GGML_OP_MUL_MAT_ID writes
+    //                    zeros, GGML_OP_ADD_ID adds nothing, GGML_OP_GET_ROWS reads zeros) or with repeat its token's
+    //                    last kept expert (named twice by the token); larger batches keep every slot's own expert (its
+    //                    weight is 0), since some backends' kernels for them take neither -1 nor a repeated expert
+    GGML_API struct ggml_tensor * ggml_moe_tail(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * ids,
+            float                 p,
+            float                 w,
+            bool                  renorm);
+
+    GGML_API struct ggml_tensor * ggml_moe_tail_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * ids,
+            float                 p,
+            float                 w,
+            int                   n_skip,
+            bool                  repeat);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

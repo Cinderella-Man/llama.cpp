@@ -1120,9 +1120,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "KQ_MASK",
+
+    "MOE_TAIL",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1239,9 +1241,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "kq_mask(c,t)",
+
+    "moe_tail(w,ids)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5564,6 +5568,59 @@ struct ggml_tensor * ggml_top_k(
     result->src[0] = a;
 
     return result;
+}
+
+// ggml_moe_tail
+
+static struct ggml_tensor * ggml_moe_tail_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * ids,
+        float                 p,
+        float                 w,
+        bool                  renorm,
+        int                   n_skip,
+        bool                  repeat,
+        bool                  out_ids) {
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(ggml_nelements(weights) == ids->ne[0]*ids->ne[1] && ids->ne[2] == 1 && ids->ne[3] == 1);
+
+    struct ggml_tensor * result = out_ids ?
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]) : ggml_dup_tensor(ctx, weights);
+
+    ggml_set_op_params_f32(result, 0, p);
+    ggml_set_op_params_f32(result, 1, w);
+    ggml_set_op_params_i32(result, 2, renorm ? 1 : 0);
+    ggml_set_op_params_i32(result, 3, n_skip);
+    ggml_set_op_params_i32(result, 4, repeat ? 1 : 0);
+
+    result->op     = GGML_OP_MOE_TAIL;
+    result->src[0] = weights;
+    result->src[1] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_tail(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * ids,
+        float                 p,
+        float                 w,
+        bool                  renorm) {
+    return ggml_moe_tail_impl(ctx, weights, ids, p, w, renorm, 0, false, false);
+}
+
+struct ggml_tensor * ggml_moe_tail_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * ids,
+        float                 p,
+        float                 w,
+        int                   n_skip,
+        bool                  repeat) {
+    return ggml_moe_tail_impl(ctx, weights, ids, p, w, false, n_skip, repeat, true);
 }
 
 // ggml_arange

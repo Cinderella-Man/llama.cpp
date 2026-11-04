@@ -2662,7 +2662,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // after the scale, so that the fused top-k kernel still produces the weights the tail is cut from
     if (cparams.moe_tail && n_expert_used > 1) {
-        weights = build_moe_tail(weights, n_expert_used, n_tokens, il);
+        if (cparams.moe_tail_graph) {
+            weights = build_moe_tail(weights, n_expert_used, n_tokens, il);
+        } else {
+            build_moe_tail_op(weights, selected_experts, n_expert_used, n_tokens, il);
+        }
     }
 
     //call early so that topk-moe can be used
@@ -2941,6 +2945,34 @@ ggml_tensor * llm_graph_context::build_moe_tail(
     }
 
     return ggml_reshape_3d(ctx0, kept, 1, n_expert_used, n_tokens);
+}
+
+void llm_graph_context::build_moe_tail_op(
+         ggml_tensor *& weights,
+         ggml_tensor *& selected_experts,
+             int64_t   n_expert_used,
+             int64_t   n_tokens,
+                 int   il) const {
+    // the same cut as build_moe_tail in one op for the weights and one for the ids, right after the top-k chain (the
+    // CUDA backend computes both in its fused router kernel); a dropped slot's id is -1 in micro-batches of up to
+    // moe_tail_skip tokens, which the expert kernels skip (or with moe_tail_repeat its token's last kept expert)
+    ggml_tensor * w   = ggml_moe_tail(ctx0, weights, selected_experts, cparams.moe_tail_p, cparams.moe_tail_w,
+                                      cparams.moe_tail_renorm);
+    cb(w, "ffn_moe_weights_tail", il);
+    ggml_tensor * ids = ggml_moe_tail_ids(ctx0, weights, selected_experts, cparams.moe_tail_p, cparams.moe_tail_w,
+                                          (int) cparams.moe_tail_skip, cparams.moe_tail_repeat);
+    cb(ids, "ffn_moe_topk_tail", il);
+    ggml_build_forward_expand(gf, w);
+    ggml_build_forward_expand(gf, ids);
+
+    if (cparams.moe_tail_hist) {
+        // the histogram of build_moe_tail's keep mask (its weights stay out of the graph); a diagnostic: the router's
+        // weights then have a reader outside the fused launch, so the CUDA backend runs the tail as its own kernels
+        build_moe_tail(weights, n_expert_used, n_tokens, il);
+    }
+
+    weights          = w;
+    selected_experts = ids;
 }
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(

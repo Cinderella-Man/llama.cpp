@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "moe-tail.cuh"
 
 #include <cstdint>
 
@@ -172,7 +173,20 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
+static void ggml_cuda_mul_mat_q_impl(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion);
+
+// ids that may hold -1 (skipped slots, moe-tail.cuh): the kernels read a copy without them, then the slots' rows become zeros
 void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    const ggml_cuda_skip_ids skip(ctx, ids, src0->ne[2]);
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, skip.ids(), dst, fusion);
+    skip.zero_rows(ctx, dst);
+}
+
+static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);

@@ -494,19 +494,25 @@ llama_context::llama_context(
         }
     }
 
-    // fewer routed experts on confident tokens (Q618): LLAMA_MOE_TAIL=p=<p>,w=<w>,renorm=<0|1>,hist=<0|1>, any subset,
-    // defaults 1, 0, 0, 1 (p = 1 and w = 0 drop nothing)
+    // fewer routed experts on confident tokens (Q618): LLAMA_MOE_TAIL=p=<p>,w=<w>,renorm=<0|1>,hist=<0|1>,
+    // graph=<0|1>,skip=<n>,repeat=<0|1>, any subset, defaults 1, 0, 0, 1, 0, 8, 0 (p = 1 and w = 0 drop nothing)
     cparams.moe_tail        = false;
     cparams.moe_tail_p      = 1.0f;
     cparams.moe_tail_w      = 0.0f;
     cparams.moe_tail_renorm = false;
     cparams.moe_tail_hist   = false;
+    cparams.moe_tail_graph  = false;
+    cparams.moe_tail_skip   = 8;
+    cparams.moe_tail_repeat = false;
     cparams.head_bound_on   = false;
     if (const char * LLAMA_MOE_TAIL = getenv("LLAMA_MOE_TAIL")) {
         float p      = 1.0f;
         float w      = 0.0f;
         bool  renorm = false;
         bool  hist   = true;
+        bool  graph  = false;
+        int   skip   = 8;
+        bool  repeat = false;
         std::stringstream ss(LLAMA_MOE_TAIL);
         std::string item;
         while (std::getline(ss, item, ',')) {
@@ -521,10 +527,18 @@ llama_context::llama_context(
                 renorm = std::stoi(val) != 0;
             } else if (key == "hist") {
                 hist = std::stoi(val) != 0;
+            } else if (key == "graph") {
+                graph = std::stoi(val) != 0;
+            } else if (key == "skip") {
+                skip = std::stoi(val);
+            } else if (key == "repeat") {
+                repeat = std::stoi(val) != 0;
             } else if (!key.empty()) {
-                LLAMA_LOG_WARN("%s: LLAMA_MOE_TAIL: unknown item '%s' (p, w, renorm, hist)\n", __func__, item.c_str());
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_TAIL: unknown item '%s' (p, w, renorm, hist, graph, skip, repeat)\n",
+                        __func__, item.c_str());
             }
         }
+        set_moe_tail_mode(graph, skip, repeat);
         set_moe_tail(true, p, w, renorm, hist);
     }
 
@@ -1902,10 +1916,20 @@ void llama_context::set_moe_tail(bool on, float p, float w, bool renorm, bool hi
     if (on && hparams.n_expert == 0) {
         LLAMA_LOG_WARN("%s: the model has no routed experts\n", __func__);
     } else if (on) {
+        const std::string how = cparams.moe_tail_graph ? std::string("graph-level ops (the dropped experts still read)") :
+            std::string(cparams.moe_tail_repeat ? "GGML_OP_MOE_TAIL, dropped slots reading their token's last kept expert"
+                                                : "GGML_OP_MOE_TAIL, dropped experts skipped") +
+            " in micro-batches of up to " + std::to_string(cparams.moe_tail_skip) + " tokens";
         LLAMA_LOG_INFO("%s: moe tail on: a slot of the %u routed experts is dropped when the slots above it hold a share "
-                "of %g, or its own share is below %g; kept weights %s; histogram %s\n", __func__, k, p, w,
-                renorm ? "renormalized" : "as they are", hist ? "on" : "off");
+                "of %g, or its own share is below %g; kept weights %s; histogram %s; %s\n", __func__, k, p, w,
+                renorm ? "renormalized" : "as they are", hist ? "on" : "off", how.c_str());
     }
+}
+
+void llama_context::set_moe_tail_mode(bool graph, int skip, bool repeat) {
+    cparams.moe_tail_graph  = graph;
+    cparams.moe_tail_skip   = (uint32_t) std::max(skip, 0);
+    cparams.moe_tail_repeat = repeat;
 }
 
 uint64_t llama_context::moe_tail_counts(uint64_t * counts, int32_t n_counts) const {
@@ -6265,6 +6289,10 @@ void llama_set_moe_tail(llama_context * ctx, bool on, float p, float w, bool ren
 
 uint64_t llama_moe_tail_counts(const llama_context * ctx, uint64_t * counts, int32_t n_counts) {
     return ctx->moe_tail_counts(counts, n_counts);
+}
+
+void llama_set_moe_tail_mode(llama_context * ctx, bool graph, int32_t skip, bool repeat) {
+    ctx->set_moe_tail_mode(graph, skip, repeat);
 }
 
 uint32_t llama_model_screen_head_m(const llama_model * model) {
