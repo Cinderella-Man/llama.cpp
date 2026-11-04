@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -493,6 +494,40 @@ llama_context::llama_context(
         }
     }
 
+    // fewer routed experts on confident tokens (Q618): LLAMA_MOE_TAIL=p=<p>,w=<w>,renorm=<0|1>,hist=<0|1>, any subset,
+    // defaults 1, 0, 0, 1 (p = 1 and w = 0 drop nothing)
+    cparams.moe_tail        = false;
+    cparams.moe_tail_p      = 1.0f;
+    cparams.moe_tail_w      = 0.0f;
+    cparams.moe_tail_renorm = false;
+    cparams.moe_tail_hist   = false;
+    cparams.head_bound_on   = false;
+    if (const char * LLAMA_MOE_TAIL = getenv("LLAMA_MOE_TAIL")) {
+        float p      = 1.0f;
+        float w      = 0.0f;
+        bool  renorm = false;
+        bool  hist   = true;
+        std::stringstream ss(LLAMA_MOE_TAIL);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            const size_t eq = item.find('=');
+            const std::string key = item.substr(0, eq);
+            const std::string val = eq == std::string::npos ? "" : item.substr(eq + 1);
+            if (key == "p") {
+                p = std::stof(val);
+            } else if (key == "w") {
+                w = std::stof(val);
+            } else if (key == "renorm") {
+                renorm = std::stoi(val) != 0;
+            } else if (key == "hist") {
+                hist = std::stoi(val) != 0;
+            } else if (!key.empty()) {
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_TAIL: unknown item '%s' (p, w, renorm, hist)\n", __func__, item.c_str());
+            }
+        }
+        set_moe_tail(true, p, w, renorm, hist);
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -730,6 +765,14 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (cparams.moe_tail && moe_kept_tokens > 0) {
+        moe_tail_log();
+    }
+    if (head_bound) {
+        head_bound_finish_row();
+        head_bound->log(__func__);
+    }
 
     pipe_drain();
     for (auto & slot : pipe_slots) {
@@ -1802,6 +1845,270 @@ uint32_t llama_context::head_shortlist_size() const {
 void llama_context::set_head_shortlist(bool value) {
     // a flip rebuilds the graph (llm_graph_params::allow_reuse)
     cparams.head_short_on = value && head_short != nullptr;
+}
+
+void llama_context::set_moe_tail(bool on, float p, float w, bool renorm, bool hist) {
+    const auto & hparams = model.hparams;
+    const uint32_t k = std::max<uint32_t>(hparams.n_expert_used_max(), 1);
+    if (!(p > 0.0f) || p > 1.0f) {
+        LLAMA_LOG_WARN("%s: p = %g is outside (0, 1], using 1\n", __func__, p);
+        p = 1.0f;
+    }
+    // the first slot's share is at least 1/k, and it must stay
+    if (!(w >= 0.0f) || w >= 1.0f/k) {
+        LLAMA_LOG_WARN("%s: w = %g is outside [0, 1/%u), using 0\n", __func__, w, k);
+        w = 0.0f;
+    }
+
+    cparams.moe_tail        = on && hparams.n_expert > 0;
+    cparams.moe_tail_p      = p;
+    cparams.moe_tail_w      = w;
+    cparams.moe_tail_renorm = renorm;
+    cparams.moe_tail_hist   = hist;
+
+    if (on && hparams.n_expert == 0) {
+        LLAMA_LOG_WARN("%s: the model has no routed experts\n", __func__);
+    } else if (on) {
+        LLAMA_LOG_INFO("%s: moe tail on: a slot of the %u routed experts is dropped when the slots above it hold a share "
+                "of %g, or its own share is below %g; kept weights %s; histogram %s\n", __func__, k, p, w,
+                renorm ? "renormalized" : "as they are", hist ? "on" : "off");
+    }
+}
+
+uint64_t llama_context::moe_tail_counts(uint64_t * counts, int32_t n_counts) const {
+    uint64_t n = 0;
+    for (size_t c = 0; c < moe_kept_hist.size(); ++c) {
+        n += moe_kept_hist[c];
+        if (counts && (int32_t) c < n_counts) {
+            counts[c] = moe_kept_hist[c];
+        }
+    }
+    for (int32_t c = (int32_t) moe_kept_hist.size(); counts && c < n_counts; ++c) {
+        counts[c] = 0;
+    }
+    return n;
+}
+
+void llama_context::moe_tail_collect(const llm_graph_result * res, uint32_t n_tokens) {
+    const auto & ts = res->t_moe_kept;
+    if (ts.empty()) {
+        return;
+    }
+
+    size_t n_all = 0;
+    for (const auto * t : ts) {
+        n_all += ggml_nelements(t);
+    }
+    moe_kept_buf.resize(n_all);
+
+    size_t off = 0;
+    for (auto * t : ts) {
+        if (ggml_nelements(t) == 0) {
+            continue; // a layer cropped to the outputs of a ubatch without any
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched_res(), t);
+        GGML_ASSERT(backend != nullptr);
+        ggml_backend_tensor_get_async(backend, t, moe_kept_buf.data() + off, 0, ggml_nbytes(t));
+        off += ggml_nelements(t);
+    }
+    ggml_backend_sched_synchronize(sched_res());
+
+    if (moe_kept_layer.size() < 2*ts.size()) {
+        moe_kept_layer.resize(2*ts.size(), 0.0);
+    }
+
+    off = 0;
+    for (size_t l = 0; l < ts.size(); ++l) {
+        const int64_t n = ggml_nelements(ts[l]);
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = moe_kept_buf[off + i];
+            const size_t c = (size_t) std::max(0L, std::lrint(v));
+            if (moe_kept_hist.size() <= c) {
+                moe_kept_hist.resize(c + 1, 0);
+            }
+            moe_kept_hist[c]++;
+            moe_kept_layer[2*l + 0] += v;
+            moe_kept_layer[2*l + 1] += 1.0;
+        }
+        off += n;
+    }
+
+    moe_kept_tokens += n_tokens;
+    if (moe_kept_tokens >= moe_kept_next_log) {
+        if (moe_kept_next_log > 0) {
+            moe_tail_log();
+        }
+        moe_kept_next_log = (moe_kept_tokens/65536 + 1)*65536;
+    }
+}
+
+void llama_context::moe_tail_log() const {
+    const uint32_t k = std::max<uint32_t>(model.hparams.n_expert_used_max(), 1);
+
+    uint64_t n_pairs = 0;
+    double   n_kept  = 0.0;
+    for (size_t c = 0; c < moe_kept_hist.size(); ++c) {
+        n_pairs += moe_kept_hist[c];
+        n_kept  += (double) c*moe_kept_hist[c];
+    }
+    if (n_pairs == 0) {
+        return;
+    }
+
+    std::string by_count;
+    for (size_t c = 0; c < moe_kept_hist.size(); ++c) {
+        if (moe_kept_hist[c] > 0) {
+            by_count += format(" %zu: %.2f %%", c, 100.0*moe_kept_hist[c]/n_pairs);
+        }
+    }
+    std::string by_layer;
+    for (size_t l = 0; l + 1 < moe_kept_layer.size(); l += 2) {
+        by_layer += format(" %.2f", moe_kept_layer[l + 1] > 0 ? moe_kept_layer[l]/moe_kept_layer[l + 1] : 0.0);
+    }
+
+    LLAMA_LOG_INFO("moe tail (p = %g, w = %g, renorm %d): %" PRIu64 " tokens, %" PRIu64 " token-layers; experts kept: "
+            "mean %.3f of %u (%.1f %% of the routed experts' reads); by count:%s\n",
+            cparams.moe_tail_p, cparams.moe_tail_w, (int) cparams.moe_tail_renorm, moe_kept_tokens, n_pairs,
+            n_kept/n_pairs, k, 100.0*n_kept/n_pairs/k, by_count.c_str());
+    LLAMA_LOG_INFO("moe tail: mean experts kept per MoE layer:%s\n", by_layer.c_str());
+}
+
+bool llama_context::head_bound_init() {
+    const ggml_tensor * output = model.output;
+    if (!head_short) {
+        LLAMA_LOG_ERROR("%s: the head bound needs the context's shortlist (llama_head_shortlist_init)\n", __func__);
+        return false;
+    }
+    if (model.output_s || model.output_in_s) {
+        LLAMA_LOG_ERROR("%s: the output head has scales, which the bound does not apply\n", __func__);
+        return false;
+    }
+    if (model.prec_policy.prec_acc.count(model.output) || model.prec_policy.prec_src1.count(model.output)) {
+        LLAMA_LOG_ERROR("%s: the output head has a precision policy, which the shortlist's products do not get\n", __func__);
+        return false;
+    }
+
+    // the backend the head's buffer belongs to (head_shortlist_init accepted the buffer type)
+    ggml_backend_t backend = nullptr;
+    if (ggml_backend_buffer_is_host(output->buffer)) {
+        backend = backend_cpu;
+    } else {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(output->buffer));
+        for (auto & b : backends) {
+            if (ggml_backend_get_device(b.get()) == dev) {
+                backend = b.get();
+                break;
+            }
+        }
+    }
+    if (backend == nullptr) {
+        LLAMA_LOG_ERROR("%s: no backend of this context holds the output head\n", __func__);
+        return false;
+    }
+    for (const auto & fn : set_n_threads_fns) {
+        if (fn.first == backend) {
+            fn.second(backend, cparams.n_threads);
+        }
+    }
+
+    const int64_t t0 = ggml_time_us();
+
+    auto hb = std::make_unique<llama_head_bound>();
+    if (!hb->init(model.output, backend)) {
+        return false;
+    }
+    head_bound = std::move(hb);
+
+    LLAMA_LOG_INFO("%s: head bound: %u rows of %s read in %.1f s; largest |W_t| %.4f, |W_t - mu| %.4f, |mu| %.4f; the full "
+            "head on %s when a sampler can't exclude every token left out\n", __func__, head_bound->n_vocab,
+            ggml_type_name(output->type), (ggml_time_us() - t0)/1e6, head_bound->norm[head_bound->by_norm[0]],
+            head_bound->cnorm[head_bound->by_cnorm[0]], head_bound->mu_norm, ggml_backend_name(backend));
+
+    return true;
+}
+
+void llama_context::set_head_bound(bool value) {
+    // used for the decodes with one output (decode())
+    head_bound_req = value && head_bound != nullptr;
+}
+
+void llama_context::head_bound_finish_row() {
+    auto & hb = *head_bound;
+    if (hb.row < 0 || hb.have_bound) {
+        return;
+    }
+    hb.bound      = hb.compute(*head_short);
+    hb.have_bound = true;
+
+    // the top logit of the row is the shortlist's: every other entry is -INFINITY
+    const float * row = logits.data + (int64_t) hb.row*model.vocab.n_tokens();
+    float top = -INFINITY;
+    for (uint32_t t = 0; t < hb.n_vocab; ++t) {
+        top = std::max(top, row[t]);
+    }
+    const double gap = (double) hb.bound - top;
+    hb.n_greedy += top > hb.bound;
+    hb.sum_gap  += gap;
+    hb.min_gap   = std::min(hb.min_gap, gap);
+    hb.sum_top  += top;
+    hb.sum_bnd  += hb.bound;
+}
+
+float llama_context::head_bound_ith(int32_t i) {
+    if (!head_bound || head_bound->row < 0) {
+        return INFINITY;
+    }
+    synchronize();
+    output_reorder();
+
+    int64_t j = -1;
+    try {
+        j = output_resolve_row(i);
+    } catch (const std::exception &) {
+        return INFINITY;
+    }
+    if (j != head_bound->row) {
+        return INFINITY;
+    }
+    head_bound_finish_row();
+
+    return head_bound->bound;
+}
+
+bool llama_context::head_bound_full(int32_t i) {
+    if (!head_bound || head_bound->row < 0) {
+        return false;
+    }
+    synchronize();
+    output_reorder();
+
+    int64_t j = -1;
+    try {
+        j = output_resolve_row(i);
+    } catch (const std::exception &) {
+        return false;
+    }
+    if (j != head_bound->row) {
+        return false;
+    }
+    head_bound_finish_row();
+
+    if (!head_bound->full(logits.data + j*model.vocab.n_tokens(), *head_short, head_bound->bound)) {
+        return false;
+    }
+    head_bound->row = -1;
+    head_bound->n_full++;
+
+    return true;
+}
+
+void llama_context::head_bound_stats(uint64_t * n_rows, uint64_t * n_full) const {
+    if (n_rows) {
+        *n_rows = head_bound ? head_bound->n_rows : 0;
+    }
+    if (n_full) {
+        *n_full = head_bound ? head_bound->n_full : 0;
+    }
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2974,6 +3281,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // the main model's shortlist head (Q619): the last row's counts, the batch's tokens join the shortlist (which waits
+    // for the previous decode, before this one's tokens are queued), and a decode with one output computes the
+    // shortlist's logits
+    if (head_bound) {
+        head_bound_finish_row();
+        head_bound->row = -1;
+        cparams.head_bound_on = head_bound_req && n_outputs_all == 1 && sampling.samplers.empty();
+        if (cparams.head_bound_on && balloc->get_batch().token) {
+            head_shortlist_add(balloc->get_batch().token, n_tokens_all);
+        }
+    }
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
@@ -3176,6 +3495,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
+        }
+
+        // the shortlist head's input row, for the bound and the fallback (head_bound_ith, head_bound_full)
+        if (head_bound && res->t_head_h && n_outputs == 1 && logits.data && t_logits && needs_raw_logits(ubatch, sampling.samplers)) {
+            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_res(), res->t_head_h);
+            GGML_ASSERT(backend_h != nullptr && ggml_nelements(res->t_head_h) == (int64_t) head_bound->n_embd);
+            ggml_backend_tensor_get_async(backend_h, res->t_head_h, head_bound->h.data(), 0, ggml_nbytes(res->t_head_h));
+            head_bound->row        = (int32_t) n_outputs_prev;
+            head_bound->have_bound = false;
+            head_bound->n_rows++;
+            if (head_bound->n_rows % 4096 == 0) {
+                head_bound->log(__func__);
+            }
+        }
+
+        // the routed experts kept per token (a synchronous read)
+        if (cparams.moe_tail && cparams.moe_tail_hist) {
+            moe_tail_collect(res, ubatch.n_tokens);
         }
 
         // extract embeddings
@@ -5817,6 +6154,34 @@ uint32_t llama_head_shortlist_size(const llama_context * ctx) {
 
 void llama_set_head_shortlist(llama_context * ctx, bool value) {
     ctx->set_head_shortlist(value);
+}
+
+bool llama_head_bound_init(llama_context * ctx) {
+    return ctx->head_bound_init();
+}
+
+void llama_set_head_bound(llama_context * ctx, bool value) {
+    ctx->set_head_bound(value);
+}
+
+float llama_head_bound_ith(llama_context * ctx, int32_t i) {
+    return ctx->head_bound_ith(i);
+}
+
+bool llama_head_bound_full(llama_context * ctx, int32_t i) {
+    return ctx->head_bound_full(i);
+}
+
+void llama_head_bound_stats(const llama_context * ctx, uint64_t * n_rows, uint64_t * n_full) {
+    ctx->head_bound_stats(n_rows, n_full);
+}
+
+void llama_set_moe_tail(llama_context * ctx, bool on, float p, float w, bool renorm, bool hist) {
+    ctx->set_moe_tail(on, p, w, renorm, hist);
+}
+
+uint64_t llama_moe_tail_counts(const llama_context * ctx, uint64_t * counts, int32_t n_counts) {
+    return ctx->moe_tail_counts(counts, n_counts);
 }
 
 uint32_t llama_model_screen_head_m(const llama_model * model) {

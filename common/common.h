@@ -138,6 +138,24 @@ enum common_sampler_type {
 // the full head whenever the true top-k is among the candidates; why = the reason when it does not
 bool common_sampling_screen_head_ok(const struct common_params_sampling & p, uint32_t m, std::string * why = nullptr);
 
+// the shortlist head with an exact bound (Q619, llama_head_bound_*): what a row of shortlist logits must show for
+// sampling with these parameters to pick the same token, with the same probabilities, as from the full head: at
+// least k candidates whose logit v has v/temp + log_p > bound/temp (the k-th highest is above every logit left out,
+// with min-p's margin log_p and the temperature applied before it). False when no such condition exists (the
+// sampling reads the whole distribution, or raises logits); why = the reason
+struct common_head_bound_need {
+    int32_t k     = 1;
+    float   log_p = 0.0f;
+    float   temp  = 1.0f;
+};
+bool common_sampling_head_bound_need(const struct common_params_sampling & p, common_head_bound_need & need, std::string * why = nullptr);
+
+// LLAMA_HEAD_BOUND=<k_low>[,<m_cap>]: the main model's shortlist head (llama_head_bound_*) over the ids below k_low,
+// the special tokens, LLAMA_HEAD_BOUND_FILE (one id per line) and the context's tokens, up to m_cap more; sets it up
+// on the context (common_init_from_params) and returns whether it is on
+bool common_head_bound_setup(struct llama_context * ctx);
+bool common_head_bound_requested();
+
 // LLAMA_SCREEN_HEAD=1 asks for the screened output head (llama_context turns it on at creation)
 bool common_screen_head_requested();
 

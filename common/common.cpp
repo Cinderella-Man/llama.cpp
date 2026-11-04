@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "draft-shortlist.h"
 
 #include "../src/llama-ext.h"
 
@@ -1514,6 +1515,200 @@ bool common_sampling_screen_head_ok(const common_params_sampling & p, uint32_t m
     return no("top-k is not in the sampler chain");
 }
 
+bool common_sampling_head_bound_need(const common_params_sampling & p, common_head_bound_need & need, std::string * why) {
+    const auto no = [&](const char * reason) {
+        if (why) {
+            *why = reason;
+        }
+        return false;
+    };
+    if (p.n_probs > 0) {
+        return no("token probabilities are requested (they need the whole distribution)");
+    }
+    if (p.mirostat != 0) {
+        return no("mirostat needs the whole distribution");
+    }
+
+    // samplers that only lower logits can push down that many of the highest shortlist logits: the k-th highest of
+    // the candidates then needs that many more ranks above the bound
+    int32_t n_lowered = 0;
+    for (const auto & lb : p.logit_bias) {
+        if (lb.bias > 0.0f) {
+            return no("a positive logit bias is set");
+        }
+        n_lowered += lb.bias < 0.0f;
+    }
+
+    need = {};
+
+    // greedy (temperature 0 in the chain): the highest logit after the lowering samplers, whatever top-k, top-p, min-p
+    // and top-n-sigma keep (each keeps the highest), unless a sampler can drop the highest token
+    const auto has = [&](common_sampler_type t) { return std::find(p.samplers.begin(), p.samplers.end(), t) != p.samplers.end(); };
+    if (has(COMMON_SAMPLER_TYPE_TEMPERATURE) && p.temp <= 0.0f && p.dynatemp_range <= 0.0f && p.typ_p >= 1.0f &&
+            !has(COMMON_SAMPLER_TYPE_ADAPTIVE_P) && !has(COMMON_SAMPLER_TYPE_INFILL) &&
+            !(p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f)) {
+        if (has(COMMON_SAMPLER_TYPE_PENALTIES) && p.penalty_last_n != 0 &&
+                (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f)) {
+            if (p.penalty_repeat < 1.0f || p.penalty_freq < 0.0f || p.penalty_present < 0.0f) {
+                return no("a penalty raises logits");
+            }
+            if (p.penalty_last_n < 0) {
+                return no("the penalties cover the whole context");
+            }
+            n_lowered += p.penalty_last_n;
+        }
+        if (has(COMMON_SAMPLER_TYPE_DRY) && p.dry_multiplier > 0.0f && p.dry_penalty_last_n != 0) {
+            if (p.dry_penalty_last_n < 0) {
+                return no("DRY covers the whole context");
+            }
+            n_lowered += p.dry_penalty_last_n;
+        }
+        need.k = 1 + n_lowered;
+        return true;
+    }
+
+    for (const auto s : p.samplers) {
+        switch (s) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (p.penalty_last_n != 0 && (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f)) {
+                    if (p.penalty_repeat < 1.0f || p.penalty_freq < 0.0f || p.penalty_present < 0.0f) {
+                        return no("a penalty raises logits");
+                    }
+                    if (p.penalty_last_n < 0) {
+                        return no("the penalties cover the whole context");
+                    }
+                    n_lowered += p.penalty_last_n;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (p.dry_multiplier > 0.0f && p.dry_penalty_last_n != 0) {
+                    if (p.dry_penalty_last_n < 0) {
+                        return no("DRY covers the whole context");
+                    }
+                    n_lowered += p.dry_penalty_last_n;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                if (p.top_k > 0) {
+                    // the rest of the chain sees the same top k
+                    need.k = p.top_k + n_lowered;
+                    return true;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (p.min_p > 0.0f) {
+                    // every token below the min-p cut of the highest logit drops out, with at least min_keep left
+                    need.k     = std::max(1, (int32_t) p.min_keep) + n_lowered;
+                    need.log_p = logf(p.min_p);
+                    return true;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                if (p.dynatemp_range > 0.0f) {
+                    return no("dynamic temperature reads the whole distribution");
+                }
+                if (p.temp <= 0.0f) {
+                    // only the highest logit stays
+                    need.k = 1 + n_lowered;
+                    return true;
+                }
+                need.temp = p.temp;
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (p.top_p < 1.0f) {
+                    return no("top-p before top-k or min-p reads the whole distribution");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (p.typ_p < 1.0f) {
+                    return no("typical-p before top-k or min-p reads the whole distribution");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (p.xtc_probability > 0.0f && p.xtc_threshold <= 0.5f) {
+                    return no("XTC before top-k or min-p reads the whole distribution");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (p.top_n_sigma > 0.0f) {
+                    return no("top-n-sigma before top-k or min-p reads the whole distribution");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_INFILL:
+                return no("infill reads the whole distribution");
+            case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                return no("adaptive-p reads the whole distribution");
+            default:
+                return no("an unknown sampler");
+        }
+    }
+
+    // the chain's last sampler (common_sampler_init): greedy, or a draw from the whole distribution
+    const bool greedy = !p.samplers.empty() &&
+        ((p.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && p.temp == 0.0f && p.dynatemp_range == 0.0f) ||
+         (p.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && p.top_k == 1));
+    if (greedy) {
+        need.k = 1 + n_lowered;
+        return true;
+    }
+    return no("the draw reads the whole distribution (no top-k, min-p or greedy)");
+}
+
+bool common_head_bound_requested() {
+    const char * e = getenv("LLAMA_HEAD_BOUND");
+    return e && atoi(e) > 0;
+}
+
+bool common_head_bound_setup(llama_context * ctx) {
+    const auto cfg = common_draft_shortlist_config::from_string(getenv("LLAMA_HEAD_BOUND"));
+    if (cfg.k_low == 0) {
+        return false;
+    }
+    if (!llama_head_shortlist_init(ctx, cfg.k_low, cfg.m_cap) || !llama_head_bound_init(ctx)) {
+        COM_WRN("%s", "no shortlist head with a bound for this model: it uses the full head\n");
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    // the special tokens (chat markup, tool-call tags, the end of a turn), then a frequency list
+    std::vector<llama_token> ids;
+    for (llama_token id = (llama_token) cfg.k_low; id < n_vocab; ++id) {
+        const auto attr = llama_vocab_get_attr(vocab, id);
+        if ((attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) || llama_vocab_is_eog(vocab, id)) {
+            ids.push_back(id);
+        }
+    }
+    const uint32_t n_special = llama_head_shortlist_add(ctx, ids.data(), ids.size());
+
+    uint32_t n_file = 0;
+    if (const char * path = getenv("LLAMA_HEAD_BOUND_FILE")) {
+        std::ifstream f(path);
+        if (!f) {
+            COM_WRN("cannot read LLAMA_HEAD_BOUND_FILE '%s'\n", path);
+        }
+        ids.clear();
+        std::string line;
+        while (std::getline(f, line)) {
+            char * end = nullptr;
+            const long v = std::strtol(line.c_str(), &end, 10);
+            if (end != line.c_str()) {
+                ids.push_back((llama_token) v);
+            }
+        }
+        n_file = llama_head_shortlist_add(ctx, ids.data(), ids.size());
+    }
+
+    llama_set_head_bound(ctx, true);
+
+    COM_INF("shortlist head with a bound: %u ids (below %u, %u special, %u from the file; the context's tokens join up "
+            "to %u more); the full head for samplings it can't exclude every token left out for\n",
+            llama_head_shortlist_size(ctx), cfg.k_low, n_special, n_file, cfg.m_cap);
+
+    return true;
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     common_init_result_ptr res(new common_init_result(params, model_only));
 
@@ -1541,6 +1736,17 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (!common_sampling_screen_head_ok(params.sampling, llama_model_screen_head_m(model), &why)) {
             COM_WRN("screened output head off: %s\n", why.c_str());
             llama_set_screen_head(lctx, false);
+        }
+    }
+
+    // the shortlist head with an exact bound (LLAMA_HEAD_BOUND): its fallback keeps every sampling exact, so it stays on
+    // for all of them; the server turns it off for batches whose sampling always falls back
+    if (common_head_bound_requested()) {
+        common_head_bound_setup(lctx);
+        common_head_bound_need need;
+        std::string why;
+        if (!common_sampling_head_bound_need(params.sampling, need, &why)) {
+            COM_WRN("shortlist head: every token of this sampling takes the full head: %s\n", why.c_str());
         }
     }
 

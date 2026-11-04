@@ -189,6 +189,30 @@ LLAMA_API bool     llama_head_shortlist_contains(const struct llama_context * ct
 LLAMA_API uint32_t llama_head_shortlist_size    (const struct llama_context * ctx); // ids in the list, 0 without one
 LLAMA_API void     llama_set_head_shortlist     (struct llama_context * ctx, bool value);
 
+// The main model's head over the context's shortlist (llama_head_shortlist_init) with an exact bound on every other
+// logit (Q619): while it is on, a decode with one output computes the shortlist's logits and gives every other token
+// -INFINITY; llama_head_bound_ith(i) is then at least every left-out logit the full head would have computed (Cauchy-
+// Schwarz on the head's input row and the head's row norms), and +INFINITY for a row with the full head's logits.
+// A sampler that can't exclude every left-out token with it calls llama_head_bound_full(i), which computes the full
+// head for that row with the same kernel and writes it into the logits. The context's tokens join the shortlist as
+// they are decoded. Supported by the qwen4exp main graph; init reads the head's rows once (norms) and returns false
+// for heads it can't bound (scaled, with a precision policy, or without a shortlist).
+LLAMA_API bool  llama_head_bound_init (struct llama_context * ctx);
+LLAMA_API void  llama_set_head_bound  (struct llama_context * ctx, bool value);
+LLAMA_API float llama_head_bound_ith  (struct llama_context * ctx, int32_t i);
+LLAMA_API bool  llama_head_bound_full (struct llama_context * ctx, int32_t i);
+LLAMA_API void  llama_head_bound_stats(const struct llama_context * ctx, uint64_t * n_rows, uint64_t * n_full);
+
+// Fewer routed experts on confident tokens (Q618): after the router's top-k, a slot's weight becomes 0 when the slots
+// ranked above it already hold a share p of the token's routed weight, or its own share is below w (w < 1/k); renorm
+// rescales the kept weights to the token's sum of its k weights. The experts are still computed (graph level: their
+// outputs are weighted 0). hist counts the experts kept per token and MoE layer (a synchronous read per decode),
+// logged every 65,536 tokens and when the context is freed. LLAMA_MOE_TAIL=p=<p>,w=<w>,renorm=<0|1>,hist=<0|1> turns
+// it on for every context. llama_moe_tail_counts fills counts[n] with the (token, layer) pairs that kept n experts,
+// n < n_counts, and returns the pairs counted.
+LLAMA_API void     llama_set_moe_tail   (struct llama_context * ctx, bool on, float p, float w, bool renorm, bool hist);
+LLAMA_API uint64_t llama_moe_tail_counts(const struct llama_context * ctx, uint64_t * counts, int32_t n_counts);
+
 //
 // model/context data extraction
 //

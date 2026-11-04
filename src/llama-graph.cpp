@@ -1619,9 +1619,12 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_embd_all    = nullptr;
     t_h_nextn     = nullptr;
+    t_head_h      = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+
+    t_moe_kept.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -2657,6 +2660,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    // after the scale, so that the fused top-k kernel still produces the weights the tail is cut from
+    if (cparams.moe_tail && n_expert_used > 1) {
+        weights = build_moe_tail(weights, n_expert_used, n_tokens, il);
+    }
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
@@ -2886,6 +2894,53 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_moe_tail(
+         ggml_tensor * weights,
+             int64_t   n_expert_used,
+             int64_t   n_tokens,
+                 int   il) const {
+    // the slots come in the router's order (argsort, descending), so the shares before a slot are those of the
+    // experts ranked above it
+    ggml_tensor * w = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens); // [n_expert_used, n_tokens]
+
+    ggml_tensor * total = ggml_sum_rows(ctx0, w); // [1, n_tokens]
+    cb(total, "ffn_moe_tail_total", il);
+
+    ggml_tensor * share = ggml_div(ctx0, w, total);
+    cb(share, "ffn_moe_tail_share", il);
+
+    // top-p: a slot is kept while the shares before it sum to less than p; the first slot always is (p > 0), and at
+    // p = 1 every slot is, unless the slots above it already sum to 1 in F32 (a share below the F32 resolution)
+    ggml_tensor * before = ggml_sub(ctx0, ggml_cumsum(ctx0, share), share);
+    ggml_tensor * keep   = ggml_step(ctx0, ggml_scale_bias(ctx0, before, -1.0f, cparams.moe_tail_p)); // p - before > 0
+    cb(keep, "ffn_moe_tail_keep_p", il);
+
+    if (cparams.moe_tail_w > 0.0f) {
+        // a minimum share (below 1/n_expert_used, so the first slot stays)
+        keep = ggml_mul(ctx0, keep, ggml_step(ctx0, ggml_scale_bias(ctx0, share, 1.0f, -cparams.moe_tail_w)));
+        cb(keep, "ffn_moe_tail_keep", il);
+    }
+
+    ggml_tensor * kept = ggml_mul(ctx0, w, keep);
+    if (cparams.moe_tail_renorm) {
+        // back to the token's total: with every slot kept, the sums are the same sums of the same values, the
+        // factor exactly 1 and the weights unchanged
+        ggml_tensor * kept_sum = ggml_sum_rows(ctx0, kept);
+        kept = ggml_mul(ctx0, kept, ggml_div(ctx0, total, kept_sum));
+    }
+    cb(kept, "ffn_moe_weights_tail", il);
+
+    if (cparams.moe_tail_hist) {
+        ggml_tensor * n_kept = ggml_sum_rows(ctx0, keep); // [1, n_tokens]
+        cb(n_kept, "ffn_moe_tail_kept", il);
+        ggml_set_output(n_kept);
+        ggml_build_forward_expand(gf, n_kept);
+        res->t_moe_kept.push_back(n_kept);
+    }
+
+    return ggml_reshape_3d(ctx0, kept, 1, n_expert_used, n_tokens);
 }
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(

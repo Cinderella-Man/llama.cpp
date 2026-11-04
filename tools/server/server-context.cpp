@@ -25,6 +25,8 @@
 #include "mtmd-helper.h"
 #include "base64.hpp"
 
+#include "../../src/llama-ext.h" // staging API: llama_set_head_bound (Q619)
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -848,6 +850,13 @@ struct server_slot {
                     pipe_n_guess, pipe_n_hit, pipe_n_miss, pipe_guesser.n_store, pipe_n_draft, pipe_n_draft_hit);
         }
 
+        if (smpl && (common_sampler_get_stats(smpl.get()).n_head_short + common_sampler_get_stats(smpl.get()).n_head_full) > 0) {
+            const auto & s = common_sampler_get_stats(smpl.get());
+            SLT_INF(*this,
+                    "  shortlist head = %10d tokens from the shortlist's logits, %d from the full head's (the bound could "
+                    "not exclude every token left out)\n", s.n_head_short, s.n_head_full);
+        }
+
         if (smpl && !task->params.sampling.grammar.empty()) {
             const auto & s = common_sampler_get_stats(smpl.get());
             SLT_INF(*this,
@@ -1278,6 +1287,7 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    bool head_bound_on = false; // the shortlist head with a bound is set up on ctx_tgt (LLAMA_HEAD_BOUND)
     uint32_t screen_head_m = 0; // > 0: the screened output head may be used (LLAMA_SCREEN_HEAD=1 and the model has one)
     int screen_head_state  = -1; // last decision (-1 = none yet), logged when it changes
 
@@ -1602,6 +1612,10 @@ private:
         if (screen_head_m > 0) {
             SRV_INF("screened output head: %u candidates, used for requests whose sampling it is exact for\n", screen_head_m);
         }
+
+        // the shortlist head with a bound: set up by common_init_from_params (LLAMA_HEAD_BOUND), turned on and off
+        // per batch (decode())
+        head_bound_on = common_head_bound_requested() && ctx_tgt && llama_head_shortlist_size(ctx_tgt) > 0;
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -5818,6 +5832,20 @@ private:
                 SRV_INF("screened output head %s\n", screen ? "on" : "off");
                 screen_head_state = screen;
             }
+        }
+
+        // the shortlist head with a bound (LLAMA_HEAD_BOUND): off for batches whose sampling would always fall back
+        // to the full head (exact either way; this saves the shortlist's products)
+        if (head_bound_on) {
+            common_head_bound_need need;
+            bool use = true;
+            for (const auto & slot : slots) {
+                if (slot.task && slot.i_batch >= off && slot.i_batch < off + (int) batch.view.size()) {
+                    use = use && !slot.task->params.sampling.backend_sampling &&
+                        common_sampling_head_bound_need(slot.task->params.sampling, need);
+                }
+            }
+            llama_set_head_bound(ctx_tgt, use);
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding

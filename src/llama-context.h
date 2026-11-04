@@ -5,6 +5,7 @@
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
+#include "llama-head-bound.h"
 #include "llama-head-shortlist.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -158,6 +159,18 @@ struct llama_context {
     bool     head_shortlist_contains(llama_token id) const;
     uint32_t head_shortlist_size() const;
     void     set_head_shortlist(bool value);
+
+    // fewer routed experts on confident tokens (llama_set_moe_tail)
+    void     set_moe_tail(bool on, float p, float w, bool renorm, bool hist);
+    uint64_t moe_tail_counts(uint64_t * counts, int32_t n_counts) const;
+    void     moe_tail_log() const;
+
+    // the main model's shortlist head with an exact bound (llama_head_bound_*)
+    bool  head_bound_init();
+    void  set_head_bound(bool value);
+    float head_bound_ith(int32_t i);
+    bool  head_bound_full(int32_t i);
+    void  head_bound_stats(uint64_t * n_rows, uint64_t * n_full) const;
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -569,6 +582,23 @@ private:
 
     // the output head's shortlist (head_shortlist_init), referenced by cparams.head_short
     std::unique_ptr<llama_head_shortlist> head_short;
+
+    // the exact bound and the full-head fallback for the main model's shortlist head (head_bound_init); requested with
+    // set_head_bound, used by the decodes with one output
+    std::unique_ptr<llama_head_bound> head_bound;
+    bool head_bound_req = false;
+
+    // the bound and the counts of the last shortlist row, once
+    void head_bound_finish_row();
+
+    // the routed experts kept per token and MoE layer (cparams.moe_tail_hist): moe_kept_hist[n] counts the (token,
+    // layer) pairs that kept n experts, moe_kept_layer the experts kept per MoE layer of the graph, in graph order
+    void moe_tail_collect(const llm_graph_result * res, uint32_t n_tokens);
+    std::vector<uint64_t> moe_kept_hist;
+    std::vector<double>   moe_kept_layer;
+    std::vector<float>    moe_kept_buf;
+    uint64_t              moe_kept_tokens   = 0;
+    uint64_t              moe_kept_next_log = 0;
 
     // how the slots upload their host inputs (ggml_backend_sched_set_input_upload, LLAMA_PIPE_UPLOAD)
     int pipe_upload = 2;
