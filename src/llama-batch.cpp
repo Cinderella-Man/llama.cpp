@@ -8,6 +8,7 @@
 #include "llama-context.h"
 
 #include <cassert>
+#include <cctype>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -604,7 +605,221 @@ void llama_batch_allocr::split_reset() {
     used.resize(get_n_tokens(), false);
 }
 
+//
+// micro-batch taper (Q771)
+//
+
+bool llama_ubatch_taper::parse(const char * spec, std::string & err) {
+    llama_ubatch_taper res;
+    std::string s = spec ? spec : "";
+    s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); }), s.end());
+
+    if (s.empty() || s == "0" || s == "off") {
+        *this = res;
+        return true;
+    }
+    if (s == "1" || s == "on") {
+        res.head_n  = 256; res.head_s  = 64;
+        res.tail_n  = 512; res.tail_s  = 128;
+        res.short_n = 600; res.short_s = 64;
+        *this = res;
+        return true;
+    }
+
+    auto to_u32 = [](const std::string & v, uint32_t & out) {
+        if (v.empty() || v.size() > 9 || !std::all_of(v.begin(), v.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            return false;
+        }
+        out = (uint32_t) std::stoul(v);
+        return true;
+    };
+
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        const size_t eq = item.find('=');
+        if (eq != std::string::npos && item.substr(0, eq) == "min") {
+            if (!to_u32(item.substr(eq + 1), res.min_s) || res.min_s == 0) {
+                err = "'" + item + "': min=<tokens>, at least 1";
+                return false;
+            }
+            continue;
+        }
+        const size_t co = item.find(':', eq == std::string::npos ? 0 : eq);
+        if (eq == std::string::npos || co == std::string::npos) {
+            err = "'" + item + "' is not <rule>=<tokens>:<size> or min=<tokens>";
+            return false;
+        }
+        const std::string key = item.substr(0, eq);
+        const std::string n_str = item.substr(eq + 1, co - eq - 1);
+        const std::string s_str = item.substr(co + 1);
+        uint32_t n = 0;
+        uint32_t sz = 0;
+        if (!to_u32(n_str, n) || !to_u32(s_str, sz)) {
+            err = "'" + item + "': <tokens> and <size> must be whole numbers";
+            return false;
+        }
+        if ((n == 0) != (sz == 0)) {
+            err = "'" + item + "': <tokens> and <size> are both 0 (rule off) or both above 0";
+            return false;
+        }
+        if (key == "head") {
+            res.head_n = n; res.head_s = sz;
+        } else if (key == "tail") {
+            res.tail_n = n; res.tail_s = sz;
+        } else if (key == "short") {
+            res.short_n = n; res.short_s = sz;
+        } else {
+            err = "unknown rule '" + key + "' (head, tail, short, min)";
+            return false;
+        }
+    }
+
+    *this = res;
+    return true;
+}
+
+std::string llama_ubatch_taper::str() const {
+    if (!enabled()) {
+        return "off";
+    }
+    std::string res;
+    auto add = [&](const char * key, uint32_t n, uint32_t s) {
+        if (n > 0 && s > 0) {
+            res += (res.empty() ? "" : ",") + std::string(key) + "=" + std::to_string(n) + ":" + std::to_string(s);
+        }
+    };
+    add("head",  head_n,  head_s);
+    add("tail",  tail_n,  tail_s);
+    add("short", short_n, short_s);
+    if (min_s != llama_ubatch_taper().min_s) {
+        res += ",min=" + std::to_string(min_s);
+    }
+    return res;
+}
+
+std::vector<uint32_t> llama_ubatch_taper_plan(
+        const llama_ubatch_taper & taper, uint32_t n_tokens, uint32_t n_ubatch, bool head, bool tail) {
+    std::vector<uint32_t> ends;
+    if (!taper.enabled() || n_tokens == 0 || n_ubatch == 0) {
+        return ends;
+    }
+
+    const bool is_short = head && tail && taper.short_n > 0 && taper.short_s > 0 && n_tokens <= taper.short_n;
+    const uint32_t n_head = !is_short && head && taper.head_n > 0 && taper.head_s > 0 ? std::min(taper.head_n, n_tokens) : 0;
+    const uint32_t n_tail = !is_short && tail && taper.tail_n > 0 && taper.tail_s > 0 ? std::min(taper.tail_n, n_tokens - n_head) : 0;
+    if (!is_short && n_head == 0 && n_tail == 0) {
+        // no rule touches this call: the plain split
+        return ends;
+    }
+
+    // micro-batches of min_s tokens or more (where n_ubatch leaves room for two of them)
+    const bool     use_min = taper.min_s > 1 && n_ubatch >= 2*taper.min_s && n_tokens >= taper.min_s;
+    const uint32_t s_lo    = use_min ? taper.min_s : 1;
+
+    // [b, e) in micro-batches of s tokens (min_s to n_ubatch), the remainder of (e - b) / s as the first or the last one
+    auto add = [&](uint32_t b, uint32_t e, uint32_t s, bool remainder_first) {
+        if (e <= b) {
+            return;
+        }
+        s = std::max(s_lo, std::min(s, n_ubatch));
+        const uint32_t r = (e - b) % s;
+        uint32_t pos = b;
+        if (remainder_first && r > 0) {
+            pos += r;
+            ends.push_back(pos);
+        }
+        while (e - pos >= s) {
+            pos += s;
+            ends.push_back(pos);
+        }
+        if (pos < e) {
+            ends.push_back(e);
+        }
+    };
+
+    if (is_short) {
+        add(0, n_tokens, taper.short_s, false);
+    } else {
+        add(0,                 n_head,            taper.head_s, true);
+        add(n_head,            n_tokens - n_tail, n_ubatch,     false);
+        add(n_tokens - n_tail, n_tokens,          taper.tail_s, false);
+    }
+
+    // no micro-batch below min_s tokens: a short one (a remainder, a short region) joins its neighbour (the previous
+    // one, the next for the first), and a pair above n_ubatch is halved. Batches of 1-8 tokens take the matrix-vector
+    // products (the CPU's one-column path, MMVQ on CUDA), which round differently from the matrix-matrix kernels that
+    // a prompt's micro-batches run, and cost more per token
+    if (use_min) {
+        std::vector<uint32_t> sz;
+        uint32_t prev = 0;
+        for (const uint32_t e : ends) {
+            sz.push_back(e - prev);
+            prev = e;
+        }
+        // each step removes a short piece or halves a pair into two that are not short
+        const size_t n_steps = 2*sz.size() + 2;
+        for (size_t it = 0; it < n_steps; ++it) {
+            size_t i = 0;
+            while (i < sz.size() && sz[i] >= taper.min_s) {
+                ++i;
+            }
+            if (i == sz.size() || sz.size() < 2) {
+                break;
+            }
+            const size_t a = i > 0 ? i - 1 : 0;
+            const size_t b = a + 1;
+            const uint32_t t = sz[a] + sz[b];
+            if (t <= n_ubatch) {
+                sz[a] = t;
+                sz.erase(sz.begin() + b);
+            } else {
+                sz[a] = t - t/2;
+                sz[b] = t/2;
+            }
+        }
+        ends.clear();
+        uint32_t pos = 0;
+        for (const uint32_t s : sz) {
+            pos += s;
+            ends.push_back(pos);
+        }
+    }
+
+    // the split without a plan: n_ubatch tokens at a time, the remainder last
+    bool stock = true;
+    for (size_t i = 0; i < ends.size() && stock; ++i) {
+        stock = ends[i] == std::min<uint64_t>(n_tokens, (uint64_t) (i + 1)*n_ubatch);
+    }
+    if (stock) {
+        ends.clear();
+    }
+
+    return ends;
+}
+
+void llama_batch_allocr::set_ubatch_plan(std::vector<uint32_t> ends) {
+    ubatch_plan = std::move(ends);
+}
+
+bool llama_batch_allocr::is_one_seq_tokens() const {
+    return batch.n_tokens > 0 && batch.token != nullptr && batch.embd == nullptr && is_embd_vec.empty() &&
+           state_vec.empty() && embd_row_vec.empty() && decision_order.empty() && !has_cpl && seq_id_unq.size() == 1;
+}
+
+uint32_t llama_batch_allocr::plan_cap(uint32_t n_ubatch) const {
+    // the plan is set for batches of one sequence, whose splits take the tokens in order: n_used is the next offset
+    for (const uint32_t end : ubatch_plan) {
+        if (end > n_used) {
+            return std::max<uint32_t>(1, std::min(n_ubatch, end - n_used));
+        }
+    }
+    return n_ubatch;
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    n_ubatch = plan_cap(n_ubatch);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -639,6 +854,12 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+    if (!ubatch_plan.empty()) {
+        // the trailing n_keep_tail tokens of the sequence still go into one micro-batch (resolved below)
+        const uint32_t n_cap = plan_cap(n_ubatch);
+        n_ubatch = n_keep_tail > 0 ? std::max(n_cap, std::min(n_ubatch, n_keep_tail + 1)) : n_cap;
+    }
+
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -810,6 +1031,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+    n_ubatch = plan_cap(n_ubatch);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -882,6 +1105,8 @@ void llama_batch_allocr::clear() {
     seq_set_map.clear();
 
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
+
+    ubatch_plan.clear();
 }
 
 llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {

@@ -151,6 +151,12 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_screen_head(bool value);
+
+    // Q771: the micro-batch taper (llama_set_ubatch_taper), and the caller's hints for the next decode call
+    bool         set_ubatch_taper(const char * spec);
+    const char * get_ubatch_taper() const;
+    void         set_ubatch_taper_next(int32_t head, int32_t tail);
+
     void set_warmup(bool value);
 
     // a shortlist for this (draft) context's output head (llama_head_shortlist_*)
@@ -644,6 +650,13 @@ private:
     // env: LLAMA_GRAPH_REUSE_WAIT=1 reuses a graph under pipeline parallelism while a ubatch is in flight, after waiting
     // for all devices (the behavior before the in-flight rule)
     bool graph_reuse_wait = false;
+
+    // Q771: the micro-batch taper (env: LLAMA_UBATCH_TAPER, llama_set_ubatch_taper), its spec, and the hints for the
+    // next decode call (llama_set_ubatch_taper_next: -1 default, 0 no, 1 yes), which that call consumes
+    llama_ubatch_taper taper;
+    std::string        taper_spec      = "off";
+    int32_t            taper_next_head = -1;
+    int32_t            taper_next_tail = -1;
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;

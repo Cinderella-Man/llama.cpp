@@ -1630,6 +1630,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--ubatch-taper"}, "SPEC",
+        "micro-batch taper of the prompt calls: smaller micro-batches where a call fills or drains the layer-split "
+        "pipeline, n_ubatch in between (results unchanged). SPEC: off, on (= head=256:64,tail=512:128,short=600:64), or "
+        "any of head=N:S (first N tokens of a call that starts on idle devices, in micro-batches of S), tail=N:S (last "
+        "N tokens before the server waits), short=N:S (a call of at most N tokens that is both: all of it in S), "
+        "min=N (no micro-batch under N tokens, default 9), comma-separated; a request's \"ubatch_taper\" overrides it "
+        "(default: off, or LLAMA_UBATCH_TAPER)",
+        [](common_params & params, const std::string & value) {
+            params.ubatch_taper = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_TAPER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

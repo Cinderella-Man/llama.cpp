@@ -70,6 +70,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_str("ubatch_taper"))
+        ->set_desc("Micro-batch taper of this request's prompt calls (off, on, or head=N:S,tail=N:S,short=N:S); see --ubatch-taper")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.ubatch_taper = data.at("ubatch_taper").get<std::string>();
+        }));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 
