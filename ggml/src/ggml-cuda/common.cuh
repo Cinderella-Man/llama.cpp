@@ -1561,6 +1561,12 @@ struct ggml_backend_cuda_context {
         unsigned * counters = nullptr;
     } fattn_pascal;
 
+    // The sparse decode attention kernel's merge counters (fattn-sparse-pascal.cu), one per column (query x KV head),
+    // allocated and zeroed on first use; each launch leaves them at zero.
+    struct fattn_sparse_pascal_state {
+        unsigned * counters = nullptr;
+    } fattn_sparse_pascal;
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();

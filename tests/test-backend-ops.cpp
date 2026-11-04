@@ -13740,6 +13740,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // KV not a multiple of the compaction workgroup size.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 5003, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
+    // the sparse decode attention below Turing (GGML_CUDA_FATTN_SPARSE_PASCAL=1, or 2 on any GPU; 0: the stock kernels):
+    // Flash-Next's QSA layers (head 256, 2 KV heads of 12 query heads, 2,051 cells: the top 2,048 plus the incomplete
+    // pool) at decode and verify sizes in the cache layout, two sequences, head 128 with 8 and 4 query heads per KV head,
+    // sinks, 16 heads per KV head, lists of one tile and shorter
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t nb : { 1, 2, 3, 5, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768,  1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2},  4096,  4, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 2051));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 8, 1},  4096,  1, true, true,  0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 1027));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, { 4, 1},  4096,  7, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false,  333));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {16, 1},  4096,  1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false,   31));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  4096,  2, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false,   32));
+    }
+
     // Sparse gather: native block sizes, padded slots, and head/batch strides.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 96, 2, {8, 2}, 5003, 3, true, false, 0, 0, GGML_PREC_F32, type, type, {0, 1, 2, 3}, true, false, 257));
@@ -14544,6 +14560,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
+    }
+
+    // Flash-Next's QSA layer call in the cache layout at decode (1 token) and verify (4 tokens) sizes across the context,
+    // F16 and Q8_0 caches: the sparse decode attention below Turing against the stock kernels on the same calls
+    // (GGML_CUDA_FATTN_SPARSE_PASCAL=1/0)
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t kv : { 4096, 8192, 16384, 32768, 65536, 131072 }) {
+            for (int64_t nb : { 1, 4 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                type_KV, type_KV, {0, 2, 1, 3}, true, false, 2051));
+            }
+        }
     }
 
     // Flint's one-token decode attention per layer call (4 KV heads of 8 query heads, head size 128, F16 cache viewed as

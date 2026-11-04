@@ -742,6 +742,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
+// LLAMA_QSA_INPUT_STATS=N: every N ubatches, log the host time of the QSA k-pool inputs and their bytes, which each
+// device running a QSA layer receives once per ubatch (the counts of all contexts in the process together)
+static int qwen4exp_qsa_input_stats() {
+    static const int every = [] {
+        const char * env = getenv("LLAMA_QSA_INPUT_STATS");
+        return env ? std::max(0, atoi(env)) : 0;
+    }();
+    return every;
+}
+
+static void qwen4exp_qsa_input_stats_add(const int64_t t_us, const size_t bytes, const int64_t n_pool, const int64_t n_tokens) {
+    static int64_t n_ub      = 0;
+    static int64_t sum_us    = 0;
+    static size_t  sum_bytes = 0;
+
+    const int every = qwen4exp_qsa_input_stats();
+    ++n_ub;
+    sum_us    += t_us;
+    sum_bytes += bytes;
+    if (n_ub % every == 0) {
+        LLAMA_LOG_INFO("%s: QSA k-pool inputs, last %d ubatches: %.1f us on the host and %.1f KiB per device per ubatch "
+                       "(n_pool %" PRId64 ", %" PRId64 " tokens)\n", __func__, every, (double) sum_us/every,
+                       (double) sum_bytes/1024.0/every, n_pool, n_tokens);
+        sum_us    = 0;
+        sum_bytes = 0;
+    }
+}
+
 // QSA k-pool inputs, shared by the QSA layers: blocks of compress_ratio cells in sequence order, see llama_memory_hybrid_idx
 class llama_model_qwen4exp::llm_graph_input_kpool : public llm_graph_input_i {
 public:
@@ -749,9 +777,20 @@ public:
     virtual ~llm_graph_input_kpool() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
+        const bool    stats = qwen4exp_qsa_input_stats() > 0;
+        const int64_t t0    = stats ? ggml_time_us() : 0;
+
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
+
+        if (stats) {
+            size_t bytes = 0;
+            for (const ggml_tensor * t : { k_idxs, pool_cells, pool_idxs, pool_mask, tail_idxs, new_pool_idxs, new_pool_rep, new_pool_pos }) {
+                bytes += t ? ggml_nbytes(t) : 0;
+            }
+            qwen4exp_qsa_input_stats_add(ggml_time_us() - t0, bytes, pool_cells->ne[0], ubatch->n_tokens);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
