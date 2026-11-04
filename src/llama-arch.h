@@ -565,6 +565,11 @@ enum llm_tensor {
     LLM_TENSOR_FFN_GATE_EXPS,
     LLM_TENSOR_FFN_UP_EXPS,
     LLM_TENSOR_FFN_GATE_UP_EXPS,
+    LLM_TENSOR_FFN_DOWN_EXPS_COLD, // a cold tier of the merged experts, in its own type
+    LLM_TENSOR_FFN_GATE_EXPS_COLD,
+    LLM_TENSOR_FFN_UP_EXPS_COLD,
+    LLM_TENSOR_FFN_GATE_UP_EXPS_COLD,
+    LLM_TENSOR_FFN_EXPS_TIER,      // expert id -> its tier and slot
     LLM_TENSOR_FFN_DOWN_SHEXP,
     LLM_TENSOR_FFN_GATE_SHEXP,
     LLM_TENSOR_FFN_UP_SHEXP,

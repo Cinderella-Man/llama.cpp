@@ -279,6 +279,10 @@ struct llama_moe_cache::impl {
             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
                 continue;
             }
+            // the slots are keyed by the router's expert ids, which a cold tier splits over two sets of tensors
+            if (model.layers[il].ffn_exps_tier != nullptr) {
+                continue;
+            }
             const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
             if (it_dev == devices.end()) {
                 continue;
