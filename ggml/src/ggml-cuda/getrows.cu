@@ -47,7 +47,8 @@ static __global__ void k_get_rows(
     }
 }
 
-template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
+// qk: weights per super-block (QK_K; N2P-128 and N3P-128: QK_NP128)
+template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq, int qk = QK_K>
 static __global__ void k_get_rows_kq(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
@@ -57,7 +58,7 @@ static __global__ void k_get_rows_kq(
         const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
 
     ggml_cuda_pdl_sync();
-    const int64_t nsb = ne00/QK_K; // super-blocks per row
+    const int64_t nsb = ne00/qk; // super-blocks per row
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
         // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
         const int i10 = blockIdx.x;
@@ -81,7 +82,7 @@ static __global__ void k_get_rows_kq(
         }
 
         for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
-            dequantize_kq(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
+            dequantize_kq(src0_row, ib, dst_row + ib*qk, threadIdx.x);
         }
     }
 }
@@ -229,15 +230,15 @@ static void get_rows_cuda_q(
         s10, s11, s12/*, s13*/);
 }
 
-template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
+template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq, int qk = QK_K>
 static void get_rows_cuda_kq(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
-    GGML_ASSERT(ne00 % QK_K == 0);
-    const int64_t nsb = ne00/QK_K;
+    GGML_ASSERT(ne00 % qk == 0);
+    const int64_t nsb = ne00/qk;
 
     const dim3 block_dims(block_dim, 1, 1);
     const dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
@@ -257,7 +258,7 @@ static void get_rows_cuda_kq(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
-    k_get_rows_kq<dst_t, dequantize_kq><<<block_nums, block_dims, 0, stream>>>(
+    k_get_rows_kq<dst_t, dequantize_kq, qk><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
         ne00, /*ne01, ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
@@ -434,6 +435,22 @@ static void ggml_cuda_get_rows_switch_src0_type(
             break;
         case GGML_TYPE_IQ4_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_N2P:
+            get_rows_cuda_kq<32, dst_t, dequantize_n2p<dst_t>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_N3P:
+            get_rows_cuda_kq<32, dst_t, dequantize_n3p<dst_t>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_N2P_128:
+            get_rows_cuda_kq<16, dst_t, dequantize_n2p_128<dst_t>, QK_NP128>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_N3P_128:
+            get_rows_cuda_kq<16, dst_t, dequantize_n3p_128<dst_t>, QK_NP128>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_MXFP4:

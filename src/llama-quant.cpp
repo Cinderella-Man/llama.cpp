@@ -455,7 +455,12 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:   // types on the right: block size 32
+            case GGML_TYPE_N2P_128:
+            case GGML_TYPE_N3P_128:
             case GGML_TYPE_IQ4_XS:  return_type = GGML_TYPE_IQ4_NL; break;
+            // N2P and N3P: their 128-weight blocks where the width is a multiple of 128 (640-wide rows), else IQ4_NL
+            case GGML_TYPE_N2P:     return_type = ncols % ggml_blck_size(GGML_TYPE_N2P_128) == 0 ? GGML_TYPE_N2P_128 : GGML_TYPE_IQ4_NL; break;
+            case GGML_TYPE_N3P:     return_type = ncols % ggml_blck_size(GGML_TYPE_N3P_128) == 0 ? GGML_TYPE_N3P_128 : GGML_TYPE_IQ4_NL; break;
             case GGML_TYPE_Q2_0:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
