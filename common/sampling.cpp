@@ -549,6 +549,35 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->t_total_us = src->t_total_us;
 }
 
+void common_sampler_copy_keep_rng(const common_sampler * src, common_sampler * dst) {
+    if (!src || !dst || src == dst) {
+        return;
+    }
+
+    // dst's random samplers, kept aside while the copy overwrites them
+    // (their state is their random stream only)
+    const int32_t n = llama_sampler_chain_n(dst->chain);
+    std::vector<llama_sampler *> draws(n, nullptr);
+    for (int32_t i = 0; i < n; ++i) {
+        const llama_sampler * s = llama_sampler_chain_get(dst->chain, i);
+        const char * name = llama_sampler_name(s);
+        if (name && (strcmp(name, "dist") == 0 || strcmp(name, "xtc") == 0)) {
+            draws[i] = llama_sampler_clone(s);
+        }
+    }
+    const std::mt19937 rng = dst->rng;
+
+    common_sampler_copy(src, dst);
+
+    dst->rng = rng;
+    for (int32_t i = 0; i < n; ++i) {
+        if (draws[i]) {
+            llama_sampler_copy(draws[i], llama_sampler_chain_get(dst->chain, i));
+            llama_sampler_free(draws[i]);
+        }
+    }
+}
+
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
     // TODO: measure grammar performance
 
