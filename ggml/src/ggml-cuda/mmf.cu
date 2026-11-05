@@ -2,6 +2,7 @@
 #include "mmf.cuh"
 #include "mmid.cuh"
 #include "moe-tail.cuh"
+#include "mmvq.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -12,13 +13,14 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
 }
 
 // GGML_CUDA_MMQ_MOE_LEGACY=1 (mmq.cu) also gives MMF's MUL_MAT_ID the layout before the MoE tile list (llama.cpp PR
-// #31047): ceil(tokens / 16) tiles for every expert, each from the expert's first column, the ones past its last empty
-static bool ggml_cuda_mmf_moe_legacy() {
-    static const bool legacy = [] {
+// #31047): ceil(tokens / 16) tiles for every expert, each from the expert's first column, the ones past its last empty;
+// =2 (v2's prefill split) that layout only up to MMVQ_MAX_BATCH_SIZE tokens, as in mmq.cu
+static bool ggml_cuda_mmf_moe_legacy(const int64_t n_tokens) {
+    static const int mode = [] {
         const char * env = getenv("GGML_CUDA_MMQ_MOE_LEGACY");
-        return env != nullptr && atoi(env) != 0;
+        return env != nullptr ? atoi(env) : 0;
     }();
-    return legacy;
+    return mode == 2 ? n_tokens <= MMVQ_MAX_BATCH_SIZE : mode != 0;
 }
 
 static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
@@ -96,7 +98,7 @@ static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml
         const int64_t n_tokens      = ne12;
         const int64_t ne_get_rows   = n_tokens * n_expert_used;
         // legacy: one tile per 16 tokens for every expert (as many as the CUDA grid's y dimension allows)
-        const int     tiles_per_expert = ggml_cuda_mmf_moe_legacy() && n_experts*((n_tokens + 16 - 1) / 16) <= 65535 ?
+        const int     tiles_per_expert = ggml_cuda_mmf_moe_legacy(n_tokens) && n_experts*((n_tokens + 16 - 1) / 16) <= 65535 ?
             (n_tokens + 16 - 1) / 16 : 0;
         const int64_t max_tiles     = tiles_per_expert > 0 ? n_experts*tiles_per_expert : (ne_get_rows + 16 - 1) / 16 + ne02;
 
