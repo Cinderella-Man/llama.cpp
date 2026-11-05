@@ -732,6 +732,7 @@ static void ggml_cuda_mul_mat_vec_f_impl(ggml_backend_cuda_context & ctx, const 
         case GGML_TYPE_F16: {
             const half * src0_d = (const half *) src0->data;
             // one token, one matrix, no fusion (e.g. a MoE router kept in F16): the Pascal F16 kernel where it applies
+            // (GGML_CUDA_MMVQ_PASCAL_F16=1, off by default)
             if (!ids && ncols_dst == 1 && ne02 == 1 && ne03 == 1 && ne2 == 1 && ne3 == 1 && !fusion_local.gate &&
                     !fusion_local.x_bias && !fusion_local.gate_bias &&
                     ggml_cuda_mmvf_pascal_f16(src0_d, src1_d, dst_d, ne00, ne01, s01, ctx.stream())) {

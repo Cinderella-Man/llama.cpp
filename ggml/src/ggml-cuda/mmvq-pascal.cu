@@ -1327,9 +1327,19 @@ static __global__ void mul_mat_vec_f16_pascal(const char * x, const float * y, f
     }
 }
 
+// GGML_CUDA_MMVQ_PASCAL_F16=1 turns the Pascal F16 product on (off by default: mul_mat_vec_f, and the persistent MoE
+// kernel's router rows in mul_mat_vec_f's order)
+static bool mmvqp_f16_on() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_F16");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
 bool ggml_cuda_mmvf_pascal_f16_applies(const void * x, const int64_t ncols, const int64_t stride_row) {
     const int64_t row_bytes = stride_row * (int64_t) sizeof(half);
-    return ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+    return mmvqp_f16_on() && ggml_cuda_mmvq_pascal_active(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
         !mmvqp_skip_type(GGML_TYPE_F16) && ncols % 8 == 0 && row_bytes % 16 == 0 && row_bytes <= INT_MAX &&
         mmvqp_aligned(x, 16);
 }
