@@ -79,6 +79,7 @@
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml-cuda/moe-persistent.cuh"
 #include "ggml-cuda/hop-mailbox.cuh"
+#include "ggml-cuda/keepalive.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -493,6 +494,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void clear_pool() {
+        ggml_cuda_keepalive_quiesce();
         ggml_cuda_set_device(device);
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
@@ -567,6 +569,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
+            ggml_cuda_keepalive_quiesce();
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
             invalidate_cuda_graphs();
@@ -596,6 +599,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
+        ggml_cuda_keepalive_quiesce();
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
         invalidate_cuda_graphs();
@@ -625,6 +629,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
     ~ggml_cuda_pool_vmm() {
         if (pool_addr != 0) {
+            ggml_cuda_keepalive_quiesce();
 #if defined(GGML_USE_HIP)
             // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
             for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
@@ -867,6 +872,7 @@ static ggml_cuda_hop_ring * ggml_cuda_hop_ring_get(ggml_backend_cuda_context * c
     r->stream_mode = ggml_cuda_hop_env("GGML_CUDA_HOP_STREAM",  1,   0,     2);
 
     ggml_cuda_set_device(r->dev_dst);
+    ggml_cuda_keepalive_quiesce();
     CUDA_CHECK(cudaHostAlloc((void **) &r->host, (size_t) r->n_slots * r->slot_size, cudaHostAllocPortable));
     r->drained.resize(r->n_slots);
     for (auto & e : r->drained) {
@@ -963,6 +969,7 @@ static void ggml_cuda_hop_ring_free(ggml_cuda_hop_ring * r, const std::string & 
         CUDA_CHECK(cudaEventSynchronize(e));
         CUDA_CHECK(cudaEventDestroy(e));
     }
+    ggml_cuda_keepalive_quiesce();
     CUDA_CHECK(cudaFreeHost(r->host));
     delete r;
 }
@@ -977,6 +984,7 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+    ggml_cuda_keepalive_quiesce();
 
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         if (hop_mailboxes[i] != nullptr) {
@@ -1033,6 +1041,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        ggml_cuda_keepalive_quiesce();
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -1765,6 +1774,7 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_cuda_keepalive_quiesce();
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1774,6 +1784,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
     }
 
     void * ptr = nullptr;
+    ggml_cuda_keepalive_quiesce();
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     if (err != cudaSuccess) {
         // clear the error
@@ -3115,6 +3126,8 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    ggml_cuda_keepalive_log(ggml_cuda_get_physical_device(cuda_ctx->device));
 
     delete cuda_ctx;
     delete backend;
@@ -6700,6 +6713,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
+        // GGML_CUDA_KEEPALIVE: the card's block is not running while a capture begins
+        ggml_cuda_keepalive_graph_begin(ggml_cuda_get_physical_device(cuda_ctx->device), true);
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
@@ -6723,6 +6738,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (prof_host) {
         ggml_cuda_profile_host_exit(prof_host, cuda_ctx);
     }
+
+    // GGML_CUDA_KEEPALIVE: a beat for the card's block, started if it is not running
+    ggml_cuda_keepalive_graph_end(ggml_cuda_get_physical_device(cuda_ctx->device));
 
     return GGML_STATUS_SUCCESS;
 }
@@ -7230,6 +7248,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     }
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    ggml_cuda_keepalive_quiesce();
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
     if (err != cudaSuccess) {
         // clear the error
@@ -7252,6 +7271,7 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
         return;
     }
 
+    ggml_cuda_keepalive_quiesce();
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {
         // clear the error
@@ -8177,6 +8197,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_event_query") == 0) {
         return (void *)ggml_backend_cuda_event_query;
+    }
+    if (strcmp(name, "ggml_backend_cuda_keepalive_kick") == 0) {
+        return (void *)ggml_backend_cuda_keepalive_kick;
     }
     return nullptr;
 }

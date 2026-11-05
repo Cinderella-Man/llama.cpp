@@ -1,4 +1,5 @@
 #include "hop-mailbox.cuh"
+#include "keepalive.cuh"
 
 #include <cinttypes>
 #include <cstring>
@@ -243,6 +244,7 @@ static ggml_cuda_hop_mailbox * hop_mb_get(ggml_backend_cuda_context * ctx_src, g
 
     const size_t n_words = (size_t) (2*mb->n_slots + 1) * HOP_MB_LINE;
     ggml_cuda_set_device(mb->dev_dst);
+    ggml_cuda_keepalive_quiesce();
     CUDA_CHECK(cudaHostAlloc((void **) &mb->ring, (size_t) mb->n_slots * mb->slot_size,
             cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &mb->words, n_words * sizeof(unsigned), cudaHostAllocPortable | cudaHostAllocMapped));
@@ -372,6 +374,7 @@ void ggml_cuda_hop_mailbox_free(ggml_cuda_hop_mailbox * mb, ggml_backend_cuda_co
                 "(saw %u)\n", __func__, mb->dev_src, ctx_dst->name.c_str(), timeout_line[0] == 1 ? "writing" : "reading",
                 timeout_line[1], timeout_line[2]);
     }
+    ggml_cuda_keepalive_quiesce();
     CUDA_CHECK(cudaFreeHost(mb->words));
     CUDA_CHECK(cudaFreeHost(mb->ring));
     delete mb;
