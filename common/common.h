@@ -138,7 +138,11 @@ enum common_sampler_type {
 // screened output head (models with an output_screen tensor; see llama_set_screen_head): whether sampling with these
 // parameters picks the same tokens from screened logits (exact for the top m candidates, -INFINITY elsewhere) as from
 // the full head whenever the true top-k is among the candidates; why = the reason when it does not
-bool common_sampling_screen_head_ok(const struct common_params_sampling & p, uint32_t m, std::string * why = nullptr);
+// grammar_active: whether the grammar can reject the next token (common_sampler_grammar_active); a grammar that cannot
+// (a lazy grammar before its trigger, or inside the reasoning) leaves the chain's token as it is, so the screen stays
+// exact, while a rejection resamples over the allowed tokens, which may lie outside the candidates
+bool common_sampling_screen_head_ok(const struct common_params_sampling & p, uint32_t m, std::string * why = nullptr,
+                                    bool grammar_active = true);
 
 // the shortlist head with an exact bound (Q619, llama_head_bound_*): what a row of shortlist logits must show for
 // sampling with these parameters to pick the same token, with the same probabilities, as from the full head: at
@@ -160,6 +164,10 @@ bool common_head_bound_requested();
 
 // LLAMA_SCREEN_HEAD=1 asks for the screened output head (llama_context turns it on at creation)
 bool common_screen_head_requested();
+
+// LLAMA_SCREEN_HEAD_GRAMMAR=1 (off by default) keeps the screened head for a request with a grammar until the grammar can
+// reject a token (common_sampling_screen_head_ok's grammar_active); off, any grammar turns the screen off
+bool common_screen_head_grammar();
 
 // dimensionality reduction methods, used by cvector-generator
 enum dimre_method {
