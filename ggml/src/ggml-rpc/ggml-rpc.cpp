@@ -1665,6 +1665,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         return nullptr;
     }
 
+    // an op this build does not have (a peer with another op table) must not reach a backend
+    if (tensor->op >= GGML_OP_COUNT) {
+        LOG_ERROR("[%s] invalid tensor op received: %u\n", __func__, tensor->op);
+        return nullptr;
+    }
+
     // Fix: Prevent division by zero if blck_size is 0 (e.g., deprecated types)
     if (ggml_blck_size((enum ggml_type)tensor->type) == 0) {
         LOG_ERROR("[%s] invalid tensor type received (blck_size is 0): %u\n", __func__, tensor->type);
