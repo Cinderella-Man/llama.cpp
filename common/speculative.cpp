@@ -122,6 +122,31 @@ void common_speculative_lattice_info(common_speculative_draft_info & info, const
     }
 }
 
+std::vector<int32_t> common_speculative_lattice_walk(const float * lattice, size_t row_stride, int32_t n_pos, int32_t top_k) {
+    std::vector<int32_t> walk;
+    walk.reserve(std::max(0, n_pos));
+    int32_t predecessor = 0; // the first position's rows are all the anchor's
+    for (int32_t i = 0; i < n_pos; ++i) {
+        const float * scores = lattice + (size_t) i * row_stride + top_k + (size_t) predecessor * top_k;
+        predecessor = (int32_t) std::distance(scores, std::max_element(scores, scores + top_k));
+        walk.push_back(predecessor);
+    }
+    return walk;
+}
+
+void common_speculative_full_block_info(common_speculative_draft_info & info, const float * lattice, size_t row_stride,
+        int32_t n_pos, int32_t top_k) {
+    common_speculative_draft_info block;
+    block.k_max = info.k_max;
+    common_speculative_lattice_info(block, lattice, row_stride, n_pos, top_k,
+            common_speculative_lattice_walk(lattice, row_stride, n_pos, top_k));
+    info.fb_width = n_pos + 1;
+    info.fb_ids   = std::move(block.ids);
+    info.fb_p     = std::move(block.p);
+    info.fb_pick  = std::move(block.pick);
+    info.fb_kept  = std::move(block.kept);
+}
+
 // one drafted position of a sequential drafter (or DFlash without a selector) into info: the top k_max of its
 // candidates, and the drafted token among them
 static void spec_info_add_marginal(common_speculative_draft_info * info, const std::string & type,
@@ -1683,10 +1708,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
-            // LLAMA_SPEC_DUMP's full block: DFlash2 decodes the whole trained block, and drafts only n_max of it
-            const bool    full_block     = is_dflash2 && dp.info && dp.info->full_block;
-            const int32_t n_block_tokens = is_lilicorr ? block_size :
-                full_block ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1753,11 +1775,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (i > params.n_max) {
-                        // past the draft (a full block for dp.info): the drafter's greedy walk only
-                        walk.push_back(predecessor);
-                        continue;
-                    }
                     if (params.p_min > 0.0f || sample || dp.result_p) {
                         // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                         probs.resize(top_k);
@@ -1882,6 +1899,64 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+        }
+
+        if (is_dflash2) {
+            draft_full_block(dparams, i_block_beg);
+        }
+    }
+
+    // LLAMA_SPEC_DUMP's full block (common_speculative_draft_info::full_block): for each drafting sequence whose record
+    // asks for it, decode a second block of the asked width (the trained block at most) at the same positions and keep
+    // its lattice in the record. It runs after the draft has been taken from its own block, so the draft is the one
+    // the line makes without the record. The first block's cells in the draft context are dropped before it, as the
+    // server does after every draft, so the second block attends to what the first did. A failure leaves the record
+    // without the block; the draft stands.
+    void draft_full_block(common_speculative_draft_params_vec & dparams, const std::vector<int32_t> & i_block_beg) {
+        auto * ctx_dft = params.ctx_dft;
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        std::vector<int32_t> beg  (n_seq, -1);
+        std::vector<int32_t> width(n_seq,  0);
+
+        batch.clear();
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (i_block_beg[seq_id] < 0 || dp.info == nullptr || dp.info->full_block <= 0) {
+                continue;
+            }
+            const int32_t w = std::max(2, std::min(dp.info->full_block == 1 ? block_size : dp.info->full_block, block_size));
+            if (!llama_memory_seq_rm(mem_dft, seq_id, dp.pos0, -1)) {
+                LOG_WRN("%s: cannot drop the draft block of sequence %d, no full block for its record\n", __func__, (int) seq_id);
+                continue;
+            }
+            beg  [seq_id] = batch.size();
+            width[seq_id] = w;
+            for (int32_t i = 0; i < w; ++i) {
+                batch.add(i == 0 ? dp.id_last : mask_token_id, (llama_pos) dp.pos0 + i, seq_id, false);
+            }
+        }
+
+        if (batch.size() == 0) {
+            return;
+        }
+
+        const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (ret != 0) {
+            LOG_WRN("%s: llama_process returned %d, no full block\n", __func__, ret);
+            return;
+        }
+
+        const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+        if (lattice == nullptr) {
+            return;
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (beg[seq_id] < 0) {
+                continue;
+            }
+            common_speculative_full_block_info(*dparams[seq_id].info, lattice + (size_t) (beg[seq_id] + 1) * n_embd_dec,
+                    n_embd_dec, width[seq_id] - 1, selector_top_k);
         }
     }
 

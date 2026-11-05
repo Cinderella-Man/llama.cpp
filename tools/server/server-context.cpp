@@ -229,14 +229,17 @@ static std::vector<llama_token> server_sample_and_accept_synth(
 //   LLAMA_SPEC_DUMP_K=<n>        candidates kept per drafted position (default 8)
 //   LLAMA_SPEC_DUMP_TGT_K=<n>    the target's most probable tokens per sampled position (default 8, 0: none)
 //   LLAMA_SPEC_DUMP_NGRAM=<n>    the longest context match looked for and the tokens kept after it (default 16, 0: none)
-//   LLAMA_SPEC_DUMP_FULL_BLOCK=1 DFlash2 decodes its whole trained block for the lattice, drafting still n_max
+//   LLAMA_SPEC_DUMP_FULL_BLOCK=<n> DFlash2 decodes a second block for the record ("fb": the trained block for 1, a block
+//                                of n tokens for n >= 2, at most the trained block), after the draft is taken from the
+//                                block the line decodes anyway: drafting, verifying and the output are the same with it
+//                                on or off, the step costs one more drafter pass (default 0: off)
 // Replayed steps (after a checkpoint restore) and synthetic acceptance are not written.
 struct server_spec_dump {
     FILE *   f          = nullptr;
     int32_t  k          = 8;
     int32_t  tgt_k      = 8;
     int32_t  ngram      = 16;
-    bool     full_block = false;
+    int32_t  full_block = 0;
     uint64_t n_steps    = 0;
     int64_t  run        = 0; // the server start in microseconds: tells apart runs appended to one file
 
@@ -259,7 +262,7 @@ struct server_spec_dump {
             r.k          = std::max(1, env_int("LLAMA_SPEC_DUMP_K", 8));
             r.tgt_k      = env_int("LLAMA_SPEC_DUMP_TGT_K", 8);
             r.ngram      = env_int("LLAMA_SPEC_DUMP_NGRAM", 16);
-            r.full_block = env_int("LLAMA_SPEC_DUMP_FULL_BLOCK", 0) != 0;
+            r.full_block = env_int("LLAMA_SPEC_DUMP_FULL_BLOCK", 0);
             r.run        = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
             LOG_INF("LLAMA_SPEC_DUMP: verify steps to '%s' (k %d, target k %d, n-gram %d, full block %d)\n",
@@ -603,6 +606,7 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
     common_speculative_draft_info spec_info; // the drafter's candidates, for LLAMA_SPEC_DUMP
+    bool spec_gram = false; // LLAMA_SPEC_DUMP: the sampler's grammar (a tool call's) was active when the draft was made
 
     // LLAMA_SPEC_ADAPT (see server_spec_adapt): the drafter's probability of each token of spec_draft, the running
     // speed-up (kept across tasks), the drafted step waiting for its accepted length, and the steps of this task by
@@ -1347,6 +1351,7 @@ static void spec_dump_step(const server_slot & slot, llama_context * ctx_tgt, co
         {"draft",    slot.spec_draft},
         {"sampled",  accepted},
         {"n_acc",    accepted.size() - 1},
+        {"gram",     slot.spec_gram ? 1 : 0},
     };
 
     if (!info.ids.empty()) {
@@ -1374,6 +1379,33 @@ static void spec_dump_step(const server_slot & slot, llama_context * ctx_tgt, co
             }
             line["kept"] = std::move(kept);
         }
+    }
+
+    // the second block of LLAMA_SPEC_DUMP_FULL_BLOCK: its lattice in the same form, along the selector's greedy walk
+    if (info.fb_width > 0 && !info.fb_ids.empty()) {
+        json p = json::array();
+        for (const auto & row : info.fb_p) {
+            json r = json::array();
+            for (const float x : row) {
+                r.push_back(spec_dump_round(x));
+            }
+            p.push_back(std::move(r));
+        }
+        json cand = json::array();
+        for (const auto & row : info.fb_ids) {
+            cand.push_back(row);
+        }
+        json kept = json::array();
+        for (const float x : info.fb_kept) {
+            kept.push_back(spec_dump_round(x));
+        }
+        line["fb"] = {
+            {"w",    info.fb_width},
+            {"cand", std::move(cand)},
+            {"p",    std::move(p)},
+            {"pick", info.fb_pick},
+            {"kept", std::move(kept)},
+        };
     }
 
     if (d.tgt_k > 0) {
@@ -5616,6 +5648,7 @@ private:
                             slot.spec_info.clear();
                             slot.spec_info.k_max      = server_spec_dump::get().k;
                             slot.spec_info.full_block = server_spec_dump::get().full_block;
+                            slot.spec_gram            = common_sampler_grammar_active(slot.smpl.get());
                         }
 
                         const bool spec_adapt = server_spec_adapt::on();

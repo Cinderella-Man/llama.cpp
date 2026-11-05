@@ -63,9 +63,12 @@ void common_speculative_free(common_speculative * spec);
 struct common_speculative_draft_info {
     // in
     int32_t k_max      = 8;     // the most candidates kept per position
-    bool    full_block = false; // DFlash2: decode the whole trained block for the lattice; the draft stays at n_max
+    // DFlash2: also decode a second block, for this record only, and keep its lattice in fb_* (0: no; 1: the trained
+    // block; n >= 2: a block of n tokens, the anchor and n - 1 masks, capped at the trained block). The draft is
+    // decoded first, from the block the line would decode without the record, so it is the same either way.
+    int32_t full_block = 0;
 
-    // out, one entry per position after the anchor (DFlash2: every position of the decoded block, drafted or not)
+    // out, one entry per position after the anchor of the draft's own block (DFlash2: n_max positions)
     std::string type;            // the implementation that filled it
     bool        lattice = false; // true: DFlash2's selector, p[i] holds the conditional rows; false: marginals
     std::vector<std::vector<llama_token>> ids;  // candidates, highest marginal probability first
@@ -77,6 +80,14 @@ struct common_speculative_draft_info {
     std::vector<int32_t> pick; // the drafter's own walk: index into ids[i] (-1: the walk stopped before it)
     std::vector<float>   kept; // lattice: the selector's marginal mass of the kept candidates per position
 
+    // out, full_block: the second block's lattice, in the same form as ids, p, pick and kept (always a lattice), one
+    // entry per position after the anchor; fb_pick is the selector's greedy walk over the whole block
+    int32_t fb_width = 0; // the block's tokens, the anchor included (0: not decoded)
+    std::vector<std::vector<llama_token>> fb_ids;
+    std::vector<std::vector<float>>       fb_p;
+    std::vector<int32_t>                  fb_pick;
+    std::vector<float>                    fb_kept;
+
     void clear() {
         type.clear();
         lattice = false;
@@ -84,6 +95,11 @@ struct common_speculative_draft_info {
         p.clear();
         pick.clear();
         kept.clear();
+        fb_width = 0;
+        fb_ids.clear();
+        fb_p.clear();
+        fb_pick.clear();
+        fb_kept.clear();
     }
 };
 
@@ -94,6 +110,15 @@ struct common_speculative_draft_info {
 // the candidates, and each position keeps the info.k_max highest plus the walked one.
 void common_speculative_lattice_info(common_speculative_draft_info & info, const float * lattice, size_t row_stride,
         int32_t n_pos, int32_t top_k, const std::vector<int32_t> & walk);
+
+// The selector's greedy walk over a lattice laid out as above: the candidate index taken at each of n_pos positions,
+// each the highest-scoring candidate given the previous one (the first position scores from the anchor alone).
+std::vector<int32_t> common_speculative_lattice_walk(const float * lattice, size_t row_stride, int32_t n_pos, int32_t top_k);
+
+// Reduce a whole decoded block's lattice (n_pos positions after the anchor) along its greedy walk into info.fb_*,
+// leaving the draft's own record (ids, p, pick, kept) alone. The candidates kept are info.k_max's.
+void common_speculative_full_block_info(common_speculative_draft_info & info, const float * lattice, size_t row_stride,
+        int32_t n_pos, int32_t top_k);
 
 // The draft length chosen per step (llama-server's LLAMA_SPEC_ADAPT). After drafting, keep the longest prefix of the
 // draft that pays for its verification, judged from the drafter's own probabilities and a table of what a k-token
