@@ -71,6 +71,18 @@ static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const in
     v.y = (v.y * dm.x) + dm.y;
 }
 
+static __device__ __forceinline__ void dequantize_q4_1_64(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    // ib counts 32-weight halves; each half is packed like a Q4_1 block and shares the 64-weight block's d and m
+    const block_q4_1_64 * x = (const block_q4_1_64 *) vx;
+
+    const float2 dm = __half22float2(x[ib/2].dm);
+
+    const int vui = x[ib/2].qs[16*(ib%2) + iqs];
+
+    v.x = (vui & 0xF) * dm.x + dm.y;
+    v.y = (vui >>  4) * dm.x + dm.y;
+}
+
 static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q5_0 * x = (const block_q5_0 *) vx;
 
