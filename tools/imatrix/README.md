@@ -10,7 +10,7 @@ More information is available in <https://github.com/ggml-org/llama.cpp/pull/486
     -m model.gguf -f some-text.txt [-o imatrix.gguf] [--output-format {gguf,dat}] [--no-ppl] \
     [--process-output] [--nextn] [--model-draft draft.gguf] [--chunk 123] [--save-frequency 0] \
     [--output-frequency 10] [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] \
-    [--parse-special] [--show-statistics] [...]
+    [--parse-special] [--show-statistics] [--span-mask classes.txt | --span-dump tokens.tsv] [...]
 ```
 
 Here `-m | --model` with a model name and `-f | --file` with a file containing calibration data (such as e.g. `wiki.train.raw`) are mandatory.
@@ -31,6 +31,8 @@ The parameters in square brackets are optional and have the following meaning:
 * `--chunks` maximum number of chunks to process. Default is `-1` for all available chunks.
 * `--no-ppl` disables the calculation of perplexity for the processed chunks. Useful if you want to speed up the processing and do not care about perplexity.
 * `--show-statistics` displays imatrix file's statistics.
+* `--span-dump FNAME` writes the tokenized input, one `<index> <token id> <hex bytes of the piece>` line per token after a `#` header, and exits. It loads only the vocabulary and tokenizes exactly as a run does (`--parse-special` included), so a script can rebuild the text from the pieces, find spans in it and write a `--span-mask` file.
+* `--span-mask FNAME` gives every token of the tokenized input a class (one `<token id> <class>` line per token, classes 0-255, `#` lines skipped, `#classes N` declares N classes) and, besides the usual matrix, collects one matrix per class: every collected row also goes to the matrix of its token's class, which is written to `<output>.span<class>.gguf` at the end (keys `imatrix.span.class`, `imatrix.span.mask`, `imatrix.span.tokens`). The classes' matrices add up to the usual one, which is computed exactly as without the mask. The ids must match the input's tokenization. It needs one sequence per batch (`--batch-size` ≤ `--ctx-size`) and each batch in one ubatch (`--ubatch-size` ≥ `--batch-size`); a dense tensor whose rows are not the batch's tokens is left out of the class matrices, with a warning. Use it to count which routed experts given spans of the text pick (`.counts` of the `_exps` tensors).
 
 For faster computation, make sure to use GPU offloading via the `-ngl | --n-gpu-layers` argument.
 
@@ -84,6 +86,14 @@ Recent versions of `llama-imatrix` store data in GGUF format by default. For the
 ```bash
 # analyze imatrix file and display summary statistics instead of running inference
 ./llama-imatrix -m ggml-model-f16.gguf --in-file imatrix.gguf --show-statistics
+```
+
+```bash
+# one matrix per class of tokens (e.g. tool-call spans): dump the tokens, write the classes, collect
+./llama-imatrix -m ggml-model-f16.gguf -f calibration-data.txt --parse-special --span-dump tokens.tsv
+python3 span_mask.py find tokens.tsv --format template --out classes.txt
+./llama-imatrix -m ggml-model-f16.gguf -f calibration-data.txt --parse-special --span-mask classes.txt -o imatrix.gguf -ngl 99
+# -> imatrix.gguf, imatrix.span0.gguf, imatrix.span1.gguf, ...
 ```
 
 ## Statistics

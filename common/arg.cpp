@@ -3386,6 +3386,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--span-mask"}, "FNAME",
+        "a class for every token of the tokenized input ('<token id> <class 0-255>' per line, '#' lines skipped, "
+        "'#classes N' declares N classes): besides the usual imatrix, collect one per class into <output>.span<class>.gguf "
+        "(needs one sequence per batch and --ubatch-size >= --batch-size)",
+        [](common_params & params, const std::string & value) {
+            params.imat_span_mask = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--span-dump"}, "FNAME",
+        "write the tokenized input as '<index> <token id> <hex bytes of its piece>' lines (for building a --span-mask), "
+        "then exit; loads only the vocabulary",
+        [](common_params & params, const std::string & value) {
+            params.imat_span_dump = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"--ids"},
         string_format("only print the token IDs, in a Python-parseable list form like [1, 2, 3] (default: %s)", params.tokenize_ids ? "true" : "false"),
         [](common_params & params) {
