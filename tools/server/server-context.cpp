@@ -5003,7 +5003,9 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        // the random draws this step used stay used: the replay below does not verify, so with them
+                        // handed back the next verification would draw again the uniforms whose outcome it follows
+                        common_sampler_copy_keep_rng(smpl_save.get(), slot.smpl.get());
 
                         return;
                     }
