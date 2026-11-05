@@ -41,3 +41,15 @@ struct ggml_cuda_mmvq_pascal_qkv_args {
     const void * vy;       // Q8_1 activations, ncols padded to MATRIX_ROW_PADDING
 };
 bool ggml_cuda_mmvq_pascal_qkv(const ggml_cuda_mmvq_pascal_qkv_args & args, cudaStream_t stream);
+
+// One token of a contiguous F16 matrix (ncols columns, rows stride_row halves apart) with FP32 activations y, as
+// mul_mat_vec_f computes it with FP32 accumulation, e.g. a MoE router kept in F16. Returns false (nothing launched)
+// unless GGML_CUDA_MMVQ_PASCAL_F16=1 (off by default), the Pascal kernels are active on this device
+// (GGML_CUDA_MMVQ_PASCAL) and F16 is not in GGML_CUDA_MMVQ_PASCAL_SKIP, ncols is a multiple of 8, and x, y and the rows
+// are 16-byte aligned.
+bool ggml_cuda_mmvf_pascal_f16(const void * x, const float * y, float * dst, int64_t ncols, int64_t nrows, int64_t stride_row,
+                               cudaStream_t stream);
+
+// Whether ggml_cuda_mmvf_pascal_f16 would take a matrix x (activations 16-byte aligned), so that the persistent MoE kernel
+// can sum its router rows in the same order as the per-op path.
+bool ggml_cuda_mmvf_pascal_f16_applies(const void * x, int64_t ncols, int64_t stride_row);
