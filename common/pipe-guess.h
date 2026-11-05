@@ -17,8 +17,9 @@
 //       (common_pipe_store, Q161): the copy lookup, else the request's continuations of contexts of 2 tokens or more,
 //       else the store's most frequent continuation of the longest context (2 tokens or more) it holds, if that token
 //       has at least 30 % of the context's occurrences, else the request's continuations of any context. With cont_any
-//       off (the staircase drafter guesses next): the copy lookup, the request's continuations of contexts of 2 tokens
-//       or more, the store if there is one, and nothing from a 1-token context
+//       off (the staircase drafter guesses next; the server picks cont there only with a store or
+//       LLAMA_PIPE_STAIR_CONT=1): the copy lookup, the request's continuations of contexts of 2 tokens or more, the
+//       store if there is one, and nothing from a 1-token context
 struct common_pipe_store;
 
 struct common_pipe_guesser {

@@ -425,7 +425,7 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
 
     // cost options from the environment: the output head's draft ids (LLAMA_DRAFT_VOCAB=K keeps the K most frequent,
     // the vocabulary's first K, and the other class) and type (LLAMA_DRAFT_HEAD=q8_0 or f16, converted at load), the
-    // last block for the output row only (LLAMA_DRAFT_PRUNE, on unless 0), one product for all depth projections
+    // last block for the output row only (LLAMA_DRAFT_PRUNE=1), one product for all depth projections
     // (LLAMA_DRAFT_ANC=dense), the step graph's products in groups of rows (LLAMA_DRAFT_SPLIT=4: the Pascal
     // multi-token kernels take up to 4)
     auto env_str = [](const char * name) {
@@ -437,7 +437,7 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
         const int32_t k = v.empty() ? 0 : atoi(v.c_str());
         n_short = k > 0 && k < n_vocab_draft ? k : n_vocab_draft;
     }
-    prune_last = env_str("LLAMA_DRAFT_PRUNE") != "0";
+    prune_last = atoi(env_str("LLAMA_DRAFT_PRUNE").c_str()) != 0;
     anc_dense  = env_str("LLAMA_DRAFT_ANC") == "dense";
     split_cols = std::max(0, atoi(env_str("LLAMA_DRAFT_SPLIT").c_str()));
     ggml_tensor * th = ggml_get_tensor(ctx_w, "sd.head.weight");
@@ -487,8 +487,13 @@ bool llama_pipe_drafter::init(const llama_pipe_draft_params & params, ggml_tenso
             return false;
         }
         // the file is read and uploaded in pieces of at most CHUNK bytes, so that loading takes a few MB of host memory
-        // (the rig's host has 4 GB, most of it taken by the target's load)
-        constexpr size_t CHUNK = 8u << 20;
+        // (the rig's host has 4 GB, most of it taken by the target's load). LLAMA_DRAFT_LOAD_CHUNK=<MiB> sets the piece
+        // (default 8); 0 reads each tensor, and converts the head, at once. The weights are the same bytes either way
+        const size_t CHUNK = [&] {
+            const std::string v = env_str("LLAMA_DRAFT_LOAD_CHUNK");
+            const int mib = v.empty() ? 8 : std::max(0, atoi(v.c_str()));
+            return mib > 0 ? (size_t) mib << 20 : SIZE_MAX;
+        }();
         const size_t data_off = gguf_get_data_offset(g);
         std::vector<uint8_t> tmp, out;
         std::vector<float> rows;

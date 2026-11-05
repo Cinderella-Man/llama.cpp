@@ -116,8 +116,8 @@ private:
     // the output head as run: its first n_short draft ids (the most frequent) and the other class, n_short + 1 rows
     int32_t n_short = 0;
     // cost options (LLAMA_DRAFT_* environment): the last block for the output row only, and all depth projections as
-    // one matrix product instead of one per row; both exact
-    bool    prune_last = true;
+    // one matrix product instead of one per row; both exact, both off by default
+    bool    prune_last = false;
     bool    anc_dense  = false;
     // the step graph's matrix products in groups of split_cols rows (0: all rows at once), for kernels that take few
     int32_t split_cols = 0;
