@@ -2752,6 +2752,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    // route once's histogram counts the routed experts before the tail's cut (GGML_OP_MOE_TAIL's ids hold -1)
+    ggml_tensor * selected_routed = selected_experts;
+
     // after the scale, so that the fused top-k kernel still produces the weights the tail is cut from; a tiered layer
     // takes the graph-level cut (its tier lookup reads a row of ffn_exps_tier per id, so no id may be -1)
     if (cparams.moe_tail && n_expert_used > 1) {
@@ -2768,7 +2771,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (route_once_hist) {
         // the experts read per token and those independent routing picks, as outputs for the distinct-experts count
         // (after the weights, so that a dry run keeps the fused top-k kernel)
-        ggml_tensor * read = ggml_cont(ctx0, selected_experts);
+        ggml_tensor * read = ggml_cont(ctx0, selected_routed);
         cb(read, "ffn_moe_route_read", il);
         ggml_set_output(read);
         ggml_build_forward_expand(gf, read);
