@@ -11868,6 +11868,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
 
+    // one token, rows not a multiple of the rows per block: the used experts' outputs lie next to each other,
+    // so a block's rows past m are the next expert's first rows
+    // (CUDA MMVQ: 4 rows per block with a small k, 2 for Q2_K)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 10, false, 129, 1, 640));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 32, 10, false, 129, 1, 4096));
+
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0
     // repeated expert ids within a row
