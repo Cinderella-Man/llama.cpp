@@ -49,6 +49,10 @@ void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
+// as common_sampler_copy, but dst keeps its random state: rng and the draws of the chain's dist and xtc samplers
+// a speculative step rolled back this way does not hand its random draws to the next step
+void common_sampler_copy_keep_rng(const struct common_sampler * src, struct common_sampler * dst);
+
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 
