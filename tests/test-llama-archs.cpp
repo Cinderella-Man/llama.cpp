@@ -972,8 +972,8 @@ static std::vector<float> get_logits_steps(
 }
 
 // LLAMA_ARCHS_LOGITS=<prefix>: write an architecture's CPU logits (one batch, then the steps of get_logits_steps) to
-// <prefix><arch>.f32, or compare with that file when it exists, so two builds or two settings (LLAMA_GDN_FUSE=0 and 1)
-// can be compared; false when they differ by more than float rounding
+// <prefix><name>.f32 (name: logits_dump_name), or compare with that file when it exists, so two builds or two settings
+// (LLAMA_GDN_FUSE=0 and 1) can be compared; false when they differ by more than float rounding
 static bool logits_dump_or_compare(const char * arch_name, const std::vector<float> & logits) {
     const char * prefix = getenv("LLAMA_ARCHS_LOGITS");
     if (prefix == nullptr) {
@@ -1145,6 +1145,13 @@ static bool moe_implemented(const llm_arch arch) {
         default:
             return false;
     }
+}
+
+// the LLAMA_ARCHS_LOGITS file name of an architecture's model: an architecture with a Dense and a MoE model runs two
+// different models, so the MoE one gets "-moe" (sharing one file, it compared against the Dense one's logits and
+// failed); an architecture with one model keeps its name, so files written by earlier builds still compare
+static std::string logits_dump_name(const llm_arch arch, const bool moe) {
+    return std::string(llama_arch_name(arch)) + (moe && !moe_mandatory(arch) ? "-moe" : "");
 }
 
 static bool arch_supported(const llm_arch arch) {
@@ -1436,7 +1443,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             logits_all.insert(logits_all.end(), logits_steps.begin(), logits_steps.end());
                             LOG("%s: one batch against steps of 1-8 tokens: nmse %.3e\n",
                                 llama_arch_name(arch), nmse(logits_cpu, logits_steps));
-                            if (!logits_dump_or_compare(llama_arch_name(arch), logits_all)) {
+                            if (!logits_dump_or_compare(logits_dump_name(arch, moe).c_str(), logits_all)) {
                                 test_ok = false;
                             }
                         }
