@@ -13742,6 +13742,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 10, 8, true, 1024, n, 3072));
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 10, 8, true));
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 8, 8, true));
+            // skipped slots (id -1, LLAMA_MOE_TAIL)
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 10, 8, false, 3072, n, 1024, 0, false, true));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 1024, 3072, true, 10, 8, true,
+                                                                false, true, false, { 4, 2 }, true));
             if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 3072, n, 8192, { 1, 1 }, { 1, 1 }));
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8192, n, 3072, { 1, 1 }, { 1, 1 }));

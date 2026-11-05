@@ -68,13 +68,14 @@
 //     loads instead of one strided load per lane and token. Off by default until it is measured on a P106.
 //
 // For the types of Ornith-1.5's files (mmvqp_mt_type: IQ2_S, IQ3_XXS, N2P, N3P, Q8_0, Q5_0), 2 to MMVQP_MAX_COLS tokens
-// run mul_mat_vec_q_pascal_mt instead, which decodes each weight once for all tokens (GGML_CUDA_MMVQ_PASCAL_MT=0: the
-// kernel above). It keeps the lane groups, launch shapes and weight staging of the single-token kernel and changes three
-// things:
+// can run mul_mat_vec_q_pascal_mt instead, which decodes each weight once for all tokens (GGML_CUDA_MMVQ_PASCAL_MT=1; off
+// by default: the kernel above, and before both -mtok's expert kernels and -kcol's plain products take what they take).
+// It keeps the lane groups, launch shapes and weight staging of the single-token kernel and changes three things:
 //   - MUL_MAT_ID: block y serves group y of the step's (token, slot) entries, the entries that picked one expert (up to
 //     MMVQP_MAX_COLS of them in entry order; a further entry starts a new group). Each warp finds the groups in ids
 //     itself with shuffles and ballots over at most MMVQP_MT_MAX_ENTRIES entries, one load of ids per lane, and blocks
-//     past the last group exit at once; the kernel above scanned ids entry by entry in every block.
+//     past the last group exit at once; the kernel above scanned ids entry by entry in every block. A skipped slot (id
+//     -1, moe-tail.cuh) is in no group: block 0 writes its zeros, and no expert's rows are read for it.
 //   - The block stages its tokens' activations in shared memory once (per tile of iterations where a row's do not fit
 //     the budget, GGML_CUDA_MMVQ_PASCAL_MT_ACT_KB): the int8 values in 32-byte runs with 16 bytes of padding per lane
 //     chunk, so that the lanes of a quarter warp hit different banks, and the FP32 scales (and Q5_0's offset terms)
@@ -869,11 +870,33 @@ static __global__ void mul_mat_vec_q_pascal_mt(const mmvqp_args_mt p, const ggml
                 before[1] += (v0 == e[1]) + (j < lane && v1 == e[1]);
             }
         }
-        // every NC-th entry of an expert starts a group; groups are numbered in entry order
-        const uint32_t lead0 = __ballot_sync(0xFFFFFFFF, lane < ne && before[0] % NC == 0);
-        const uint32_t lead1 = __ballot_sync(0xFFFFFFFF, lane + WARP_SIZE < ne && before[1] % NC == 0);
+        // every NC-th entry of an expert starts a group; groups are numbered in entry order. A skipped slot (id -1,
+        // moe-tail.cuh) starts none and is in none
+        const uint32_t lead0 = __ballot_sync(0xFFFFFFFF, lane < ne && e[0] >= 0 && before[0] % NC == 0);
+        const uint32_t lead1 = __ballot_sync(0xFFFFFFFF, lane + WARP_SIZE < ne && e[1] >= 0 && before[1] % NC == 0);
         const int      n0    = __popc(lead0);
         const int      g     = blockIdx.y;
+        if (g == 0) {
+            // the skipped slots' zeros over the block's rows, as mul_mat_vec_q_pascal_mc writes them
+            const int rpb = NW * (WARP_SIZE >> lpr_log2) * R;
+            const int r0  = blockIdx.x * p.rb * rpb;
+            const int r1  = min(p.nrows, r0 + p.rb * rpb);
+            const int tid = threadIdx.y * WARP_SIZE + lane;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                uint32_t ms = __ballot_sync(0xFFFFFFFF, lane + WARP_SIZE*h < ne && e[h] < 0);
+                while (ms != 0) {
+                    const int i = WARP_SIZE*h + __ffs(ms) - 1;
+                    ms &= ms - 1;
+                    const int t = i / p.nslots;
+                    const int k = i - t*p.nslots;
+                    float * d = p.dst + sample_dst*p.stride_sample_dst + k*p.stride_channel_dst + t*p.stride_col_dst;
+                    for (int r = r0 + tid; r < r1; r += NW * WARP_SIZE) {
+                        d[r] = 0.0f;
+                    }
+                }
+            }
+        }
         if (g >= n0 + __popc(lead1)) {
             return;
         }
@@ -1216,12 +1239,12 @@ static __device__ __forceinline__ void mmvqp_mt_rows(const mmvqp_args_mt & p, co
     }
 }
 
-// GGML_CUDA_MMVQ_PASCAL_MT=0: 2 to MMVQP_MAX_COLS tokens of the mmvqp_mt_type types go to mul_mat_vec_q_pascal_mc, as
-// before mul_mat_vec_q_pascal_mt
+// GGML_CUDA_MMVQ_PASCAL_MT=1: 2 to MMVQP_MAX_COLS tokens of the mmvqp_mt_type types that reach this file go to
+// mul_mat_vec_q_pascal_mt; off by default (mul_mat_vec_q_pascal_mc, as on pascal-p106-v3-b12076-ladder4)
 static bool mmvqp_mt_enabled() {
     static const bool mt = [] {
         const char * env = getenv("GGML_CUDA_MMVQ_PASCAL_MT");
-        return env == nullptr || atoi(env) != 0;
+        return env != nullptr && atoi(env) != 0;
     }();
     return mt;
 }
