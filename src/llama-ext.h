@@ -219,6 +219,22 @@ LLAMA_API uint64_t llama_moe_tail_counts(const struct llama_context * ctx, uint6
 // repeat=<0|1> set it. Call it before llama_set_moe_tail.
 LLAMA_API void     llama_set_moe_tail_mode(struct llama_context * ctx, bool graph, int32_t skip, bool repeat);
 
+// Route once per verify block (Q860): the tokens of a micro-batch form blocks of up to k consecutive positions of one
+// sequence; a block's first token picks its routed experts as usual and every later token picks its own top-k only
+// among those (its own router scores masked to that set, then the usual weight normalization), so a pass over the
+// block reads one token's experts per layer. Lossy. k = 0: off; k = 1: the masked path with every token its own
+// block's first (the same experts). max > 0: only micro-batches of at most max tokens (verify batches, not prompts).
+// hist counts the distinct experts per full block and MoE layer, as read and under independent routing (a synchronous
+// read per decode), logged every 65,536 tokens and when the context is freed; dry keeps the routing as it is and only
+// counts. LLAMA_MOE_ROUTE_ONCE=<k>[,max=<n>][,hist=<0|1>][,dry=<0|1>] turns it on for every context.
+// llama_moe_route_once_counts fills read[d] / indep[d] (d < n_counts) with the full blocks' (block, layer) pairs that
+// read d distinct experts / would read them under independent routing, sets *n_outside to the later tokens'
+// (token, layer) pairs that read an expert outside their block's first token's set, and returns the pairs counted.
+LLAMA_API void     llama_set_moe_route_once   (struct llama_context * ctx, uint32_t k, uint32_t max, bool hist,
+        bool dry);
+LLAMA_API uint64_t llama_moe_route_once_counts(const struct llama_context * ctx, uint64_t * read, uint64_t * indep,
+        int32_t n_counts, uint64_t * n_outside);
+
 //
 // model/context data extraction
 //

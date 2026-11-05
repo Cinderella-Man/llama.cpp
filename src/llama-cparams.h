@@ -88,6 +88,19 @@ struct llama_cparams {
     uint32_t moe_tail_skip   = 8;
     bool     moe_tail_repeat = false;
 
+    // route once per block (Q860, llama_set_moe_route_once, LLAMA_MOE_ROUTE_ONCE): the tokens of a micro-batch form
+    // blocks of up to moe_route_once consecutive positions of one sequence; a block's first token picks its routed
+    // experts as usual, every later token picks its own top-k only among those (its own router scores, then the usual
+    // weight normalization), so a pass over the block reads the first token's experts only. 0: off; 1: the masked
+    // path at blocks of one token (every token is its own first: the same experts, for checks and its cost).
+    // moe_route_once_max > 0 limits it to micro-batches of at most that many tokens (a server's verify batches, not its
+    // prompts); moe_route_once_hist makes the graph output each MoE layer's experts for the distinct-experts
+    // histogram; moe_route_once_dry keeps the routing as it is and only counts (the histogram of independent routing)
+    uint32_t moe_route_once      = 0;
+    uint32_t moe_route_once_max  = 0;
+    bool     moe_route_once_hist = false;
+    bool     moe_route_once_dry  = false;
+
     // the main model's head over the shortlist head_short with an exact bound on the other logits (Q619,
     // llama_head_bound_*): while head_bound_on, a decode with one output computes the shortlist's logits and keeps
     // the head's input row for the bound and the full-head fallback

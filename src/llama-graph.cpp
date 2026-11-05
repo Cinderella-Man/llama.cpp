@@ -542,6 +542,73 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llama_route_once_leaders(const llama_ubatch & ubatch, uint32_t k, uint32_t n_outputs,
+        std::vector<int32_t> & lead_all, std::vector<int32_t> & lead_out) {
+    const uint32_t n = ubatch.n_tokens;
+    lead_all.resize(n);
+
+    uint32_t first = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        bool start = i == 0 || k <= 1 || i - first >= k;
+        if (!start && ubatch.pos && ubatch.pos[i] != ubatch.pos[i - 1] + 1) {
+            start = true;
+        }
+        if (!start && ubatch.seq_id && ubatch.seq_id[i] && ubatch.seq_id[i - 1] &&
+                ubatch.seq_id[i][0] != ubatch.seq_id[i - 1][0]) {
+            start = true;
+        }
+        if (start) {
+            first = i;
+        }
+        lead_all[i] = (int32_t) first;
+    }
+
+    // the cropped layer's rows are the outputs in order (llm_graph_input_out_ids)
+    lead_out.clear();
+    if (n_outputs == n || ubatch.output == nullptr) {
+        lead_out = lead_all;
+        lead_out.resize(n_outputs);
+        for (uint32_t j = n; j < n_outputs; ++j) {
+            lead_out[j] = (int32_t) j;
+        }
+        return;
+    }
+    int32_t block = -1;
+    int32_t row   = 0;
+    for (uint32_t i = 0; i < n && lead_out.size() < n_outputs; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        const int32_t j = (int32_t) lead_out.size();
+        if (lead_all[i] != block) {
+            block = lead_all[i];
+            row   = j;
+        }
+        lead_out.push_back(row);
+    }
+    while (lead_out.size() < n_outputs) {
+        lead_out.push_back((int32_t) lead_out.size());
+    }
+}
+
+void llm_graph_input_route_once::set_input(const llama_ubatch * ubatch) {
+    llama_route_once_leaders(*ubatch, k, n_outputs, buf_all, buf_out);
+
+    // a leaders tensor no node reads has no buffer
+    if (lead_all && lead_all->buffer && ggml_nbytes(lead_all) > 0) {
+        GGML_ASSERT(ggml_nelements(lead_all) == (int64_t) buf_all.size());
+        ggml_backend_tensor_set(lead_all, buf_all.data(), 0, ggml_nbytes(lead_all));
+    }
+    if (lead_out && lead_out->buffer && ggml_nbytes(lead_out) > 0) {
+        GGML_ASSERT(ggml_nelements(lead_out) == (int64_t) buf_out.size());
+        ggml_backend_tensor_set(lead_out, buf_out.data(), 0, ggml_nbytes(lead_out));
+    }
+}
+
+bool llm_graph_input_route_once::can_reuse(const llm_graph_params & params) {
+    return params.ubatch.n_tokens == n_tokens && params.n_outputs == n_outputs && params.cparams.moe_route_once == k;
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -1625,6 +1692,8 @@ void llm_graph_result::reset() {
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
     t_moe_kept.clear();
+    t_moe_route_read.clear();
+    t_moe_route_free.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -2610,9 +2679,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    // route once per block (Q860, cparams.moe_route_once): a block's later tokens pick their top-k among the experts
+    // of its first token only; a layer of one token has nothing to share, and a micro-batch of more than
+    // cparams.moe_route_once_max tokens (when set) routes as usual. Not with expert groups (their mask comes first) or
+    // GroveMoE's index rescaling, nor with experts chosen by the caller
+    ggml_tensor * selected_route  = nullptr; // the experts route once picks
+    bool          route_once_hist = false;
+    if (cparams.moe_route_once > 0 && selected_experts_in == nullptr && n_tokens > 1 && n_expert_used > 0 &&
+            (cparams.moe_route_once_max == 0 || this->n_tokens <= (int64_t) cparams.moe_route_once_max) &&
+            hparams.n_expert_groups <= 1 && arch != LLM_ARCH_GROVEMOE) {
+        if (cparams.moe_route_once_dry) {
+            // only counted: the context finds the blocks from the micro-batch, the graph needs no leaders
+            route_once_hist = cparams.moe_route_once_hist && (n_tokens == this->n_tokens || n_tokens == n_outputs);
+        } else if (ggml_tensor * lead = build_inp_route_once(n_tokens)) {
+            route_once_hist = cparams.moe_route_once_hist;
+            selected_route  = build_moe_route_once(selection_probs, lead, n_expert_used, il);
+        }
+    }
+
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
-    if (selected_experts == nullptr) {
+    if (selected_experts == nullptr && selected_route != nullptr) {
+        selected_experts = selected_route;
+    } else if (selected_experts == nullptr) {
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
@@ -2675,6 +2764,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (route_once_hist) {
+        // the experts read per token and those independent routing picks, as outputs for the distinct-experts count
+        // (after the weights, so that a dry run keeps the fused top-k kernel)
+        ggml_tensor * read = ggml_cont(ctx0, selected_experts);
+        cb(read, "ffn_moe_route_read", il);
+        ggml_set_output(read);
+        ggml_build_forward_expand(gf, read);
+
+        ggml_tensor * free_ids = read;
+        if (selected_route != nullptr) {
+            free_ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, selection_probs, n_expert_used));
+            cb(free_ids, "ffn_moe_route_free", il);
+            ggml_set_output(free_ids);
+            ggml_build_forward_expand(gf, free_ids);
+        }
+        res->t_moe_route_read.push_back(read);
+        res->t_moe_route_free.push_back(free_ids);
+    }
 
     // the experts of host-resident layers may be read from the MoE cache
     // (a cold tier's ids are slots of its own tensors, which the cache does not hold)
@@ -3042,6 +3150,67 @@ void llm_graph_context::build_moe_tail_op(
 
     weights          = w;
     selected_experts = ids;
+}
+
+ggml_tensor * llm_graph_context::build_inp_route_once(int64_t n_tokens_layer) const {
+    if (inp_route_once == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_route_once>(cparams.moe_route_once, (uint32_t) n_tokens,
+                (uint32_t) n_outputs);
+        inp_route_once = inp.get();
+        res->add_input(std::move(inp));
+    }
+
+    llm_graph_input_route_once * inp = inp_route_once;
+    if (n_tokens_layer == n_tokens) {
+        if (inp->lead_all == nullptr) {
+            inp->lead_all = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(inp->lead_all);
+            ggml_set_name(inp->lead_all, "route_once_lead");
+        }
+        return inp->lead_all;
+    }
+    if (n_tokens_layer == n_outputs) {
+        if (inp->lead_out == nullptr) {
+            inp->lead_out = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+            ggml_set_input(inp->lead_out);
+            ggml_set_name(inp->lead_out, "route_once_lead_out");
+        }
+        return inp->lead_out;
+    }
+    return nullptr;
+}
+
+ggml_tensor * llm_graph_context::build_moe_route_once(
+         ggml_tensor * selection_probs,
+         ggml_tensor * lead,
+             int64_t   n_expert_used,
+                 int   il) const {
+    if (!ggml_is_contiguous(selection_probs)) {
+        selection_probs = ggml_cont(ctx0, selection_probs);
+    }
+    const int64_t n_exp = selection_probs->ne[0];
+    const int64_t n_tok = selection_probs->ne[1];
+
+    // every token's column of its leader's scores, and their top-k: the experts its block reads (for the leader
+    // itself the sort of its own scores, as the router's)
+    ggml_tensor * lead_probs = ggml_get_rows(ctx0, selection_probs, lead); // [n_expert, n_tokens]
+    cb(lead_probs, "ffn_moe_route_lead_probs", il);
+
+    ggml_tensor * lead_top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, lead_probs, n_expert_used)); // [n_used, n_tok]
+    cb(lead_top, "ffn_moe_route_lead_topk", il);
+
+    // the token's own scores at those experts and their order: its own order of the block's experts (its weights
+    // come from its own probabilities). A leader's row is already sorted, and a sort of n_expert_used values leaves it
+    // as it is, so a block of one token reads exactly the router's top-k in the router's order
+    ggml_tensor * own = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, selection_probs, 1, n_exp, n_tok), lead_top);
+    own = ggml_reshape_2d(ctx0, own, n_expert_used, n_tok); // [n_expert_used, n_tokens]
+    cb(own, "ffn_moe_route_own", il);
+
+    ggml_tensor * order = ggml_argsort(ctx0, own, GGML_SORT_ORDER_DESC); // [n_expert_used, n_tokens]
+    cb(order, "ffn_moe_route_order", il);
+
+    ggml_tensor * selected = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lead_top, 1, n_expert_used, n_tok), order);
+    return ggml_reshape_2d(ctx0, selected, n_expert_used, n_tok); // I32 [n_expert_used, n_tokens]
 }
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(
