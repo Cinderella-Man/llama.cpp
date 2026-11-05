@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-embd-cache.h"
 #include "llama-head-shortlist.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -635,19 +636,39 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    // the draft's h from its carry on this layer's card (llama_set_nextn_carry, Q961): each token reads its sequence's
+    // row, which the previous pass wrote, instead of an input the host uploads
+    const bool carry_in  = cparams.nextn_carry && cparams.nextn_carry_in;
+    const bool carry_out = cparams.nextn_carry && cparams.nextn_carry_out;
+    ggml_tensor * h = nullptr;
+    if (carry_in) {
+        inp->carry_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->carry_in);
+        h = ggml_get_rows(ctx0, cparams.nextn_carry, inp->carry_in);
+    } else {
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+        h = inp->h;
+    }
+    if (carry_out) {
+        inp->carry_out = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+        ggml_set_input(inp->carry_out);
+    }
+    ggml_tensor * carry_out_idx = inp->carry_out;
 
     ggml_tensor * tok_embd;
-    if (ubatch.token) {
+    if (ubatch.token && cparams.embd_cache_on && cparams.embd_cache) {
+        // the rows from the row cache on this layer's card, the same bytes as the table's (llama_embd_cache, Q961):
+        // inp->tokens holds the batch's slots
+        inp->row_cache = cparams.embd_cache;
+        tok_embd = ggml_get_rows(ctx0, cparams.embd_cache->rows, inp->tokens);
+    } else if (ubatch.token) {
         tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
     cb(tok_embd, "mtp_tok_embd", il);
-
-    ggml_tensor * h = inp->h;
 
     res->add_input(std::move(inp));
 
@@ -693,6 +714,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
     cb(res->t_h_nextn, "h_nextn", il);
     ggml_build_forward_expand(gf, res->t_h_nextn);
+
+    if (carry_out) {
+        // each output's row stays on this card for the next draft pass, in its sequence's row of the carry
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, cparams.nextn_carry, flat_out, carry_out_idx));
+    }
 
     hc_mix head_mix = build_hc_mix(ggml_reshape_3d(ctx0, flat_out, n_embd, hc, flat_out->ne[1]),
             layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,

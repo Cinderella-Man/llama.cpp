@@ -5,6 +5,7 @@
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-embd-cache.h"
 #include "llama-sampler.h"
 
 #include "llama-kv-cache.h"
@@ -367,7 +368,11 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
-    if (ubatch->token) {
+    if (ubatch->token && row_cache) {
+        // the slots the context prepared for this micro-batch (llama_embd_cache::prepare)
+        GGML_ASSERT(row_cache->slots.size() == (size_t) n_tokens);
+        ggml_backend_tensor_set(tokens, row_cache->slots.data(), 0, n_tokens*ggml_element_size(tokens));
+    } else if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
@@ -375,6 +380,31 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+    }
+
+    // the sequences of the tokens and of the outputs, whose rows of the draft's carry the graph reads and writes
+    if (carry_in || carry_out) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(carry_in ? carry_in->buffer : carry_out->buffer));
+        int32_t * d_in  = carry_in  ? (int32_t *) carry_in->data  : nullptr;
+        int32_t * d_out = carry_out ? (int32_t *) carry_out->data : nullptr;
+        int64_t n_out = 0;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            const int32_t s = ubatch->seq_id[i][0];
+            if (d_in) {
+                d_in[i] = s;
+            }
+            if (d_out && (!ubatch->output || ubatch->output[i])) {
+                GGML_ASSERT(n_out < carry_out->ne[0]);
+                d_out[n_out++] = s;
+            }
+        }
+        GGML_ASSERT(!d_out || n_out == carry_out->ne[0]);
+    }
+
+    if (h == nullptr) {
+        // the draft's h comes from its carry on the device
+        GGML_ASSERT(carry_in);
+        return;
     }
 
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
@@ -388,7 +418,9 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd_state) || (h && h->ne[1] == params.ubatch.n_tokens) ||
+                                          (!h && carry_in && carry_in->ne[0] == params.ubatch.n_tokens);
+    res &= (!carry_out) || carry_out->ne[0] == params.n_outputs;
 
     return res;
 }

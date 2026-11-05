@@ -2010,6 +2010,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_token>                   short_add; // scratch: the tokens of a batch to add to the list
     uint64_t                                   short_n_rounds = 0;
 
+    // the draft's token embedding rows on its layer's card (LLAMA_DRAFT_EMBD_CACHE, Q961)
+    bool     embd_cache_on       = false;
+    uint64_t embd_cache_n_rounds = 0;
+
+    // the draft's hidden rows kept on its layer's card between a step's passes (LLAMA_DRAFT_H_CARRY, Q961)
+    bool h_carry_on = false;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -2086,6 +2093,61 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         short_init();
+        embd_cache_init();
+        h_carry_init();
+    }
+
+    // LLAMA_DRAFT_H_CARRY=1: each drafting pass after a step's first reads its h from the previous pass's output on the
+    // draft layer's card, and no drafting pass copies its h to the host (40 KB a row for Flash-Next's 4 x 2,560 values)
+    void h_carry_init() {
+        const char * s = getenv("LLAMA_DRAFT_H_CARRY");
+        if (s == nullptr || atoi(s) == 0) {
+            return;
+        }
+        if (chain_heads || is_mem_shared) {
+            SPC_WRN("%s", "LLAMA_DRAFT_H_CARRY: not for drafts with chained heads or the target's memory: off\n");
+            return;
+        }
+        if (!llama_nextn_carry_init(this->params.ctx_dft)) {
+            SPC_WRN("%s", "no hidden-row carry for this draft: its passes copy their rows through the host\n");
+            return;
+        }
+        h_carry_on = true;
+        SPC_INF("%s", "draft hidden rows: a step's drafting passes keep them on the device\n");
+    }
+
+    // LLAMA_DRAFT_EMBD_CACHE=<rows>[,<max tokens>]: batches of up to max tokens (default 16: the draft passes and the
+    // catch-up over a verify step's tokens) read their token rows from a cache on the draft layer's card, so that a
+    // pass with the table on another card (-otd token_embd=CUDA4) does not cross to it; prompts read the table
+    void embd_cache_init() {
+        const char * s = getenv("LLAMA_DRAFT_EMBD_CACHE");
+        if (s == nullptr || *s == '\0') {
+            return;
+        }
+        char * end = nullptr;
+        const long n_rows = strtol(s, &end, 10);
+        long max_tokens = 16;
+        if (end != nullptr && *end == ',') {
+            max_tokens = strtol(end + 1, &end, 10);
+        }
+        if (end == s || (end != nullptr && *end != '\0') || n_rows <= 0 || max_tokens <= 0) {
+            SPC_WRN("LLAMA_DRAFT_EMBD_CACHE='%s' is not <rows>[,<max tokens>]: the draft reads its table\n", s);
+            return;
+        }
+        if (!llama_embd_cache_init(this->params.ctx_dft, (uint32_t) n_rows, (uint32_t) std::min<long>(max_tokens, n_rows))) {
+            SPC_WRN("%s", "no embedding row cache for this draft: it reads its table\n");
+            return;
+        }
+        embd_cache_on = true;
+    }
+
+    void embd_cache_report() const {
+        uint64_t n_hit = 0;
+        uint64_t n_miss = 0;
+        uint64_t n_plain = 0;
+        llama_embd_cache_stats(this->params.ctx_dft, &n_hit, &n_miss, &n_plain);
+        SPC_INF("draft embedding row cache: %" PRIu64 " token rows read from it, %" PRIu64 " of them copied from the table "
+                "first; %" PRIu64 " batches read the table\n", n_hit + n_miss, n_miss, n_plain);
     }
 
     void short_init() {
@@ -2160,6 +2222,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     ~common_speculative_impl_draft_mtp() override {
         if (short_on) {
             short_report();
+        }
+        if (embd_cache_on) {
+            embd_cache_report();
         }
 
         auto * ctx_dft = this->params.ctx_dft;
@@ -2366,6 +2431,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        if (embd_cache_on && n_drafting > 0 && ++embd_cache_n_rounds % 1000 == 0) {
+            embd_cache_report();
+        }
+
         // the shortlisted head, unless a drafting sequence falls back: its target token (id_last) was outside the list
         if (short_on && n_drafting > 0) {
             bool use_short = true;
@@ -2403,6 +2472,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            // the first pass reads the target's row from the host, the later ones the previous pass's on the device
+            if (h_carry_on) {
+                llama_set_nextn_carry(ctx_dft, i > 0, true);
+            }
+
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
@@ -2422,7 +2496,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                // with the carry the row stayed on the device: the batch's state embedding is set but not read
+                const float * h_row = h_carry_on ? pending_h[seq_id].data() : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2499,6 +2574,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (short_on) {
             llama_set_head_shortlist(ctx_dft, false); // the catch-up decodes produce no logits
+        }
+
+        if (h_carry_on) {
+            llama_set_nextn_carry(ctx_dft, false, false); // the catch-up decodes read the target's rows
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

@@ -7,7 +7,9 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct ggml_tensor;
 struct llama_head_shortlist;
+struct llama_embd_cache;
 
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
@@ -70,6 +72,19 @@ struct llama_cparams {
     const llama_head_shortlist * head_short    = nullptr;
     bool                         head_short_on = false;
     uint32_t                     head_short_n  = 0;
+
+    // a draft's token embedding rows on its layer's card (llama_embd_cache_init, Q961); embd_cache_on is set per micro-
+    // batch, when the batch's tokens read their rows from it, so that the two kinds of batch keep separate graphs
+    const llama_embd_cache * embd_cache    = nullptr;
+    bool                     embd_cache_on = false;
+
+    // a draft's hidden rows kept on its layer's card between passes (llama_nextn_carry_init, Q961): nextn_carry holds
+    // one row per sequence (F32 [n_embd_out, n_seq_max]); with nextn_carry_in a decode reads each token's h from its
+    // sequence's row instead of the batch's state embedding, with nextn_carry_out it writes each output's row there and
+    // the host gets no copy of the rows
+    ggml_tensor * nextn_carry     = nullptr;
+    bool          nextn_carry_in  = false;
+    bool          nextn_carry_out = false;
 
     // fewer routed experts on confident tokens (Q618, llama_set_moe_tail, LLAMA_MOE_TAIL): after the router's top-k a
     // slot's weight becomes 0 when the shares of the slots ranked above it already sum to moe_tail_p, or when its own

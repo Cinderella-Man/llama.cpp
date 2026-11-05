@@ -1955,6 +1955,146 @@ void llama_context::set_head_shortlist(bool value) {
     cparams.head_short_on = value && head_short != nullptr;
 }
 
+bool llama_context::mtp_layer_device(ggml_backend_dev_t & dev, ggml_backend_t & backend) const {
+    // the card that runs the draft's layer: where its first weight is
+    const ggml_tensor * w = nullptr;
+    for (const auto & layer : model.layers) {
+        if (layer.nextn.eh_proj != nullptr && layer.nextn.eh_proj->buffer != nullptr) {
+            w = layer.nextn.eh_proj;
+            break;
+        }
+    }
+    if (w == nullptr) {
+        LLAMA_LOG_ERROR("%s: the model has no MTP layer in a buffer\n", __func__);
+        return false;
+    }
+    dev = ggml_backend_buffer_is_host(w->buffer) ?
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) :
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
+    backend = nullptr;
+    for (const auto & b : backends) {
+        if (dev != nullptr && ggml_backend_get_device(b.get()) == dev) {
+            backend = b.get();
+            break;
+        }
+    }
+    if (backend == nullptr) {
+        LLAMA_LOG_ERROR("%s: no backend of this context runs the MTP layer's device\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+bool llama_context::nextn_carry_init() {
+    if (model.arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_ERROR("%s: only the qwen4exp MTP draft keeps its hidden rows on the device\n", __func__);
+        return false;
+    }
+    ggml_backend_dev_t dev     = nullptr;
+    ggml_backend_t     backend = nullptr;
+    if (!mtp_layer_device(dev, backend)) {
+        return false;
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    nextn_carry_ctx.reset(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_2d(nextn_carry_ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), cparams.n_seq_max);
+    ggml_set_name(t, "nextn_carry");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    nextn_carry_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(nextn_carry_ctx.get(), buft));
+    if (!nextn_carry_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the hidden rows' carry in %s\n", __func__, ggml_backend_buft_name(buft));
+        nextn_carry_ctx.reset();
+        return false;
+    }
+    // placed like weights: the ops that read and write it run where it is
+    ggml_backend_buffer_set_usage(nextn_carry_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_clear(nextn_carry_buf.get(), 0);
+
+    cparams.nextn_carry     = t;
+    cparams.nextn_carry_in  = false;
+    cparams.nextn_carry_out = false;
+
+    LLAMA_LOG_INFO("%s: draft hidden rows kept on the device: %u rows of %u F32 (%.2f MiB) in %s\n", __func__,
+            cparams.n_seq_max, model.hparams.n_embd_out(),
+            ggml_backend_buffer_get_size(nextn_carry_buf.get()) / 1024.0 / 1024.0, ggml_backend_buft_name(buft));
+
+    return true;
+}
+
+void llama_context::set_nextn_carry(bool in, bool out) {
+    // a change rebuilds the graph (llm_graph_params::allow_reuse)
+    cparams.nextn_carry_in  = in  && cparams.nextn_carry != nullptr;
+    cparams.nextn_carry_out = out && cparams.nextn_carry != nullptr;
+}
+
+bool llama_context::embd_cache_init(uint32_t n_rows, uint32_t max_tokens) {
+    if (model.arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_ERROR("%s: only the qwen4exp MTP draft reads its token rows from a row cache\n", __func__);
+        return false;
+    }
+    const ggml_tensor * tok_embd = model.tok_embd;
+    if (tok_embd == nullptr || tok_embd->buffer == nullptr) {
+        LLAMA_LOG_ERROR("%s: the model has no token embeddings in a buffer\n", __func__);
+        return false;
+    }
+
+    ggml_backend_dev_t dev     = nullptr;
+    ggml_backend_t     backend = nullptr;
+    if (!mtp_layer_device(dev, backend)) {
+        return false;
+    }
+
+    auto ec = std::make_unique<llama_embd_cache>();
+    if (!ec->init(tok_embd, n_rows, max_tokens)) {
+        LLAMA_LOG_ERROR("%s: a cache of %u rows for batches of up to %u tokens does not fit a vocabulary of %" PRId64 " "
+                "(1 <= tokens <= rows <= vocabulary)\n", __func__, n_rows, max_tokens, tok_embd->ne[1]);
+        return false;
+    }
+
+    // the layer's card must read rows of the table's type (get_rows of a quantized type is not on every backend)
+    {
+        ggml_init_params ip = { 3*ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr c(ggml_init(ip));
+        ggml_tensor * t   = ggml_new_tensor_2d(c.get(), tok_embd->type, tok_embd->ne[0], n_rows);
+        ggml_tensor * ids = ggml_new_tensor_1d(c.get(), GGML_TYPE_I32, max_tokens);
+        if (!ggml_backend_dev_supports_op(dev, ggml_get_rows(c.get(), t, ids))) {
+            LLAMA_LOG_ERROR("%s: %s can't read %s rows\n", __func__, ggml_backend_dev_name(dev), ggml_type_name(tok_embd->type));
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!ec->alloc(buft)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the row cache in %s\n", __func__, ggml_backend_buft_name(buft));
+        return false;
+    }
+
+    embd_cache         = std::move(ec);
+    embd_cache_backend = backend;
+
+    cparams.embd_cache    = embd_cache.get();
+    cparams.embd_cache_on = false;
+
+    LLAMA_LOG_INFO("%s: draft embedding row cache: %u rows of %s (%.2f MiB) in %s, for batches of up to %u tokens; the "
+            "table is in %s\n", __func__, n_rows, ggml_type_name(tok_embd->type),
+            ggml_backend_buffer_get_size(embd_cache->buf.get()) / 1024.0 / 1024.0, ggml_backend_buft_name(buft), max_tokens,
+            ggml_backend_buffer_name(tok_embd->buffer));
+
+    return true;
+}
+
+bool llama_context::embd_cache_stats(uint64_t * n_hit, uint64_t * n_miss, uint64_t * n_plain) const {
+    if (!embd_cache) {
+        return false;
+    }
+    if (n_hit)   { *n_hit   = embd_cache->n_hit;   }
+    if (n_miss)  { *n_miss  = embd_cache->n_miss;  }
+    if (n_plain) { *n_plain = embd_cache->n_plain; }
+    return true;
+}
+
 void llama_context::set_moe_tail(bool on, float p, float w, bool renorm, bool hist) {
     const auto & hparams = model.hparams;
     const uint32_t k = std::max<uint32_t>(hparams.n_expert_used_max(), 1);
@@ -2659,6 +2799,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
     sched_active = ss ? ss->sched.get() : nullptr;
+
+    // the draft's token rows from its row cache (embd_cache_init, Q961): the batch's slots are set and the rows it does
+    // not hold uploaded before the graph is chosen, since the graph reads either the cache or the table
+    if (embd_cache) {
+        cparams.embd_cache_on = gtype == LLM_GRAPH_TYPE_DECODER_MTP && ubatch.token != nullptr && ubatch.embd == nullptr &&
+                embd_cache->prepare(ubatch.token, ubatch.n_tokens, embd_cache_backend);
+    }
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -3858,6 +4005,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+
+        // a draft pass that keeps its hidden rows on the device for the next pass (set_nextn_carry): no copy to the host
+        if (cparams.nextn_carry && cparams.nextn_carry_out) {
+            t_h_nextn = nullptr;
+        }
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -6582,6 +6734,22 @@ uint32_t llama_head_shortlist_size(const llama_context * ctx) {
 
 void llama_set_head_shortlist(llama_context * ctx, bool value) {
     ctx->set_head_shortlist(value);
+}
+
+bool llama_embd_cache_init(llama_context * ctx, uint32_t n_rows, uint32_t max_tokens) {
+    return ctx->embd_cache_init(n_rows, max_tokens);
+}
+
+bool llama_embd_cache_stats(const llama_context * ctx, uint64_t * n_hit, uint64_t * n_miss, uint64_t * n_plain) {
+    return ctx->embd_cache_stats(n_hit, n_miss, n_plain);
+}
+
+bool llama_nextn_carry_init(llama_context * ctx) {
+    return ctx->nextn_carry_init();
+}
+
+void llama_set_nextn_carry(llama_context * ctx, bool in, bool out) {
+    ctx->set_nextn_carry(in, out);
 }
 
 bool llama_head_bound_init(llama_context * ctx) {
