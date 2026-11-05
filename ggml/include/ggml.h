@@ -439,7 +439,8 @@ extern "C" {
         GGML_TYPE_N3P     = 501, // 3.25 bpw: 8 levels and a shifted copy, 5-bit scale and shift bit per 32 weights
         GGML_TYPE_N2P_128 = 502, // N2P in 128-weight blocks (rows of 640 weights): 2.75 bpw
         GGML_TYPE_N3P_128 = 503, // N3P in 128-weight blocks: 3.375 bpw
-        GGML_TYPE_COUNT   = 504,
+        GGML_TYPE_Q4_1_64 = 504, // Q4_1 with one scale and offset per 64 weights (id 43, then 44, before upstream took 43)
+        GGML_TYPE_COUNT   = 505,
     };
 
     // [TAG_GGML_PREC]
@@ -496,6 +497,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_1_64 = 500, // except 1d tensors
     };
 
     // available tensor operations:

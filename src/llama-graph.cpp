@@ -2072,7 +2072,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 // LLAMA_NO_MOE_DOWN_RESCALE: the MoE down-projection rescale of build_moe_ffn keeps the FP16 block sums of Q8_1
 // activations from overflowing. "tg" drops it where the down-projection has one token: on compute 6.1 that product runs
 // the Pascal kernels of mmvq-pascal.cu, which compute the sums in FP32 (Q4_0, Q4_1, Q5_0, Q8_0, Q5_K, IQ4_XS;
-// mul_mat_vec_q does so for the other K-quants, but still reads the FP16 sum for Q5_1, as the CPU backend
+// mul_mat_vec_q does so for the other K-quants, but still reads the FP16 sum for Q5_1 and Q4_1_64, as the CPU backend
 // does for Q4_1 and Q5_1). Batches keep it: mul_mat_vec_q (2-8 tokens) reads the FP16 sums for Q4_0, Q4_1, Q5_0 and
 // Q5_1, MMQ for Q4_1, Q5_1, Q4_K, Q5_K and, without tensor cores, Q4_0. Unset: as "tg" where every device is of compute
 // capability 6.1 (cparams.moe_down_rescale_tg), else kept everywhere; "0" keeps it everywhere. Any other value drops it
