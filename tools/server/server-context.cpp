@@ -54,6 +54,18 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// GGML_CUDA_KEEPALIVE=request: each card's keep-alive block starts when a request is taken, ahead of its prompt, so that
+// the cards leave their idle state while it is prepared (the CUDA backend's kick does nothing in the other modes)
+static void server_keepalive_kick() {
+    static void (*kick)(void) = [] {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        return reg ? (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_keepalive_kick") : nullptr;
+    }();
+    if (kick != nullptr) {
+        kick();
+    }
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -4457,6 +4469,8 @@ private:
             case SERVER_TASK_TYPE_TTS:
             case SERVER_TASK_TYPE_DECISION:
                 {
+                    server_keepalive_kick();
+
                     if (task.need_sampling() && !decision.can_generate()) {
                         send_error(task, "This model is a decision model without text generation, use /v1/systemone", ERROR_TYPE_NOT_SUPPORTED);
                         break;

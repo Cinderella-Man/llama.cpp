@@ -1,5 +1,6 @@
 #include "batch-get.cuh"
 #include "common.cuh"
+#include "keepalive.cuh"
 #include "ggml-cpp.h"
 
 #include <climits>
@@ -55,6 +56,7 @@ struct ggml_cuda_batch_get_mapping {
     unsigned char * device = nullptr;
 
     ggml_cuda_batch_get_mapping(void * host, size_t size) {
+        ggml_cuda_keepalive_quiesce();
         const cudaError_t err = cudaHostRegister(host, size, cudaHostRegisterMapped | cudaHostRegisterPortable);
         if (err != cudaSuccess) {
             (void) cudaGetLastError();
@@ -76,6 +78,7 @@ struct ggml_cuda_batch_get_mapping {
     ~ggml_cuda_batch_get_mapping() {
         if (host) {
             // Release only the registration acquired by this object.
+            ggml_cuda_keepalive_quiesce();
             CUDA_CHECK(cudaHostUnregister(host));
         }
     }

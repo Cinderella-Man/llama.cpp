@@ -3,6 +3,7 @@
 #if !defined(GGML_USE_MUSA)
 
 #include "convert.cuh"
+#include "keepalive.cuh"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -276,6 +277,7 @@ struct ggml_cuda_ar_host_mapping {
     uint8_t * dev  = nullptr;   // device-side pointer for kernels / cudaMemset
 
     cudaError_t alloc(size_t bytes) {
+        ggml_cuda_keepalive_quiesce();
         cudaError_t rc = cudaHostAlloc(reinterpret_cast<void **>(&host), bytes,
                                        cudaHostAllocPortable | cudaHostAllocMapped);
         if (rc != cudaSuccess) {
@@ -293,6 +295,7 @@ struct ggml_cuda_ar_host_mapping {
 
     void free() {
         if (host) {
+            ggml_cuda_keepalive_quiesce();
             CUDA_CHECK(cudaFreeHost(host));
             host = nullptr;
             dev  = nullptr;
@@ -557,6 +560,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         p->host_large[i].free();
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
+            ggml_cuda_keepalive_quiesce();
             CUDA_CHECK(cudaFree(p->dev_tmp[i]));
         }
         ggml_cuda_set_device(p->devices[i]);

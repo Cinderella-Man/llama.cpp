@@ -320,6 +320,9 @@ llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)
 llama_build_and_test(test-cuda-profile-light.cpp  LABEL behavior)
+
+# GGML_CUDA_KEEPALIVE's settings, poll decision and start/stop controller, with a thread for each card's block
+llama_build_and_test(test-cuda-keepalive.cpp  LABEL behavior)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

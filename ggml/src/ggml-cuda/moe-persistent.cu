@@ -1,6 +1,7 @@
 #include "moe-persistent.cuh"
 #include "mmvq-pascal-impl.cuh"
 #include "unary.cuh"
+#include "keepalive.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -938,6 +939,7 @@ static void moep_alloc(ggml_backend_cuda_context & ctx) {
     ggml_cuda_set_device(ctx.device);
     CUDA_CHECK(cudaMalloc(&st.buf, moep_scratch::size));
     CUDA_CHECK(cudaMemsetAsync(st.buf, 0, moep_scratch::size, ctx.stream()));
+    ggml_cuda_keepalive_quiesce();
     CUDA_CHECK(cudaHostAlloc((void **) &st.err_host, MOEP_ERR_WORDS * sizeof(unsigned), cudaHostAllocMapped));
     memset(st.err_host, 0, MOEP_ERR_WORDS * sizeof(unsigned));
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &st.err_dev, st.err_host, 0));
@@ -1114,6 +1116,9 @@ void ggml_cuda_moe_persistent_end_graph(ggml_backend_cuda_context & ctx) {
 
 void ggml_cuda_moe_persistent_free(ggml_backend_cuda_context & ctx) {
     auto & st = ctx.moe_persistent;
+    if (st.buf != nullptr || st.err_host != nullptr) {
+        ggml_cuda_keepalive_quiesce();
+    }
     if (st.buf != nullptr) {
         ggml_cuda_set_device(ctx.device);
         CUDA_CHECK(cudaFree(st.buf));
