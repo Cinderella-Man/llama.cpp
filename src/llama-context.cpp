@@ -15,6 +15,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -428,12 +429,14 @@ llama_context::llama_context(
         }
     }
 
-    // card-to-card hops: LLAMA_HOP_CAST=f16|bf16|q8_0 sends the residual across every boundary between two GPUs of a
-    // layer split in that type: cast on the card before the boundary, back to F32 on the card after it, so the
-    // scheduler copies the narrow tensor (Flash-Next: 40,960 B a token in F32, 20,480 in F16 or BF16, 10,880 in Q8_0).
-    // LLAMA_HOP_CAST_AT=<l1,l2,...> marks those layers instead (each the first layer after a boundary), e.g. a rig's
-    // boundaries in a run on fewer cards or on the CPU. Unset, empty, 0, off or f32: off. Only the architectures whose
-    // graph calls build_hop_cast use it (qwen4exp)
+    // card-to-card hops: LLAMA_HOP_CAST=<type> sends the residual across every boundary between two GPUs of a layer
+    // split in that type: cast on the card before the boundary, back to F32 on the card after it, so the scheduler
+    // copies the narrow tensor (Flash-Next, 10,240 values a token: 40,960 B in F32, 20,480 in F16 or BF16, 10,880 in
+    // Q8_0, 8,400 in Q6_K, 7,680 in Q5_1, 7,040 in Q5_0, 6,400 in Q4_1, 5,760 in Q4_0 or IQ4_NL; the types below 8 bits
+    // are Q963's, each to be cleared by its KLD). The type's block must divide the residual's rows (Q6_K: 256), or that
+    // hop stays F32. LLAMA_HOP_CAST_AT=<l1,l2,...> marks those layers instead (each the first layer after a boundary),
+    // e.g. a rig's boundaries in a run on fewer cards or on the CPU. Unset, empty, 0, off or f32: off. Only the
+    // architectures whose graph calls build_hop_cast use it (qwen4exp)
     {
         cparams.hop_type = GGML_TYPE_F32;
         cparams.hop_layer.assign(hparams.n_layer(), false);
@@ -442,14 +445,28 @@ llama_context::llama_context(
         const char * LLAMA_HOP_CAST_AT = getenv("LLAMA_HOP_CAST_AT");
         if (LLAMA_HOP_CAST && *LLAMA_HOP_CAST && strcmp(LLAMA_HOP_CAST, "0") != 0 && strcmp(LLAMA_HOP_CAST, "off") != 0 &&
                 strcmp(LLAMA_HOP_CAST, "f32") != 0) {
-            if (strcmp(LLAMA_HOP_CAST, "f16") == 0) {
-                cparams.hop_type = GGML_TYPE_F16;
-            } else if (strcmp(LLAMA_HOP_CAST, "bf16") == 0) {
-                cparams.hop_type = GGML_TYPE_BF16;
-            } else if (strcmp(LLAMA_HOP_CAST, "q8_0") == 0) {
-                cparams.hop_type = GGML_TYPE_Q8_0;
-            } else {
-                LLAMA_LOG_WARN("%s: LLAMA_HOP_CAST=%s is not f16, bf16 or q8_0: hops stay F32\n", __func__, LLAMA_HOP_CAST);
+            // the type's name as ggml_type_name gives it, in any case (q6_k is q6_K)
+            static const ggml_type hop_types[] = {
+                GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
+                GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL,
+            };
+            const auto same_name = [](const char * a, const char * b) {
+                for (; *a && *b; ++a, ++b) {
+                    if (tolower((unsigned char) *a) != tolower((unsigned char) *b)) {
+                        return false;
+                    }
+                }
+                return *a == *b;
+            };
+            for (const ggml_type t : hop_types) {
+                if (same_name(LLAMA_HOP_CAST, ggml_type_name(t))) {
+                    cparams.hop_type = t;
+                    break;
+                }
+            }
+            if (cparams.hop_type == GGML_TYPE_F32) {
+                LLAMA_LOG_WARN("%s: LLAMA_HOP_CAST=%s is not f16, bf16, q8_0, q6_k, q5_1, q5_0, q4_1, q4_0 or iq4_nl: hops "
+                        "stay F32\n", __func__, LLAMA_HOP_CAST);
             }
         }
 

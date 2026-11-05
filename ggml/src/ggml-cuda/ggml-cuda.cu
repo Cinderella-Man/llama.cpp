@@ -7674,6 +7674,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
                     return true;
                 }
+                // the card hops' 4-bit non-linear and 6-bit casts back to F32 (LLAMA_HOP_CAST=iq4_nl, q6_K)
+                if (src0_type == GGML_TYPE_IQ4_NL && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q6_K) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q6_K && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {
                     return true;
                 }

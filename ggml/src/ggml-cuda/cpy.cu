@@ -386,6 +386,187 @@ static void ggml_cpy_f32_iq4_nl_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+static void ggml_cpy_iq4_nl_f32_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+
+    const int64_t num_blocks = (ne/QK4_NL + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    cpy_q_f32<cpy_blck_q_f32<dequantize_iq4_nl_pair, QK4_NL>, QK4_NL><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+// F32 -> Q6_K (the card hops' 6-bit type): the CPU's quantize_row_q6_K_ref with 16 threads per super-block of QK_K
+// values, one 16-value sub-block each (quantize_f32_q6_K_sub_scale), CUDA_CPY_Q6_K_SB super-blocks per thread block.
+// The 16 threads of a super-block are one half of a warp: they pick the super-block's scale with shuffles, then pack
+// the interleaved low and high bits from the codes in shared memory. As in cpy_f32_q, the source's values of a block
+// are contiguous.
+#define CUDA_CPY_Q6_K_SB 8
+
+static __global__ void cpy_f32_q6_K(const char * cx, char * cdst, const int64_t ne,
+                                    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                    const int64_t nb12, const int64_t nb13) {
+    __shared__ uint8_t codes[CUDA_CPY_Q6_K_SB][QK_K];
+
+    const int sb  = threadIdx.x / 16;
+    const int sub = threadIdx.x % 16;
+    const int64_t i = ((int64_t) blockIdx.x*CUDA_CPY_Q6_K_SB + sb)*QK_K;
+
+    // a super-block's 16 threads leave together, so the half-warp mask below holds only threads that stay
+    if (i >= ne) {
+        return;
+    }
+    const unsigned int hmask = 0xFFFFu << (threadIdx.x & 16);
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = (i10/QK_K)*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    ggml_cuda_pdl_sync();
+
+    const float * x = (const float *) (cx + x_offset) + 16*sub;
+    block_q6_K  * y = (block_q6_K *) (cdst + dst_offset);
+
+    float xs[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        xs[j] = x[j];
+    }
+    uint8_t L[16];
+    const float scale = quantize_f32_q6_K_sub_scale(xs, L);
+
+    // the scale of largest magnitude, the first sub-block's on ties (the CPU's loop keeps the first strictly larger one)
+    float max_abs = fabsf(scale);
+    float max_scl = scale;
+    int   max_ib  = sub;
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+        const float oa = __shfl_xor_sync(hmask, max_abs, off, 16);
+        const float os = __shfl_xor_sync(hmask, max_scl, off, 16);
+        const int   oi = __shfl_xor_sync(hmask, max_ib,  off, 16);
+        if (oa > max_abs || (oa == max_abs && oi < max_ib)) {
+            max_abs = oa;
+            max_scl = os;
+            max_ib  = oi;
+        }
+    }
+
+    if (max_abs < 1e-15f) { // GROUP_MAX_EPS: the CPU zeroes the block
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            y->ql[8*sub + k] = 0;
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            y->qh[4*sub + k] = 0;
+        }
+        y->scales[sub] = 0;
+        if (sub == 0) {
+            y->d = 0.0f;
+        }
+        return;
+    }
+
+    const float iscale = __fdiv_rn(-128.0f, max_scl);
+    const half  dh     = __float2half_rn(__fdiv_rn(1.0f, iscale));
+    const int   sc     = min(127, __float2int_rn(__fmul_rn(iscale, scale)));
+    const float d      = __fmul_rn(__half2float(dh), (float) sc);
+    if (d != 0.0f) { // otherwise the CPU keeps make_qx_quants' codes
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            L[j] = 32 + max(-32, min(31, __float2int_rn(__fdiv_rn(xs[j], d))));
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        codes[sb][16*sub + j] = L[j];
+    }
+    y->scales[sub] = (int8_t) sc;
+    if (sub == 0) {
+        y->d = dh;
+    }
+    __syncwarp(hmask);
+
+    // ql[64 h + 32 k + l] holds the low 4 bits of values 128 h + 32 k + l and 128 h + 32 k + 64 + l (k = 0, 1);
+    // qh[32 h + l] the high 2 bits of values 128 h + l, + 32, + 64 and + 96. Each thread packs 8 and 4 of those bytes
+    const uint8_t * c = codes[sb];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int b = 8*sub + k;
+        const int v = 128*(b / 64) + 32*((b % 64) / 32) + b % 32;
+        y->ql[b] = (c[v] & 0xF) | ((c[v + 64] & 0xF) << 4);
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int b = 4*sub + k;
+        const int v = 128*(b / 32) + b % 32;
+        y->qh[b] = (c[v] >> 4) | ((c[v + 32] >> 4) << 2) | ((c[v + 64] >> 4) << 4) | ((c[v + 96] >> 4) << 6);
+    }
+}
+
+// Q6_K -> F32: dequantize_q6_K's 64 threads per super-block, CUDA_CPY_Q6_K_SB of them per thread block
+static __global__ void cpy_q6_K_f32(const char * cx, char * cdst, const int64_t ne,
+                                    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                    const int64_t nb12, const int64_t nb13) {
+    const int sb  = threadIdx.x / 64;
+    const int tid = threadIdx.x % 64;
+    const int64_t i = ((int64_t) blockIdx.x*CUDA_CPY_Q6_K_SB + sb)*QK_K;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = (i00/QK_K)*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    ggml_cuda_pdl_sync();
+    dequantize_q6_K<float>(cx + x_offset, 0, (float *) (cdst + dst_offset), tid);
+}
+
+static void ggml_cpy_f32_q6_K_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+
+    GGML_ASSERT(ne % QK_K == 0);
+    const int64_t num_blocks = (ne/QK_K + CUDA_CPY_Q6_K_SB - 1) / CUDA_CPY_Q6_K_SB;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    cpy_f32_q6_K<<<num_blocks, 16*CUDA_CPY_Q6_K_SB, 0, stream>>>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+static void ggml_cpy_q6_K_f32_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+
+    GGML_ASSERT(ne % QK_K == 0);
+    const int64_t num_blocks = (ne/QK_K + CUDA_CPY_Q6_K_SB - 1) / CUDA_CPY_Q6_K_SB;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    cpy_q6_K_f32<<<num_blocks, 64*CUDA_CPY_Q6_K_SB, 0, stream>>>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -527,6 +708,15 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_IQ4_NL) {
         ggml_cpy_f32_iq4_nl_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_IQ4_NL && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_iq4_nl_f32_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q6_K) {
+        ggml_cpy_f32_q6_K_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_q6_K_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q5_1) {
         ggml_cpy_f32_q5_1_cuda
