@@ -20,6 +20,9 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include "../ggml/src/ggml-impl.h" // ggml_graph_view: replay computes node by node as the live check does
+#include "test-backend-ops-replay.h"
+
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -42,6 +45,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <typeinfo>
 #include <vector>
 #include <unordered_map>
 
@@ -1233,6 +1237,172 @@ static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) 
     return false;
 }
 
+// Record and replay (C372, Q931; the files: test-backend-ops-replay.h), so that a host whose CPU is too slow for the
+// reference checks a backend against references computed elsewhere:
+//   --record DIR  each case's tensors as its initialize_tensors left them, and the reference backend's result of every
+//                 node the check compares; with -b CPU only the reference runs (no comparison), with another backend
+//                 the live check runs as well and its verdict goes into the record
+//   --replay DIR  (or GGML_TEST_REPLAY=DIR) the tensors restored from the record instead of drawn, the tested backend
+//                 alone computes, and its results go through the live check's comparison against the stored ones: the
+//                 same thresholds, the same output lines, the same summary
+// A replayed case uses the record's draw of the inputs; the reference is the one the recording build's CPU code gives,
+// which is the rig's own when the record is made with the rig build (no AVX: the same CPU code on any x86-64 host).
+struct rr_options {
+    std::string record;                // --record DIR
+    std::string replay;                // --replay DIR, GGML_TEST_REPLAY
+    std::string log;                   // --replay-log FILE, GGML_TEST_REPLAY_LOG: a line per replayed case
+    size_t      sample        = 0;     // --sample N: record about one case in N, chosen by a hash of the case string
+    double      max_case_mb   = 0;     // --record-max-case-mb X: leave out cases whose files would be larger
+    double      budget_gb     = 0;     // --record-budget-gb X: leave out cases once the files reach X GB
+    bool        dry           = false; // --record-dry: print each case's file sizes, write nothing
+    size_t      cpu_check     = 0;     // --cpu-check N, GGML_TEST_REPLAY_CPU_CHECK: about one replayed case in N (inputs
+                                       // under 32 MB) also runs the live check against this host's CPU first
+    bool        allow_missing = false; // --replay-allow-missing, GGML_TEST_REPLAY_ALLOW_MISSING=1: cases the filter
+                                       // selects but the record lacks are left out without failing the run
+};
+
+static rr_options          g_rr;
+static std::atomic<size_t> g_rr_recorded{0}, g_rr_bytes{0}, g_rr_capped{0}, g_rr_kept{0};
+static std::atomic<size_t> g_rr_replayed{0}, g_rr_missing{0}, g_rr_cpu_checked{0}, g_rr_cpu_same{0}, g_rr_cpu_differ{0};
+static FILE *              g_rr_log_file = nullptr;
+
+static uint64_t rr_hash(const std::string & s) { // FNV-1a
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h = (h ^ c) * 1099511628211ULL;
+    }
+    return h;
+}
+
+static std::string rr_case_path(const std::string & dir, const std::string & id, const char * ext) {
+    return dir + "/cases/" + id + ext;
+}
+
+static std::string rr_shape(const ggml_tensor * t) {
+    char s[96];
+    snprintf(s, sizeof(s), "%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+    return s;
+}
+
+// the tensors a record holds: every tensor with its own memory, in context order (the case's context, then its weights)
+static std::vector<ggml_tensor *> rr_tensors(ggml_context * ctx, ggml_context * ctx_weights) {
+    std::vector<ggml_tensor *> ts;
+    for (ggml_context * c : { ctx, ctx_weights }) {
+        if (c == nullptr) {
+            continue;
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->view_src == nullptr && ggml_nbytes(t) > 0) {
+                ts.push_back(t);
+            }
+        }
+    }
+    return ts;
+}
+
+// the reference results of one case, node by node: the bytes of a node without an op, its values as floats
+struct rr_refs {
+    struct node {
+        int                  index;
+        std::string          op, name;
+        std::vector<uint8_t> raw;
+        std::vector<float>   f;
+    };
+    std::vector<node> nodes;
+
+    void add(int index, const ggml_tensor * t, std::vector<uint8_t> raw, std::vector<float> f) {
+        nodes.push_back({ index, ggml_op_desc(t), t->name, std::move(raw), std::move(f) });
+    }
+};
+
+static constexpr size_t rr_chunk = 64u << 20;
+
+// the record's tensors uploaded in the order they were written, checked against the meta's layout and md5
+static bool rr_restore(const tbo_meta & m, const std::string & path, ggml_context * ctx, ggml_context * ctx_weights,
+                       std::string & why) {
+    const std::vector<ggml_tensor *> ts = rr_tensors(ctx, ctx_weights);
+    if (ts.size() != m.tensors.size()) {
+        why = "the case has " + std::to_string(ts.size()) + " tensors, the record " + std::to_string(m.tensors.size());
+        return false;
+    }
+    for (size_t i = 0; i < ts.size(); i++) {
+        if (m.tensors[i].type != ggml_type_name(ts[i]->type) || m.tensors[i].shape != rr_shape(ts[i]) ||
+                m.tensors[i].nbytes != ggml_nbytes(ts[i])) {
+            why = "tensor " + std::to_string(i) + " is " + ggml_type_name(ts[i]->type) + " [" + rr_shape(ts[i]) +
+                  "], the record has " + m.tensors[i].type + " [" + m.tensors[i].shape + "]";
+            return false;
+        }
+    }
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        why = "cannot open " + path;
+        return false;
+    }
+    std::vector<uint8_t> buf;
+    tbo_md5 md5;
+    size_t  total = 0;
+    bool    ok = true;
+    for (ggml_tensor * t : ts) {
+        const size_t n = ggml_nbytes(t);
+        for (size_t off = 0; ok && off < n; off += rr_chunk) {
+            const size_t c = std::min(rr_chunk, n - off);
+            buf.resize(c);
+            ok = fread(buf.data(), 1, c, f) == c;
+            if (ok) {
+                md5.update(buf.data(), c);
+                ggml_backend_tensor_set(t, buf.data(), off, c);
+                total += c;
+            }
+        }
+    }
+    const bool at_end = ok && fgetc(f) == EOF;
+    fclose(f);
+    if (!ok || !at_end || total != m.in_bytes) {
+        why = path + " is not " + std::to_string(m.in_bytes) + " bytes long";
+        return false;
+    }
+    const std::string h = md5.hex();
+    if (h != m.in_md5) {
+        why = path + " has md5 " + h + ", the record says " + m.in_md5;
+        return false;
+    }
+    return true;
+}
+
+static bool rr_read_refs(const tbo_meta & m, const std::string & path, rr_refs & ref, std::string & why) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        why = "cannot open " + path;
+        return false;
+    }
+    tbo_md5 md5;
+    size_t  total = 0;
+    bool    ok = true;
+    for (const tbo_meta::node & n : m.nodes) {
+        rr_refs::node r { n.graph_index, n.op, n.name, std::vector<uint8_t>(n.raw), std::vector<float>(n.n) };
+        ok = ok && fread(r.raw.data(), 1, n.raw, f) == n.raw && fread(r.f.data(), sizeof(float), n.n, f) == n.n;
+        if (!ok) {
+            break;
+        }
+        md5.update(r.raw.data(), n.raw);
+        md5.update(r.f.data(), n.n*sizeof(float));
+        total += n.raw + n.n*sizeof(float);
+        ref.nodes.push_back(std::move(r));
+    }
+    const bool at_end = ok && fgetc(f) == EOF;
+    fclose(f);
+    if (!ok || !at_end || total != m.ref_bytes) {
+        why = path + " is not " + std::to_string(m.ref_bytes) + " bytes long";
+        return false;
+    }
+    const std::string h = md5.hex();
+    if (h != m.ref_md5) {
+        why = path + " has md5 " + h + ", the record says " + m.ref_md5;
+        return false;
+    }
+    return true;
+}
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -1358,6 +1528,156 @@ struct test_case {
     std::string current_op_name;
     bool contains_f16 = false;
 
+    // the case's position in the full case list, and the name of its record: the md5 of its class, its parameters and
+    // how many cases of the list before it have both (test_backend sets them), so that a record stays valid when a
+    // branch adds or removes other cases
+    size_t      case_index = 0;
+    std::string case_key;
+    std::string case_id;
+
+    // the check of one node: t1 on the tested backend against the reference backend's values f2 and, for a node
+    // without an op (a sentinel or a parameter, which must stay unchanged), its bytes raw2; err is the case's error, -1
+    // when an earlier check fails
+    bool compare_node(ggml_backend_t backend1, const char * bn2, ggml_tensor * t1, const uint8_t * raw2,
+                      const std::vector<float> & f2, double & err_out) {
+        const char * bn1 = ggml_backend_name(backend1);
+        err_out = -1;
+
+        if (t1->op == GGML_OP_NONE) {
+            // sentinels must be unchanged
+            std::vector<uint8_t> t1_data(ggml_nbytes(t1));
+            ggml_backend_tensor_get(t1, t1_data.data(), 0, ggml_nbytes(t1));
+
+            if (memcmp(t1_data.data(), raw2, ggml_nbytes(t1)) != 0) {
+                printf("sentinel mismatch: %s ", t1->name);
+                return false;
+            }
+        }
+
+        std::vector<float> f1 = tensor_to_float(t1);
+
+        for (size_t i = 0; i < f1.size(); i++) {
+            // check for nans
+            if (std::isnan(f1[i]) || std::isnan(f2[i])) {
+                printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
+                return false;
+            }
+            // check for infs: both must be inf of the same sign, or both must be finite
+            if (isinf_or_max(f1[i]) || isinf_or_max(f2[i])) {
+                if (isinf_or_max(f1[i]) && isinf_or_max(f2[i])) {
+                    if (std::signbit(f1[i]) != std::signbit(f2[i])) {
+                        printf("[%s] inf sign mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
+                        return false;
+                    }
+                } else {
+                    printf("[%s] inf mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
+                    return false;
+                }
+            }
+        }
+
+        double err = this->err(f1.data(), f2.data(), f1.size());
+        err_out = err;
+        if (err > max_err(backend1)) {
+            printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, max_err(backend1));
+            //for (int i = 0; i < (int) f1.size(); i++) {
+            //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
+            //}
+            //printf("\n");
+            //exit(1);
+            return false;
+        }
+        return true;
+    }
+
+    // node i of the graph computed alone, the view ggml_backend_compare_graph_backend gives the backend
+    void rr_compute_node(ggml_backend_t backend, int i) {
+        ggml_cgraph gv = ggml_graph_view(gf, i, i + 1);
+        ggml_backend_graph_compute(backend, &gv);
+    }
+
+    // the reference node by node, as ggml_backend_compare_graph_backend computes it on the reference backend, for a
+    // record without a live check: the tensors are already in host memory
+    void rr_reference(ggml_backend_t backend2, const std::vector<ggml_tensor *> & test_nodes, rr_refs & refs) {
+        auto take = [&](int i, ggml_tensor * t) {
+            std::vector<uint8_t> raw;
+            if (t->op == GGML_OP_NONE) {
+                raw.resize(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+            }
+            std::vector<float> f = tensor_to_float(t);
+            host_reference(t, f);
+            refs.add(i, t, std::move(raw), std::move(f));
+        };
+        if (!test_nodes.empty()) {
+            ggml_backend_graph_compute(backend2, gf);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                for (ggml_tensor * t : test_nodes) {
+                    if (ggml_graph_node(gf, i) == t) {
+                        take(i, t);
+                    }
+                }
+            }
+            return;
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            rr_compute_node(backend2, i);
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            take(i, t);
+        }
+    }
+
+    // the tested backend alone, node by node as the live check runs it, each node against the stored reference
+    bool rr_replay_compare(ggml_backend_t backend1, const char * bn2, const std::vector<ggml_tensor *> & test_nodes,
+                           const rr_refs & ref, bool & ok, std::vector<double> & errs, std::string & why) {
+        size_t k = 0;
+        auto check = [&](int i, ggml_tensor * t1) {
+            if (k >= ref.nodes.size() || ref.nodes[k].index != i || ref.nodes[k].op != ggml_op_desc(t1) ||
+                    ref.nodes[k].f.size() != (size_t) ggml_nelements(t1) ||
+                    (t1->op == GGML_OP_NONE && ref.nodes[k].raw.size() != ggml_nbytes(t1))) {
+                why = "node " + std::to_string(i) + " (" + ggml_op_desc(t1) + ") is not the record's node " + std::to_string(k);
+                return false;
+            }
+            const rr_refs::node & r = ref.nodes[k++];
+            double e;
+            if (!compare_node(backend1, bn2, t1, r.raw.data(), r.f, e)) {
+                ok = false;
+            }
+            errs.push_back(e);
+            return true;
+        };
+        ok = true;
+        if (!test_nodes.empty()) {
+            ggml_backend_graph_compute(backend1, gf);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                for (ggml_tensor * t : test_nodes) {
+                    if (ggml_graph_node(gf, i) == t && !check(i, t)) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * t1 = ggml_graph_node(gf, i);
+                rr_compute_node(backend1, i);
+                if (ggml_is_view_op(t1->op)) {
+                    continue;
+                }
+                if (!check(i, t1)) {
+                    return false;
+                }
+            }
+        }
+        if (k != ref.nodes.size()) {
+            why = "the graph has " + std::to_string(k) + " compared nodes, the record " + std::to_string(ref.nodes.size());
+            return false;
+        }
+        return true;
+    }
+
     // Used by the WebGPU backend to relax error thresholds on ops on f16 tensors
     void check_for_f16_tensor(ggml_context * ctx) {
         contains_f16 = false;
@@ -1465,10 +1785,18 @@ struct test_case {
             return test_status_t::SKIPPED;
         }
 
+        // a record without a live check (-b CPU --record): the tested backend is the one the record is replayed on
+        // later, which checks its own support then, as a live run does; here only the reference must support the case
+        const bool reference_only = !g_rr.record.empty() &&
+            ggml_backend_dev_type(ggml_backend_get_device(backend1)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+
         // check if the backends support the ops
         bool supported = true;
         std::string unsupported_str;
         for (ggml_backend_t backend : {backend1, backend2}) {
+            if (reference_only && backend == backend1) {
+                continue;
+            }
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
                 if (!ggml_backend_supports_op(backend, t)) {
                     supported = false;
@@ -1480,7 +1808,7 @@ struct test_case {
                 }
             }
         }
-        if (supported && !supported_by(backend1)) {
+        if (supported && !reference_only && !supported_by(backend1)) {
             supported = false;
             unsupported_str = std::string(ggml_backend_name(backend1));
         }
@@ -1492,6 +1820,37 @@ struct test_case {
             print_test_result_locked(output_printer, result);
 
             return test_status_t::NOT_SUPPORTED;
+        }
+
+        // record and replay: which cases, and the record of this one, before anything is allocated
+        const std::string case_name = current_op_name + "(" + vars() + ")";
+        const bool recording = !g_rr.record.empty();
+        const bool replaying = !g_rr.replay.empty();
+        if (recording && g_rr.sample > 1 && rr_hash(case_name) % g_rr.sample != 0) {
+            return test_status_t::SKIPPED;
+        }
+        if (recording && !g_rr.dry && tbo_file_exists(rr_case_path(g_rr.record, case_id, ".meta"))) {
+            // recorded by an earlier run into the same folder (another filter, or a run that stopped): kept as it is
+            g_rr_kept++;
+            return test_status_t::SKIPPED;
+        }
+        tbo_meta rmeta;
+        if (replaying) {
+            const std::string mp = rr_case_path(g_rr.replay, case_id, ".meta");
+            if (!tbo_file_exists(mp)) {
+                g_rr_missing++;
+                if (!g_rr.allow_missing) {
+                    std::lock_guard<std::mutex> guard(g_test_output_mutex);
+                    printf("  %s: not recorded [%s]\n", case_name.c_str(), mp.c_str());
+                }
+                return test_status_t::SKIPPED;
+            }
+            if (!rmeta.read(mp) || rmeta.name != case_name) {
+                printf("record mismatch: %s holds %s ", mp.c_str(), rmeta.name.empty() ? "no case" : rmeta.name.c_str());
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "record mismatch");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
         }
 
         // post-graph sentinel
@@ -1526,10 +1885,82 @@ struct test_case {
             ggml_graph_add_node(gf, sentinel);
         }
 
-        // randomize tensors
-        initialize_tensors(ctx.get());
-        if (ctx_weights) {
-            initialize_tensors(ctx_weights.get());
+        std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
+        if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
+            fused_nodes_to_verify.push_back(out);
+        }
+
+        // the record's size: the tensors, and each compared node's values (and bytes, for nodes without an op)
+        const std::vector<ggml_tensor *> rr_ts = rr_tensors(ctx.get(), ctx_weights.get());
+        if (recording) {
+            size_t in_bytes = 0, ref_bytes = 0;
+            for (ggml_tensor * t : rr_ts) {
+                in_bytes += ggml_nbytes(t);
+            }
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                const bool compared = fused_nodes_to_verify.empty() ? !ggml_is_view_op(t->op) :
+                    std::find(fused_nodes_to_verify.begin(), fused_nodes_to_verify.end(), t) != fused_nodes_to_verify.end();
+                if (compared) {
+                    ref_bytes += (t->op == GGML_OP_NONE ? ggml_nbytes(t) : 0) + ggml_nelements(t)*sizeof(float);
+                }
+            }
+            const double mb = (in_bytes + ref_bytes) / 1e6;
+            if (g_rr.dry) {
+                g_rr_recorded++;
+                g_rr_bytes += in_bytes + ref_bytes;
+                std::lock_guard<std::mutex> guard(g_test_output_mutex);
+                printf("  %s: in %zu B, ref %zu B\n", case_name.c_str(), in_bytes, ref_bytes);
+                return test_status_t::SKIPPED;
+            }
+            if ((g_rr.max_case_mb > 0 && mb > g_rr.max_case_mb) ||
+                    (g_rr.budget_gb > 0 && (g_rr_bytes + in_bytes + ref_bytes) / 1e9 > g_rr.budget_gb)) {
+                g_rr_capped++;
+                std::lock_guard<std::mutex> guard(g_test_output_mutex);
+                printf("  %s: not recorded (%.1f MB; cap %.0f MB a case, %.1f GB in all)\n", case_name.c_str(), mb,
+                       g_rr.max_case_mb, g_rr.budget_gb);
+                return test_status_t::SKIPPED;
+            }
+            g_rr_bytes += in_bytes + ref_bytes;
+        }
+
+        // randomize tensors, or restore the recorded ones
+        if (replaying) {
+            std::string why;
+            if (!rr_restore(rmeta, rr_case_path(g_rr.replay, case_id, ".in"), ctx.get(), ctx_weights.get(), why)) {
+                printf("record mismatch: %s ", why.c_str());
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "record mismatch");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
+        } else {
+            initialize_tensors(ctx.get());
+            if (ctx_weights) {
+                initialize_tensors(ctx_weights.get());
+            }
+        }
+
+        // the record's tensors, written before anything computes
+        std::unique_ptr<tbo_writer> rr_in;
+        std::vector<std::string>    rr_tensor_lines;
+        if (recording) {
+            rr_in.reset(new tbo_writer(rr_case_path(g_rr.record, case_id, ".in")));
+            std::vector<uint8_t> chunk;
+            for (size_t i = 0; i < rr_ts.size(); i++) {
+                ggml_tensor * t = rr_ts[i];
+                const size_t  n = ggml_nbytes(t);
+                for (size_t off = 0; off < n; off += rr_chunk) {
+                    chunk.resize(std::min(rr_chunk, n - off));
+                    ggml_backend_tensor_get(t, chunk.data(), off, chunk.size());
+                    rr_in->write(chunk.data(), chunk.size());
+                }
+                rr_tensor_lines.push_back("tensor\t" + std::to_string(i) + "\t" + t->name + "\t" + ggml_type_name(t->type) +
+                                          "\t" + rr_shape(t) + "\t" + std::to_string(n));
+            }
+            if (!rr_in->close()) {
+                printf("cannot write %s ", rr_in->path.c_str());
+                return test_status_t::FAIL;
+            }
         }
 
         // TODO: [TAG_MUL_MAT_ID_SKIP] @ngxson : remove this once CUDA implements mul_mat_id with -1 = skipped
@@ -1545,6 +1976,8 @@ struct test_case {
             test_case * tc;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
+            rr_refs * refs;              // the reference's results, kept for a record or a replay's CPU check
+            std::vector<double> errs;    // each compared node's error (-1: an earlier check failed)
         };
 
         callback_userdata ud {
@@ -1552,72 +1985,172 @@ struct test_case {
             this,
             backend1,
             backend2,
+            nullptr,
+            {},
         };
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
             callback_userdata * ud = (callback_userdata *) user_data;
-            const char * bn1 = ggml_backend_name(ud->backend1);
-            const char * bn2 = ggml_backend_name(ud->backend2);
 
+            std::vector<uint8_t> raw2;
             if (t1->op == GGML_OP_NONE) {
-                // sentinels must be unchanged
-                std::vector<uint8_t> t1_data(ggml_nbytes(t1));
-                std::vector<uint8_t> t2_data(ggml_nbytes(t2));
-                ggml_backend_tensor_get(t1, t1_data.data(), 0, ggml_nbytes(t1));
-                ggml_backend_tensor_get(t2, t2_data.data(), 0, ggml_nbytes(t2));
-
-                if (memcmp(t1_data.data(), t2_data.data(), ggml_nbytes(t1)) != 0) {
-                    printf("sentinel mismatch: %s ", t1->name);
-                    ud->ok = false;
-                    return true;
-                }
+                raw2.resize(ggml_nbytes(t2));
+                ggml_backend_tensor_get(t2, raw2.data(), 0, ggml_nbytes(t2));
             }
-
-            std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
             ud->tc->host_reference(t2, f2);
 
-            for (size_t i = 0; i < f1.size(); i++) {
-                // check for nans
-                if (std::isnan(f1[i]) || std::isnan(f2[i])) {
-                    printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
-                    ud->ok = false;
-                    return true;
-                }
-                // check for infs: both must be inf of the same sign, or both must be finite
-                if (isinf_or_max(f1[i]) || isinf_or_max(f2[i])) {
-                    if (isinf_or_max(f1[i]) && isinf_or_max(f2[i])) {
-                        if (std::signbit(f1[i]) != std::signbit(f2[i])) {
-                            printf("[%s] inf sign mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
-                            ud->ok = false;
-                            return true;
-                        }
-                    } else {
-                        printf("[%s] inf mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
-                        ud->ok = false;
-                        return true;
-                    }
-                }
-            }
-
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (err > ud->tc->max_err(ud->backend1)) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
-                //printf("\n");
-                //exit(1);
+            double err;
+            if (!ud->tc->compare_node(ud->backend1, ggml_backend_name(ud->backend2), t1, raw2.data(), f2, err)) {
                 ud->ok = false;
             }
+            ud->errs.push_back(err);
+            if (ud->refs) {
+                ud->refs->add(index, t2, std::move(raw2), std::move(f2));
+            }
             return true;
-
-            GGML_UNUSED(index);
         };
 
-        std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
-        if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
-            fused_nodes_to_verify.push_back(out);
+        auto errs_str = [](const std::vector<double> & errs) {
+            std::string s;
+            char e[32];
+            for (double x : errs) {
+                snprintf(e, sizeof(e), "%s%.9g", s.empty() ? "" : ",", x);
+                s += e;
+            }
+            return s;
+        };
+
+        auto write_record = [&](const rr_refs & refs, const std::string & live) {
+            tbo_writer ref(rr_case_path(g_rr.record, case_id, ".ref"));
+            std::string nodes;
+            for (size_t k = 0; k < refs.nodes.size(); k++) {
+                const rr_refs::node & r = refs.nodes[k];
+                ref.write(r.raw.data(), r.raw.size());
+                ref.write(r.f.data(), r.f.size()*sizeof(float));
+                nodes += "node\t" + std::to_string(k) + "\t" + std::to_string(r.index) + "\t" + r.op + "\t" + r.name +
+                         "\t" + std::to_string(r.raw.size()) + "\t" + std::to_string(r.f.size()) + "\n";
+            }
+            if (!ref.close()) {
+                return false;
+            }
+            char max_err_s[32];
+            snprintf(max_err_s, sizeof(max_err_s), "%.9g", max_err(backend1));
+            std::string meta = "tbo-record\t1\nname\t" + case_name + "\nkey\t" + case_key + "\nindex\t" +
+                std::to_string(case_index) + "\nclass\t" + typeid(*this).name() + "\nmode\t" + (fused_nodes_to_verify.empty() ? "nodes" : "graph") +
+                "\nmax_err\t" + max_err_s + "\nreference\t" + ggml_backend_name(backend2) +
+                "\ninputs\tstd::random_device draws, stored (not reproducible from a seed)" +
+                "\nin\t" + std::to_string(rr_in->n) + "\t" + rr_in->md5.hex() + "\nref\t" + std::to_string(ref.n) + "\t" + ref.md5.hex() + "\n";
+            for (const std::string & l : rr_tensor_lines) {
+                meta += l + "\n";
+            }
+            meta += nodes + live;
+            tbo_writer mw(rr_case_path(g_rr.record, case_id, ".meta"));
+            mw.write(meta.data(), meta.size());
+            return mw.close();
+        };
+
+        if (replaying && !recording) {
+            const char * bn2 = ggml_backend_name(backend2);
+            rr_refs ref;
+            std::string why;
+            if (!rr_read_refs(rmeta, rr_case_path(g_rr.replay, case_id, ".ref"), ref, why)) {
+                printf("record mismatch: %s ", why.c_str());
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "record mismatch");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
+
+            // the CPU check: the live check first on the same inputs, its reference against the stored one
+            std::string cpu_line;
+            bool        cpu_live_ok = true;
+            if (g_rr.cpu_check > 0 && rmeta.in_bytes < (32u << 20) && rr_hash(case_name) % g_rr.cpu_check == 0) {
+                rr_refs live_refs;
+                ud.refs = &live_refs;
+                const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                                       run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                                       fused_nodes_to_verify.size());
+                size_t n_values = 0, n_diff = 0;
+                double max_diff = 0;
+                bool same_layout = live_refs.nodes.size() == ref.nodes.size();
+                for (size_t k = 0; same_layout && k < ref.nodes.size(); k++) {
+                    const rr_refs::node & a = live_refs.nodes[k];
+                    const rr_refs::node & b = ref.nodes[k];
+                    same_layout = a.f.size() == b.f.size() && a.raw == b.raw;
+                    for (size_t i = 0; same_layout && i < a.f.size(); i++) {
+                        n_values++;
+                        if (memcmp(&a.f[i], &b.f[i], sizeof(float)) != 0) {
+                            n_diff++;
+                            max_diff = std::max(max_diff, (double) std::fabs(a.f[i] - b.f[i]));
+                        }
+                    }
+                }
+                cpu_live_ok = ud.ok && cmp_ok;
+                g_rr_cpu_checked++;
+                if (same_layout && n_diff == 0) {
+                    g_rr_cpu_same++;
+                }
+                char s[256];
+                snprintf(s, sizeof(s), "cpu-check: live %s, reference %s (%zu values, %zu differ, max |diff| %.3g)",
+                         cpu_live_ok ? "OK" : "FAIL", same_layout && n_diff == 0 ? "identical" : "differs", n_values, n_diff,
+                         max_diff);
+                cpu_line = s;
+                ud.ok = true;
+                ud.refs = nullptr;
+                ud.errs.clear();
+                // the live check computed the outputs in place: the record's tensors again for the replay
+                if (!rr_restore(rmeta, rr_case_path(g_rr.replay, case_id, ".in"), ctx.get(), ctx_weights.get(), why)) {
+                    printf("record mismatch: %s ", why.c_str());
+                    test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "record mismatch");
+                    print_test_result_locked(output_printer, result);
+                    return test_status_t::FAIL;
+                }
+            }
+
+            bool ok = true;
+            std::vector<double> errs;
+            const bool same = rr_replay_compare(backend1, bn2, fused_nodes_to_verify, ref, ok, errs, why);
+            if (!same) {
+                printf("record mismatch: %s ", why.c_str());
+            }
+            const bool test_passed = same && ok;
+            g_rr_replayed++;
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
+                               test_passed ? "" : (same ? "test failed" : "record mismatch"));
+            print_test_result_locked(output_printer, result);
+            const bool verdicts_differ = !cpu_line.empty() && cpu_live_ok != test_passed;
+            if (!cpu_line.empty()) {
+                if (verdicts_differ) {
+                    g_rr_cpu_differ++;
+                }
+                std::lock_guard<std::mutex> guard(g_test_output_mutex);
+                printf("    %s%s\n", cpu_line.c_str(), verdicts_differ ? "; the live and the replayed verdicts differ: FAIL" : "");
+            }
+            if (g_rr_log_file) {
+                std::lock_guard<std::mutex> guard(g_test_output_mutex);
+                fprintf(g_rr_log_file, "%s\t%s\t%s\t%s\n", case_id.c_str(), case_name.c_str(), test_passed ? "OK" : "FAIL",
+                        errs_str(errs).c_str());
+                fflush(g_rr_log_file);
+            }
+            return test_passed && !verdicts_differ ? test_status_t::OK : test_status_t::FAIL;
+        }
+
+        if (reference_only) {
+            rr_refs refs;
+            rr_reference(backend2, fused_nodes_to_verify, refs);
+            if (!write_record(refs, "")) {
+                printf("cannot write the record of %s ", case_name.c_str());
+                return test_status_t::FAIL;
+            }
+            g_rr_recorded++;
+            std::lock_guard<std::mutex> guard(g_test_output_mutex);
+            printf("  %s: recorded\n", case_name.c_str());
+            return test_status_t::OK;
+        }
+
+        rr_refs refs;
+        if (recording) {
+            ud.refs = &refs;
         }
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
@@ -1630,6 +2163,15 @@ struct test_case {
                            error_msg);
 
         print_test_result_locked(output_printer, result);
+
+        if (recording) {
+            if (!write_record(refs, std::string("live\t") + ggml_backend_name(backend1) + "\t" + (test_passed ? "OK" : "FAIL") +
+                                    "\t" + errs_str(ud.errs) + "\n")) {
+                printf("cannot write the record of %s\n", case_name.c_str());
+                return test_status_t::FAIL;
+            }
+            g_rr_recorded++;
+        }
 
         return test_passed ? test_status_t::OK : test_status_t::FAIL;
     }
@@ -15308,6 +15850,18 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         test_cases = make_test_cases_from_file(test_file_path);
     }
 
+    // each case's record name (record and replay): its class and parameters, and which of the cases with both it is
+    std::unordered_map<std::string, int> rr_seen;
+    for (size_t i = 0; i < test_cases.size(); i++) {
+        test_case & tc = *test_cases[i];
+        const std::string k = std::string(typeid(tc).name()) + "|" + tc.vars();
+        tc.case_index = i;
+        tc.case_key   = k + "#" + std::to_string(rr_seen[k]++);
+        tbo_md5 h;
+        h.update(tc.case_key.data(), tc.case_key.size());
+        tc.case_id = h.hex().substr(0, 20);
+    }
+
     filter_test_cases(test_cases, params_filter);
 
     if (mode == MODE_TEST) {
@@ -15406,12 +15960,37 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         }
 
+        const bool reference_only = !g_rr.record.empty() &&
+            ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (reference_only || g_rr.dry) {
+            // nothing was compared: the record's own summary instead of the tests' one
+            printf("  record: %s: %zu cases%s, %.3f GB of files, %zu left out by the caps, %zu kept from an earlier run\n",
+                   g_rr.record.c_str(), g_rr_recorded.load(), g_rr.dry ? " (dry run, nothing written)" : "",
+                   g_rr_bytes.load() / 1e9, g_rr_capped.load(), g_rr_kept.load());
+            return n_ok == tests_run;
+        }
+
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
+        bool rr_ok = true;
+        if (!g_rr.replay.empty()) {
+            printf("  replay: %s: %zu cases replayed, %zu selected by the filter have no record%s\n", g_rr.replay.c_str(),
+                   g_rr_replayed.load(), g_rr_missing.load(),
+                   g_rr_missing > 0 && !g_rr.allow_missing ? " (FAIL: the record does not cover this filter)" : "");
+            if (g_rr.cpu_check > 0) {
+                printf("  replay cpu-check: %zu cases, %zu references identical, %zu verdicts differ%s\n",
+                       g_rr_cpu_checked.load(), g_rr_cpu_same.load(), g_rr_cpu_differ.load(), g_rr_cpu_differ > 0 ? " (FAIL)" : "");
+            }
+            rr_ok = (g_rr_missing == 0 || g_rr.allow_missing) && g_rr_cpu_differ == 0;
+        } else if (!g_rr.record.empty()) {
+            printf("  record: %s: %zu cases, %.3f GB of files, %zu left out by the caps, %zu kept from an earlier run\n",
+                   g_rr.record.c_str(), g_rr_recorded.load(), g_rr_bytes.load() / 1e9, g_rr_capped.load(), g_rr_kept.load());
+        }
+
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
-        return n_ok == tests_run && slice_ok;
+        return n_ok == tests_run && slice_ok && rr_ok;
     }
 
     if (mode == MODE_GRAD) {
@@ -15573,7 +16152,21 @@ static void usage(char ** argv) {
     printf("  --list-ops                  list all available GGML operations\n");
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
-    printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n\n");
+    printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("  --record <dir>              test mode: write each case's tensors and the CPU reference to <dir>; with -b CPU\n");
+    printf("                              only the reference runs, with another backend the live check runs as well\n");
+    printf("  --replay <dir>              test mode (also GGML_TEST_REPLAY=<dir>): restore each case's tensors from <dir>\n");
+    printf("                              and check the backend against the stored reference; the CPU computes nothing\n");
+    printf("  --sample <n>                with --record: about one case in <n> (a hash of the case string picks them)\n");
+    printf("  --record-max-case-mb <x>    with --record: leave out cases whose files would be larger than <x> MB\n");
+    printf("  --record-budget-gb <x>      with --record: leave out cases once the files reach <x> GB\n");
+    printf("  --record-dry                with --record: print each case's file sizes, write nothing\n");
+    printf("  --cpu-check <n>             with --replay (also GGML_TEST_REPLAY_CPU_CHECK): about one case in <n> with inputs\n");
+    printf("                              under 32 MB also runs the live check on this host's CPU, its reference compared\n");
+    printf("  --replay-allow-missing      with --replay (also GGML_TEST_REPLAY_ALLOW_MISSING=1): cases without a record\n");
+    printf("                              are left out instead of failing the run\n");
+    printf("  --replay-log <file>         with --replay (also GGML_TEST_REPLAY_LOG): a line per case: index, case, verdict,\n");
+    printf("                              each compared node's error\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
@@ -15656,10 +16249,71 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (i + 1 < argc && strcmp(argv[i], "--record") == 0) {
+            g_rr.record = argv[++i];
+        } else if (i + 1 < argc && strcmp(argv[i], "--replay") == 0) {
+            g_rr.replay = argv[++i];
+        } else if (i + 1 < argc && strcmp(argv[i], "--sample") == 0) {
+            g_rr.sample = strtoull(argv[++i], nullptr, 10);
+        } else if (i + 1 < argc && strcmp(argv[i], "--record-max-case-mb") == 0) {
+            g_rr.max_case_mb = atof(argv[++i]);
+        } else if (i + 1 < argc && strcmp(argv[i], "--record-budget-gb") == 0) {
+            g_rr.budget_gb = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--record-dry") == 0) {
+            g_rr.dry = true;
+        } else if (i + 1 < argc && strcmp(argv[i], "--cpu-check") == 0) {
+            g_rr.cpu_check = strtoull(argv[++i], nullptr, 10);
+        } else if (strcmp(argv[i], "--replay-allow-missing") == 0) {
+            g_rr.allow_missing = true;
+        } else if (i + 1 < argc && strcmp(argv[i], "--replay-log") == 0) {
+            g_rr.log = argv[++i];
         } else {
             usage(argv);
             return 1;
         }
+    }
+
+    // record and replay: the environment for what the flags leave unset, so that scripts that call test-backend-ops
+    // replay unchanged
+    if (g_rr.replay.empty() && getenv("GGML_TEST_REPLAY") && *getenv("GGML_TEST_REPLAY")) {
+        g_rr.replay = getenv("GGML_TEST_REPLAY");
+    }
+    if (g_rr.cpu_check == 0 && getenv("GGML_TEST_REPLAY_CPU_CHECK")) {
+        g_rr.cpu_check = strtoull(getenv("GGML_TEST_REPLAY_CPU_CHECK"), nullptr, 10);
+    }
+    if (getenv("GGML_TEST_REPLAY_ALLOW_MISSING") && atoi(getenv("GGML_TEST_REPLAY_ALLOW_MISSING")) != 0) {
+        g_rr.allow_missing = true;
+    }
+    if (g_rr.log.empty() && getenv("GGML_TEST_REPLAY_LOG") && *getenv("GGML_TEST_REPLAY_LOG")) {
+        g_rr.log = getenv("GGML_TEST_REPLAY_LOG");
+    }
+    if (g_rr.dry && g_rr.record.empty()) {
+        g_rr.record = "-";
+    }
+    if (mode == MODE_TEST && !g_rr.replay.empty()) {
+        if (!tbo_file_exists(g_rr.replay + "/cases")) {
+            fprintf(stderr, "replay: %s has no cases/ folder\n", g_rr.replay.c_str());
+            return 1;
+        }
+        printf("replay: the cases' tensors and references from %s\n", g_rr.replay.c_str());
+        if (!g_rr.log.empty()) {
+            g_rr_log_file = fopen(g_rr.log.c_str(), "a");
+            if (!g_rr_log_file) {
+                fprintf(stderr, "replay: cannot open %s\n", g_rr.log.c_str());
+                return 1;
+            }
+        }
+    }
+    if (mode == MODE_TEST && !g_rr.record.empty() && !g_rr.dry) {
+        if (!tbo_mkdirs(g_rr.record + "/cases")) {
+            fprintf(stderr, "record: cannot create %s/cases\n", g_rr.record.c_str());
+            return 1;
+        }
+        printf("record: the cases' tensors and references into %s\n", g_rr.record.c_str());
+    }
+    if (mode != MODE_TEST) {
+        // record and replay are test-mode features: perf, grad and support runs ignore them
+        g_rr = rr_options();
     }
 
     // load and enumerate backends
