@@ -190,6 +190,19 @@ static bool ggml_cuda_gdn_fuse_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_GLU_ALIAS_FUSE=0: a gate/up/GLU whose GLU output reuses the activations' memory is not fused, as upstream
+static bool ggml_cuda_glu_alias_fuse_enabled() {
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_GLU_ALIAS_FUSE", 1) != 0;
+    return enabled;
+}
+
+// GGML_CUDA_CPY_HOP_TYPES=0: CPY IQ4_NL -> F32, F32 -> Q6_K and Q6_K -> F32 (the card hops' casts) are not claimed, so the
+// scheduler runs them on the CPU, as upstream
+static bool ggml_cuda_cpy_hop_types_enabled() {
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_CPY_HOP_TYPES", 1) != 0;
+    return enabled;
+}
+
 static bool ggml_cuda_p2p_enabled() {
     static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
     return enabled;
@@ -4503,7 +4516,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     // before the product kernel starts, so the GLU output may reuse their memory. ggml-alloc does that whenever gate
     // and up are the last users of the activations (a shared expert after the routed experts, a dense FFN).
     const auto mmvq_src1_may_alias = [](const ggml_tensor * ffn_up) -> const ggml_tensor * {
-        return ggml_is_quantized(ffn_up->src[0]->type) ? ffn_up->src[1] : nullptr;
+        return ggml_is_quantized(ffn_up->src[0]->type) && ggml_cuda_glu_alias_fuse_enabled() ? ffn_up->src[1] : nullptr;
     };
 
     if ((is_equal(mul_mat_bias_glu_ops, ops) || is_equal(mul_mat_id_bias_glu_ops, ops)) &&
@@ -7684,13 +7697,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 // the card hops' 4-bit non-linear and 6-bit casts back to F32 (LLAMA_HOP_CAST=iq4_nl, q6_K)
                 if (src0_type == GGML_TYPE_IQ4_NL && src1_type == GGML_TYPE_F32) {
-                    return true;
+                    return ggml_cuda_cpy_hop_types_enabled();
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q6_K) {
-                    return true;
+                    return ggml_cuda_cpy_hop_types_enabled();
                 }
                 if (src0_type == GGML_TYPE_Q6_K && src1_type == GGML_TYPE_F32) {
-                    return true;
+                    return ggml_cuda_cpy_hop_types_enabled();
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {
                     return true;

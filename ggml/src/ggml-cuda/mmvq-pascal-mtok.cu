@@ -498,6 +498,7 @@ struct mtok_cfg {
     int  rb          = 0;
     bool gate_direct = false;
     bool tile        = true;
+    bool tile_c269   = true; // T = 2: false, the decline before Q825
 };
 
 static const mtok_cfg & mtok_config() {
@@ -511,6 +512,7 @@ static const mtok_cfg & mtok_config() {
         c.rb          = n >= 3 && v[2] >= 1 ? v[2] : 0;
         c.gate_direct = n >= 4 && v[3] == 1;
         c.tile        = n < 5 || v[4] != 0;
+        c.tile_c269   = n < 5 || v[4] != 2;
         return c;
     }();
     return cfg;
@@ -889,7 +891,8 @@ bool ggml_cuda_mmvq_pascal_mtok(
     const int64_t wbytes  = (int64_t) (WARP_SIZE >> lpr_log2) * row_bytes;
     const bool    tile_ok = !gate && mtok_config().tile && stride_row_x == blocks && wbytes % 16 == 0 &&
         (nrows_x * row_bytes) % 16 == 0 && mtok_aligned(vx, 16) && (stride_channel_x * bs) % 16 == 0 &&
-        (stride_sample_x * bs) % 16 == 0 && MMVQP_MTOK_NWARPS * wbytes <= 48 * 1024;
+        (stride_sample_x * bs) % 16 == 0 && MMVQP_MTOK_NWARPS * wbytes <= 48 * 1024 &&
+        (mtok_config().tile_c269 || x_aligned(16));
     int st;
     if (gate) {
         st = seg_ok && !mtok_config().gate_direct ? MTOK_SEG : MTOK_DIRECT;
@@ -898,6 +901,9 @@ bool ggml_cuda_mmvq_pascal_mtok(
     } else if (tile_ok) {
         st = MTOK_TILE;
     } else {
+        if (!mtok_config().tile_c269) {
+            return false;
+        }
         st = MTOK_DIRECT;
     }
 

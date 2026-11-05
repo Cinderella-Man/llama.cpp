@@ -277,8 +277,9 @@ static void ggml_cuda_mul_mat_q_impl(
             const int64_t n_expert_used = ids->ne[0];
             ncols_opt = ne12;
 
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            if (!ggml_cuda_mmq_moe_legacy()) {
+            // Each expert only sees ne12*n_expert_used/ne02 tokens on average (legacy: on RDNA3 and RDNA4 only, as before).
+            if (!ggml_cuda_mmq_moe_legacy() ||
+                    GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
         }

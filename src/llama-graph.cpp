@@ -4229,13 +4229,23 @@ ggml_tensor * llm_graph_context::build_attn(
     // by doing so, the number of splits in the graph is reduced
     // expand k last, as build_attn with a plain KV cache does, so that its norm, RoPE and cache write are adjacent and
     // fuse into one kernel
+    // (LLAMA_ATTN_K_LAST=0: q, k, v, upstream's order for this cache)
+    static const bool k_last = [] {
+        const char * env = getenv("LLAMA_ATTN_K_LAST");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
     ggml_build_forward_expand(gf, q_cur);
+
+    if (k_cur && !k_last) {
+        ggml_build_forward_expand(gf, k_cur);
+    }
 
     if (v_cur) {
         ggml_build_forward_expand(gf, v_cur);
     }
 
-    if (k_cur) {
+    if (k_cur && k_last) {
         ggml_build_forward_expand(gf, k_cur);
     }
 

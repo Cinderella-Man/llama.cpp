@@ -11,6 +11,16 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
+// GGML_CUDA_MMQ_MOE_LEGACY=1 (mmq.cu) also gives MMF's MUL_MAT_ID the layout before the MoE tile list (llama.cpp PR
+// #31047): ceil(tokens / 16) tiles for every expert, each from the expert's first column, the ones past its last empty
+static bool ggml_cuda_mmf_moe_legacy() {
+    static const bool legacy = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_MOE_LEGACY");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return legacy;
+}
+
 static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
 // ids that may hold -1 (skipped slots, moe-tail.cuh): the kernels read a copy without them, then the slots' rows become zeros
@@ -85,7 +95,10 @@ static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml
         const int64_t n_experts     = ne02;
         const int64_t n_tokens      = ne12;
         const int64_t ne_get_rows   = n_tokens * n_expert_used;
-        const int64_t max_tiles     = (ne_get_rows + 16 - 1) / 16 + ne02;
+        // legacy: one tile per 16 tokens for every expert (as many as the CUDA grid's y dimension allows)
+        const int     tiles_per_expert = ggml_cuda_mmf_moe_legacy() && n_experts*((n_tokens + 16 - 1) / 16) <= 65535 ?
+            (n_tokens + 16 - 1) / 16 : 0;
+        const int64_t max_tiles     = tiles_per_expert > 0 ? n_experts*tiles_per_expert : (ne_get_rows + 16 - 1) / 16 + ne02;
 
         ids_src_compact_dev.alloc(ctx.pool(), ne_get_rows);
         ids_dst_compact_dev.alloc(ctx.pool(), ne_get_rows);
@@ -98,7 +111,7 @@ static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml
 
         ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), tile_spec_dev.get(),
             static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), 16,
-            si1, sis1, /*write_inverse =*/ false, ctx.stream());
+            si1, sis1, /*write_inverse =*/ false, ctx.stream(), tiles_per_expert);
         CUDA_CHECK(cudaGetLastError());
 
         ids_info.ids_src_compact = ids_src_compact_dev.get();

@@ -16,6 +16,16 @@
 #include <stdexcept>
 #include <unordered_map>
 
+// the fork's cell placement, each rule on unless its switch is 0 (then upstream's placement), read once:
+//   LLAMA_KV_HEAD_EMPTY         seq_rm that empties a stream puts head on cell 0
+//   LLAMA_KV_HEAD_TAIL          seq_rm of a sequence's tail puts head on the first removed position's cell
+//   LLAMA_KV_HEAD_FREE          find_slot keeps head on a free cell instead of restarting from cell 0
+//   LLAMA_KV_RESTORE_CANONICAL  a state restored into an empty stream puts position p in cell p
+static bool llama_kv_rule_on(const char * name) {
+    const char * env = getenv(name);
+    return env == nullptr || atoi(env) != 0;
+}
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -130,7 +140,12 @@ llama_kv_cache::llama_kv_cache(
 
             // the cells' positions and sequences for the mask built on the device, one copy per buffer type; not with
             // tensor split, whose buffers split each tensor across the devices by its name
-            if (!other && offload && n_seq_max <= 24 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+            // (LLAMA_GPU_KQ_CELLS=0: no copies, upstream's buffers; every mask is then the host's)
+            static const bool kq_cells_on = [] {
+                const char * env = getenv("LLAMA_GPU_KQ_CELLS");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            if (kq_cells_on && !other && offload && n_seq_max <= 24 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
                 ggml_tensor * kq_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, (int64_t) kv_size*n_stream + 1);
                 ggml_format_name(kq_cells, "cache_%skq_cells_%zu", name_tag, kq_cells_devs.size());
                 kq_cells_devs.push_back(kq_cells);
@@ -514,13 +529,16 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
         }
 
-        if (cells.get_used() == 0) {
+        static const bool head_empty = llama_kv_rule_on("LLAMA_KV_HEAD_EMPTY");
+        static const bool head_tail  = llama_kv_rule_on("LLAMA_KV_HEAD_TAIL");
+
+        if (head_empty && cells.get_used() == 0) {
             // the stream is empty: the next prompt fills it from cell 0, the cell layout of a fresh context, whatever
             // the stream held before (a sliding-window cache that wrapped ends with head anywhere). Attention sums the
             // keys in cell order, so a prompt processed from scratch, or a saved state loaded here, then gives the
             // same values as on a server that has just started
             head = 0;
-        } else if (p1 == std::numeric_limits<llama_pos>::max() && pos_min_head != cells.size()) {
+        } else if (head_tail && p1 == std::numeric_limits<llama_pos>::max() && pos_min_head != cells.size()) {
             // the tail of the sequence was removed: the next token takes the cell of the first removed position, so
             // that re-decoding the tail gives the same cell layout as before, also when the tail wrapped around the
             // end of the cache (pipelined speculation relies on this for bit-identical attention)
@@ -551,7 +569,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             // If we freed up a slot, set head to it so searching can start there.
-            if (cells.get_used() == 0) {
+            static const bool head_empty = llama_kv_rule_on("LLAMA_KV_HEAD_EMPTY");
+            if (head_empty && cells.get_used() == 0) {
                 head = 0;
             } else if (new_head != cells.size() && new_head < head) {
                 head = new_head;
@@ -1126,7 +1145,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         // but not when head is on a free cell: a removed tail of the sequence left it there for the next token (seq_rm),
         // and the cells it freed after head are no sign of free space before it. Restarting from cell 0 would put the
         // re-decoded tail into other cells than before, which changes the order in which attention sums the keys
-        if (head_cur > cells.get_used() + 2*n_tokens && !(head_cur < cells.size() && cells.is_empty(head_cur))) {
+        static const bool head_free = llama_kv_rule_on("LLAMA_KV_HEAD_FREE");
+        if (head_cur > cells.get_used() + 2*n_tokens && !(head_free && head_cur < cells.size() && cells.is_empty(head_cur))) {
             head_cur = 0;
         }
 
@@ -2918,8 +2938,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
-            sinfo = canonical_slot(strm, ubatch, cell_count);
-            canonical = !sinfo.empty();
+            static const bool restore_canonical = llama_kv_rule_on("LLAMA_KV_RESTORE_CANONICAL");
+            if (restore_canonical) {
+                sinfo = canonical_slot(strm, ubatch, cell_count);
+                canonical = !sinfo.empty();
+            }
             if (!canonical) {
                 sinfo = find_slot(ubatch, false);
             }

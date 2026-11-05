@@ -20,6 +20,8 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -1352,6 +1354,15 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// LLAMA_STATE_NOINIT=0: state buffers come zero-filled, as upstream's std::vector<uint8_t> (default 1: uninitialized)
+inline bool common_state_noinit() {
+    static const bool noinit = [] {
+        const char * env = getenv("LLAMA_STATE_NOINIT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return noinit;
+}
+
 // leave default-inserted elements uninitialized; callers must fill them before use (#30137: a state buffer is written
 // whole by llama_state_seq_get_data_ext right after it is sized, so zero-filling it first is a wasted pass)
 template <typename T>
@@ -1360,6 +1371,14 @@ struct common_no_init_allocator : std::allocator<T> {
 
     common_no_init_allocator() = default;
     template <typename U> common_no_init_allocator(const common_no_init_allocator<U> &) {}
+
+    T * allocate(std::size_t n) {
+        T * p = std::allocator<T>::allocate(n);
+        if (!common_state_noinit()) {
+            memset((void *) p, 0, n*sizeof(T));
+        }
+        return p;
+    }
 
     template <typename U> void construct(U * p) { ::new ((void *) p) U; }
 };
