@@ -88,6 +88,46 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
 
+// as above, but verifies the drafted block jointly: block verification (Sun et al., "Block Verification Accelerates
+// Speculative Decoding", arXiv:2403.10444, Algorithm 2). Exact in distribution like token-by-token rejection, and its
+// expected accepted length is never shorter. draft_q holds the draft's candidates per token, as for the rejection
+// above; the uniforms come from the sampler's own stream
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
+
+// Block verification's arithmetic (arXiv:2403.10444, Algorithm 2 with its Equations 4, 5 and 9) for a block of g
+// drafted tokens X_1 .. X_g:
+//   pb[i]  the target's distribution after the first i drafted tokens, M_b(. | X^i), for i = 0 .. n, n <= g - 1
+//          (positions past n follow a token the target cannot produce, and are never accepted)
+//   q[i]   the draft's distribution of X_(i+1), M_s(. | X^i), for i = 0 .. g - 1
+// gives the weights p_0 .. p_g (p_0 = 1, p_i = min(1, p_(i-1) M_b(X_i | X^(i-1)) / M_s(X_i | X^(i-1)))) and the
+// acceptance probabilities h_1 .. h_g (h_g = p_g; for i < g, h_i = S_i / (S_i + 1 - p_i) with
+// S_i = sum_x max(0, p_i M_b(x | X^i) - M_s(x | X^i))). The accepted length tau is the largest i with eta_i < h_i
+// (0 if none), eta_i independent uniforms; the next token is then drawn from M_b(. | X^g) when tau = g, else from
+// common_spec_block_residual at tau
+struct common_spec_block_weights {
+    std::vector<double> p; // p_0 .. p_g
+    std::vector<double> h; // h_0 (unused, 0) .. h_g
+};
+
+common_spec_block_weights common_spec_block_compute(
+        const std::vector<std::vector<llama_token_data>> & pb,
+        const std::vector<std::vector<llama_token_data>> & q,
+        const llama_tokens & draft);
+
+// p_res(. | X^i) = max(0, p_i M_b(. | X^i) - M_s(. | X^i)), normalized; empty when it has no mass
+std::vector<llama_token_data> common_spec_block_residual(
+        const std::vector<llama_token_data> & pb, const std::vector<llama_token_data> & q, double p);
+
+// a copy as common_sampler_copy makes it, except that dst keeps its random draws (its stream of uniforms and the
+// chain's dist and xtc samplers), so that after a restore the draws already used stay used
+void common_sampler_copy_keep_rng(const struct common_sampler * src, struct common_sampler * dst);
+
+// the text the grammar forces after `prefix`, tokens not yet accepted: the longest prefix of every continuation the
+// grammar then allows, up to max_chars characters (llama_sampler_grammar_forced_text). Empty when there is no grammar,
+// it does not apply (a lazy grammar before its trigger, inside the reasoning), or it rejects a token of prefix; n_valid
+// (if set) receives how many tokens of prefix it accepts
+std::string common_sampler_grammar_forced_text(struct common_sampler * gsmpl, const llama_tokens & prefix, int32_t max_chars, size_t * n_valid = nullptr);
+
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 

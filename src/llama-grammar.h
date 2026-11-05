@@ -78,6 +78,10 @@ const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar
 // positions
 void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr);
 
+// the text every continuation the grammar allows begins with (a token element adds its piece), up to max_chars code
+// points: empty for a lazy grammar before its trigger, mid-way through a character, or where the grammar may end
+std::string llama_grammar_forced_text(const struct llama_grammar & grammar, size_t max_chars);
+
 std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_stack(
         const llama_grammar_rules      & rules,
         const llama_grammar_stack      & stack,

@@ -2968,6 +2968,26 @@ bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl) {
     return ctx->grammar != nullptr && ctx->grammar->awaiting_trigger;
 }
 
+int32_t llama_sampler_grammar_forced_text(const struct llama_sampler * smpl, char * buf, int32_t size, int32_t max_chars) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_grammar_i || buf == nullptr || size <= 0 || max_chars <= 0) {
+        return 0;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    if (ctx->grammar == nullptr) {
+        return 0;
+    }
+
+    const std::string text = llama_grammar_forced_text(*ctx->grammar, (size_t) max_chars);
+
+    // cut back to a whole UTF-8 character
+    size_t n = std::min(text.size(), (size_t) size);
+    while (n > 0 && n < text.size() && (((unsigned char) text[n]) & 0xC0) == 0x80) {
+        --n;
+    }
+    memcpy(buf, text.data(), n);
+    return (int32_t) n;
+}
+
 // penalties
 
 struct llama_sampler_penalties : public llama_sampler_backend {

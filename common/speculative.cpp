@@ -3661,7 +3661,13 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
-        GGML_ASSERT(n_accepted == 0);
+        // no implementation has drafted yet, so the accepted tokens were not drafted by one (llama-server's
+        // grammar-forced tokens, LLAMA_SPEC_FORCE): every implementation hears of them as another's
+        if (n_accepted > 0) {
+            for (auto & impl_other : spec->impls) {
+                impl_other->accept(seq_id, n_accepted, true);
+            }
+        }
         return;
     }
 

@@ -1050,6 +1050,104 @@ void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr) {
     grammar->stacks = std::move(stacks_new);
 }
 
+static void llama_grammar_append_utf8(std::string & out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += (char) cp;
+    } else if (cp < 0x800) {
+        out += (char) (0xC0 | (cp >> 6));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char) (0xE0 | (cp >> 12));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    } else {
+        out += (char) (0xF0 | (cp >> 18));
+        out += (char) (0x80 | ((cp >> 12) & 0x3F));
+        out += (char) (0x80 | ((cp >> 6) & 0x3F));
+        out += (char) (0x80 | (cp & 0x3F));
+    }
+}
+
+std::string llama_grammar_forced_text(const struct llama_grammar & grammar, size_t max_chars) {
+    std::string out;
+
+    // a lazy grammar allows anything before its trigger; mid-way through a character the next code point is not whole
+    if (grammar.awaiting_trigger || grammar.partial_utf8.n_remain != 0 || grammar.stacks.empty()) {
+        return out;
+    }
+
+    llama_grammar_stacks stacks = grammar.stacks;
+
+    for (size_t n = 0; n < max_chars; ++n) {
+        // every stack must require the same single code point, or the same token
+        bool     have   = false;
+        bool     is_tok = false;
+        uint32_t value  = 0;
+
+        for (const auto & stack : stacks) {
+            if (stack.empty()) {
+                return out; // the grammar may end here
+            }
+
+            const llama_grammar_element * pos = stack.back();
+
+            bool     tok;
+            uint32_t v;
+            if (pos->type == LLAMA_GRETYPE_TOKEN) {
+                tok = true;
+                v   = pos->value;
+            } else if (pos->type == LLAMA_GRETYPE_CHAR &&
+                       pos[1].type != LLAMA_GRETYPE_CHAR_ALT && pos[1].type != LLAMA_GRETYPE_CHAR_RNG_UPPER) {
+                tok = false;
+                v   = pos->value;
+            } else {
+                return out; // a character class, a negation, any character or a token negation
+            }
+
+            if (!have) {
+                have   = true;
+                is_tok = tok;
+                value  = v;
+            } else if (tok != is_tok || v != value) {
+                return out;
+            }
+        }
+
+        if (!have) {
+            return out;
+        }
+
+        // a single code point or token: the element after it is each stack's next position
+        llama_grammar_stacks next;
+        for (const auto & stack : stacks) {
+            const llama_grammar_element * after = stack.back() + 1;
+
+            llama_grammar_stack new_stack(stack.begin(), stack.end() - 1);
+            if (!llama_grammar_is_end_of_sequence(after)) {
+                new_stack.push_back(after);
+            }
+            llama_grammar_advance_stack(grammar.rules, new_stack, next);
+        }
+
+        if (is_tok) {
+            if (grammar.vocab == nullptr) {
+                return out;
+            }
+            out += grammar.vocab->token_to_piece((llama_token) value);
+        } else {
+            llama_grammar_append_utf8(out, value);
+        }
+
+        if (next.empty()) {
+            return out;
+        }
+
+        stacks = std::move(next);
+    }
+
+    return out;
+}
+
 // checks the code point at depth of each candidate (an index into the input) against the stack
 // returns true when some match: they go to next, and the stacks that follow to next_stacks
 static bool llama_grammar_reject_step(

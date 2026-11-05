@@ -1007,6 +1007,320 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     return result;
 }
 
+//
+// block verification (Q797): Sun et al., "Block Verification Accelerates Speculative Decoding", arXiv:2403.10444
+//
+
+// the draft's candidates sorted by token, for lookups while walking the target's (often the whole vocabulary)
+static std::vector<llama_token_data> spec_block_by_id(const std::vector<llama_token_data> & q) {
+    std::vector<llama_token_data> s = q;
+    std::sort(s.begin(), s.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+    return s;
+}
+
+static double spec_block_q(const std::vector<llama_token_data> & q_by_id, llama_token id) {
+    const auto it = std::lower_bound(q_by_id.begin(), q_by_id.end(), id,
+            [](const llama_token_data & e, llama_token v) { return e.id < v; });
+    return it != q_by_id.end() && it->id == id ? (double) it->p : 0.0;
+}
+
+// S = sum_x max(0, p M_b(x) - M_s(x)); a token outside M_b's candidates contributes max(0, -M_s(x)) = 0
+static double spec_block_mass(const std::vector<llama_token_data> & pb, const std::vector<llama_token_data> & q_by_id, double p) {
+    double s = 0.0;
+    for (const auto & e : pb) {
+        const double r = p * (double) e.p - spec_block_q(q_by_id, e.id);
+        if (r > 0.0) {
+            s += r;
+        }
+    }
+    return s;
+}
+
+common_spec_block_weights common_spec_block_compute(
+        const std::vector<std::vector<llama_token_data>> & pb,
+        const std::vector<std::vector<llama_token_data>> & q,
+        const llama_tokens & draft) {
+    const size_t g = draft.size();
+    GGML_ASSERT(q.size() == g && "q must have one entry per draft token");
+    GGML_ASSERT(pb.size() <= g && "pb has at most one entry per draft token");
+
+    common_spec_block_weights w;
+    w.p.assign(g + 1, 0.0);
+    w.h.assign(g + 1, 0.0);
+    w.p[0] = 1.0;
+
+    for (size_t i = 0; i < pb.size(); ++i) {
+        const auto q_by_id = spec_block_by_id(q[i]);
+
+        // Equation 5, i < g: the mass the target still has over the draft at position i, weighed by p_i, against what
+        // the earlier positions left (1 - p_i). With p_i = 1 and no mass left (target and draft agree here) the limit
+        // is taken: every later weight stays 1, so tau never stops at i
+        if (i >= 1) {
+            const double s   = spec_block_mass(pb[i], q_by_id, w.p[i]);
+            const double den = s + 1.0 - w.p[i];
+            w.h[i] = den > 1e-12 ? s / den : (w.p[i] > 0.0 ? 1.0 : 0.0);
+        }
+
+        // Equation 9
+        const double px = prob_of(pb[i].data(), pb[i].size(), draft[i]);
+        const double qx = spec_block_q(q_by_id, draft[i]);
+        w.p[i + 1] = qx > 0.0 ? std::min(1.0, w.p[i] * px / qx) : 0.0;
+    }
+
+    // Equation 5, i = g
+    w.h[g] = w.p[g];
+
+    return w;
+}
+
+std::vector<llama_token_data> common_spec_block_residual(
+        const std::vector<llama_token_data> & pb, const std::vector<llama_token_data> & q, double p) {
+    const auto q_by_id = spec_block_by_id(q);
+
+    std::vector<llama_token_data> res;
+    double sum = 0.0;
+    for (const auto & e : pb) {
+        const double r = p * (double) e.p - spec_block_q(q_by_id, e.id);
+        if (r > 0.0) {
+            res.push_back({ e.id, 0.0f, (float) r });
+            sum += r;
+        }
+    }
+    if (sum <= 0.0) {
+        res.clear();
+        return res;
+    }
+    for (auto & e : res) {
+        e.p = (float) (e.p / sum);
+    }
+    return res;
+}
+
+// the samplers' states and the history, without the candidate scratch (rebuilt by the next sample): what the walk
+// below changes and the restore puts back
+static common_sampler * spec_block_clone_state(const common_sampler * gsmpl) {
+    auto * result = new common_sampler {
+        /* .params  = */ gsmpl->params,
+        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev    = */ gsmpl->prev,
+        /* .cur     = */ {},
+        /* .cur_p   = */ { nullptr, 0, -1, false },
+        /* .rng     = */ gsmpl->rng,
+    };
+    result->stats = gsmpl->stats;
+    return result;
+}
+
+static void spec_block_restore_state(const common_sampler * src, common_sampler * dst) {
+    llama_sampler_copy(src->grmr,    dst->grmr);
+    llama_sampler_copy(src->rbudget, dst->rbudget);
+    llama_sampler_copy(src->chain,   dst->chain);
+    dst->prev = src->prev;
+}
+
+// the chain's random samplers whose state is their stream of draws only (no history: accept leaves them as they are
+// on the host)
+static bool spec_is_draw_sampler(const llama_sampler * smpl) {
+    const char * name = llama_sampler_name(smpl);
+    return name && (strcmp(name, "dist") == 0 || strcmp(name, "xtc") == 0);
+}
+
+// the draws of src's chain into dst's (chains of the same samplers). A restore must not hand back draws the walk has
+// used: with a grammar, which candidates a position has depends on its draw (the drawn token checked first, the masked
+// row resampled on a rejection), so the decision depends on it, and a draw used again would tie a later token to it
+static void spec_block_copy_draws(common_sampler * src, common_sampler * dst) {
+    const int32_t n = llama_sampler_chain_n(src->chain);
+    if (n != llama_sampler_chain_n(dst->chain)) {
+        return;
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        llama_sampler * s = llama_sampler_chain_get(src->chain, i);
+        if (spec_is_draw_sampler(s)) {
+            llama_sampler_copy(s, llama_sampler_chain_get(dst->chain, i));
+        }
+    }
+}
+
+// a draw from a normalized candidate list
+static llama_token spec_block_draw(const std::vector<llama_token_data> & dist, double u) {
+    for (const auto & e : dist) {
+        u -= e.p;
+        if (u <= 0.0) {
+            return e.id;
+        }
+    }
+    return dist.back().id;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    const size_t g = draft.size();
+
+    // draws come from the sampler's own stream, so they stay independent of what was drafted
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+    // The decision needs the target's distribution at every drafted position, each after the drafted tokens before
+    // it (penalties and the grammar follow the accepted text): walk the block accepting the drafted tokens, then put
+    // the sampler back and accept only those the decision keeps
+    std::unique_ptr<common_sampler, common_sampler_deleter> save(spec_block_clone_state(gsmpl));
+
+    std::vector<std::vector<llama_token_data>> pb; // M_b(. | X^i), as far as the walk goes
+    pb.reserve(g);
+
+    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+
+    double p_walk = 1.0; // p_i along the walk
+    for (size_t i = 0; i < g; ++i) {
+        // leaves the target distribution in the candidate array
+        common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+
+        // as in the token-by-token rejection: a candidate the grammar rejects carries no probability, and what is
+        // left is rescaled
+        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+        if (masked) {
+            cand.assign(cur_p->data, cur_p->data + cur_p->size);
+            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(gsmpl->grmr, &arr);
+        }
+
+        std::vector<llama_token_data> dist;
+        dist.reserve(cur_p->size);
+        double sum = 0.0;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const float pk = masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
+            if (pk > 0.0f) {
+                dist.push_back({ cur_p->data[k].id, 0.0f, pk });
+                sum += pk;
+            }
+        }
+        if (sum > 0.0) {
+            for (auto & e : dist) {
+                e.p = (float) (e.p / sum);
+            }
+        }
+        pb.push_back(std::move(dist));
+
+        const double px = prob_of(pb.back().data(), pb.back().size(), draft[i]);
+        const double qx = prob_of(draft_q[i].data(), draft_q[i].size(), draft[i]);
+        p_walk = qx > 0.0 ? std::min(1.0, p_walk * px / qx) : 0.0;
+
+        // past a token the target cannot produce no position is accepted; the last position needs no walk
+        if (p_walk <= 0.0 || i + 1 == g) {
+            break;
+        }
+
+        common_sampler_accept(gsmpl, draft[i], true);
+    }
+
+    const common_spec_block_weights w = common_spec_block_compute(pb, draft_q, draft);
+
+    // tau = the largest i with eta_i < h_i: the uniforms are independent, so draw them from the last position down
+    // and stop at the first that passes
+    size_t tau = 0;
+    for (size_t i = g; i >= 1; --i) {
+        const double h = w.h[i];
+        if (h <= 0.0) {
+            continue;
+        }
+        if (h >= 1.0 || uni(gsmpl->rng) < h) {
+            tau = i;
+            break;
+        }
+    }
+
+    // tau < g: the next token from the residual at tau (the walk reached tau: tau = 0, or h_tau > 0, so p_tau > 0);
+    // without residual mass, which only rounding leaves, from the target's distribution there, its limit
+    llama_token y = LLAMA_TOKEN_NULL;
+    if (tau < g) {
+        GGML_ASSERT(tau < pb.size());
+        const auto res = common_spec_block_residual(pb[tau], draft_q[tau], w.p[tau]);
+        const auto & from = res.empty() ? pb[tau] : res;
+        GGML_ASSERT(!from.empty());
+        y = spec_block_draw(from, uni(gsmpl->rng));
+    }
+
+    // put the sampler back, except its draws: the uniforms above and the chain's draws of the walk stay used. The
+    // counters count output tokens, as the token-by-token functions' do (the walk's rows past tau are not output); the
+    // final sample below counts its own
+    {
+        auto stats = gsmpl->stats;
+        stats.n_sampled = save->stats.n_sampled + (int32_t) tau + (tau < g ? 1 : 0);
+        spec_block_copy_draws(gsmpl, save.get());
+        spec_block_restore_state(save.get(), gsmpl);
+        gsmpl->stats = stats;
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(tau + 1);
+
+    for (size_t i = 0; i < tau; ++i) {
+        common_sampler_accept(gsmpl, draft[i], true);
+        result.push_back(draft[i]);
+    }
+
+    if (tau == g) {
+        y = common_sampler_sample(gsmpl, ctx, idxs[g], grammar_first);
+    }
+
+    common_sampler_accept(gsmpl, y, true);
+    result.push_back(y);
+
+    return result;
+}
+
+void common_sampler_copy_keep_rng(const struct common_sampler * src, struct common_sampler * dst) {
+    if (!src || !dst || src == dst) {
+        return;
+    }
+    // dst's draws, kept aside while the copy overwrites them
+    std::unique_ptr<common_sampler, common_sampler_deleter> draws(spec_block_clone_state(dst));
+    common_sampler_copy(src, dst);
+    spec_block_copy_draws(draws.get(), dst);
+    dst->rng = draws->rng;
+}
+
+//
+// the grammar's forced text (Q802)
+//
+
+std::string common_sampler_grammar_forced_text(struct common_sampler * gsmpl, const llama_tokens & prefix, int32_t max_chars, size_t * n_valid) {
+    if (n_valid) {
+        *n_valid = 0;
+    }
+    if (!gsmpl || !gsmpl->grmr || max_chars <= 0) {
+        return {};
+    }
+
+    // a copy takes the prefix, as common_sampler_accept would (the reasoning budget decides whether the grammar applies)
+    std::unique_ptr<common_sampler, common_sampler_deleter> tmp(spec_block_clone_state(gsmpl));
+
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (grammar_should_apply(tmp.get()) && !common_sampler_grammar_accepts(tmp.get(), prefix[i])) {
+            return {};
+        }
+        common_sampler_accept(tmp.get(), prefix[i], true);
+        if (n_valid) {
+            *n_valid = i + 1;
+        }
+    }
+
+    if (!grammar_should_apply(tmp.get())) {
+        return {};
+    }
+
+    // a token element of the grammar adds its whole piece: room for some beyond four bytes a character
+    std::string buf((size_t) max_chars * 4 + 256, '\0');
+    const int32_t n = llama_sampler_grammar_forced_text(tmp->grmr, buf.data(), (int32_t) buf.size(), max_chars);
+    buf.resize(n > 0 ? (size_t) n : 0);
+    return buf;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {

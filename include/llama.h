@@ -1815,6 +1815,12 @@ extern "C" {
     /// @details True for a lazy grammar sampler that has not seen its trigger yet: until then it allows every token
     LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
 
+    /// @details The text a grammar sampler requires next whatever is sampled: the longest prefix of every continuation the
+    /// grammar allows (a token element adds its piece), up to max_chars code points. Empty for another sampler, a lazy
+    /// grammar before its trigger, mid-way through a character, or where the grammar may end. Writes at most `size`
+    /// bytes to `buf`, cut back to a whole character, and returns the number written
+    LLAMA_API int32_t llama_sampler_grammar_forced_text(const struct llama_sampler * smpl, char * buf, int32_t size, int32_t max_chars);
+
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(

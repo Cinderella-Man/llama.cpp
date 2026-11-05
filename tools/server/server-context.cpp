@@ -76,6 +76,85 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// Speculative verification switches (Q797, Q802), read once at the server's start; all off by default, and then
+// nothing below changes what the server does:
+//   LLAMA_SPEC_BLOCK_VERIFY=1  sampled drafts (--spec-draft-sampling probabilistic at temperature > 0) are verified as
+//                              one block, by block verification (common_sampler_sample_and_accept_n_block; Sun et al.,
+//                              arXiv:2403.10444) instead of token by token. Greedy requests (sample-and-match) and
+//                              requests with backend sampling keep their verification
+//   LLAMA_SPEC_FORCE=1         while a grammar applies (a tool call), the tokens of the text it forces after the draft
+//                              are appended to the draft, up to the drafter's width (--spec-draft-n-max), also when the
+//                              drafter drafted fewer tokens or none. Exact: the verify pass decides them as it does
+//                              drafted ones (a rejected guess costs a verify column, no output)
+//   LLAMA_SPEC_FORCE_CHARS=<n> the forced text read per step, in characters (default 64)
+//   LLAMA_SPEC_FORCE_MAX=<n>   at most n forced tokens per step (default: no limit but the width)
+//   LLAMA_SPEC_DRAFT_KEEP=<n>  every draft is cut to its first n drafted tokens (default: no cut), so that forced
+//                              tokens get the rest of the width: --spec-draft-n-max 4 with n = 2 verifies 3 tokens
+//                              outside tool calls and up to 5 inside. A fixed cut, so exact
+//   LLAMA_SPEC_KEEP_DRAWS=1    token-by-token rejection keeps its random draws used across a checkpoint replay, as
+//                              block verification always does (Q808): without it the step after a replay (a draft
+//                              longer than a recurrent target's rollback snapshots, or a target that cannot remove a
+//                              partial sequence) draws the uniforms of the step it replays, conditioned on its outcome
+struct server_spec_verify {
+    bool    block       = false;
+    bool    force       = false;
+    int32_t force_chars = 64;
+    int32_t force_max   = -1;
+    int32_t keep        = -1;
+    bool    keep_draws  = false;
+
+    static server_spec_verify & get() {
+        static server_spec_verify v;
+        return v;
+    }
+
+    bool any_draft() const {
+        return force || keep >= 0;
+    }
+
+    // throws std::invalid_argument on a malformed value
+    static void init() {
+        auto & v = get();
+        v = server_spec_verify();
+
+        auto read_int = [](const char * name, int32_t lo, int32_t & out) {
+            const char * s = getenv(name);
+            if (s == nullptr || s[0] == 0) {
+                return false;
+            }
+            char * end = nullptr;
+            const long x = strtol(s, &end, 10);
+            if (end == s || *end != 0 || x < lo || x > 1000000) {
+                throw std::invalid_argument(string_format("%s=%s: expected an integer >= %d", name, s, lo));
+            }
+            out = (int32_t) x;
+            return true;
+        };
+
+        int32_t on = 0;
+        if (read_int("LLAMA_SPEC_BLOCK_VERIFY", 0, on)) {
+            v.block = on != 0;
+        }
+        on = 0;
+        if (read_int("LLAMA_SPEC_FORCE", 0, on)) {
+            v.force = on != 0;
+        }
+        read_int("LLAMA_SPEC_FORCE_CHARS", 1, v.force_chars);
+        read_int("LLAMA_SPEC_FORCE_MAX",   0, v.force_max);
+        read_int("LLAMA_SPEC_DRAFT_KEEP",  0, v.keep);
+        on = 0;
+        if (read_int("LLAMA_SPEC_KEEP_DRAWS", 0, on)) {
+            v.keep_draws = on != 0;
+        }
+
+        if (v.block || v.any_draft() || v.keep_draws) {
+            LOG_INF("speculative verification: block verification %s, grammar-forced tokens %s (%d characters, at most "
+                    "%d a step), drafts cut to %d tokens, draws kept across a replay %s\n", v.block ? "on" : "off",
+                    v.force ? "on" : "off", v.force_chars, v.force_max, v.keep, v.block || v.keep_draws ? "on" : "off");
+        }
+    }
+};
+
 // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
 static std::vector<llama_token> server_accept_replay(
         common_sampler * smpl,
@@ -510,6 +589,14 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+
+    // LLAMA_SPEC_FORCE (server_spec_verify): where the grammar's forced tokens begin in spec_draft (-1: none), and
+    // this task's steps with forced tokens, forced tokens verified and forced tokens accepted
+    int32_t spec_force_from  = -1;
+    int32_t spec_force_steps = 0;
+    int32_t spec_force_n     = 0;
+    int32_t spec_force_acc   = 0;
+
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -731,6 +818,11 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+
+        spec_force_from  = -1;
+        spec_force_steps = 0;
+        spec_force_n     = 0;
+        spec_force_acc   = 0;
 
         pipe_n_guess = 0;
         pipe_n_hit   = 0;
@@ -1108,6 +1200,12 @@ struct server_slot {
                     s.n_sampled, s.n_device, s.n_constrained, s.n_rejected, s.n_rejected_device, s.n_forced);
         }
 
+        if (spec_force_steps > 0) {
+            SLT_INF(*this,
+                    "   forced tokens = %10d steps, %d tokens the grammar forced appended to drafts, %d accepted\n",
+                    spec_force_steps, spec_force_n, spec_force_acc);
+        }
+
         SLT_INF(*this,
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
@@ -1434,6 +1532,90 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     }
 
     return 0;
+}
+
+// LLAMA_SPEC_DRAFT_KEEP and LLAMA_SPEC_FORCE (server_spec_verify) on a new draft: cut it, then append the tokens of
+// the text the grammar forces after it, up to n_width drafted tokens in all. Returns the change in the draft's length.
+//
+// Exact under every verification: whether and what is appended depends only on the text before the appended position
+// (the history and the drafted tokens kept), so each appended token is a proposal with all its probability on one
+// token (its entry in spec_draft_q, when the drafter filled them). Nothing is appended after a drafted token the grammar
+// rejects: that token is certain to be rejected, and the draft is left as it was.
+//
+// The forced text is tokenized as plain text would be. Its last token is held back unless the text ends at a newline
+// or with a token that is not plain text (a special token): the text after it may join it into a longer token.
+static int32_t spec_force_extend(server_slot & slot, int32_t n_width) {
+    const auto & v = server_spec_verify::get();
+
+    auto & draft = slot.spec_draft;
+    auto & dq    = slot.spec_draft_q;
+
+    const int32_t n0 = (int32_t) draft.size();
+
+    slot.spec_force_from = -1;
+
+    if (v.keep >= 0 && (int32_t) draft.size() > v.keep) {
+        draft.resize(v.keep);
+        if (!dq.empty()) {
+            dq.resize(v.keep);
+        }
+    }
+
+    // only while the grammar applies after the history: before a lazy grammar's trigger (most of the output) the
+    // per-step copy of the grammar is not paid; a trigger inside the draft is caught on the next step
+    if (!v.force || !slot.smpl || !common_sampler_grammar_active(slot.smpl.get()) || (int32_t) draft.size() >= n_width) {
+        return (int32_t) draft.size() - n0;
+    }
+
+    size_t n_valid = 0;
+    const std::string text = common_sampler_grammar_forced_text(slot.smpl.get(), draft, v.force_chars, &n_valid);
+    if (text.empty() || n_valid != draft.size()) {
+        return (int32_t) draft.size() - n0;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(slot.ctx_tgt));
+
+    llama_tokens toks = common_tokenize(vocab, text, false, true);
+
+    // the pieces must spell the text, or the tokenizer normalized it and nothing is appended
+    {
+        std::string spelled;
+        for (const llama_token t : toks) {
+            spelled += common_token_to_piece(slot.ctx_tgt, t, true);
+        }
+        if (spelled != text) {
+            return (int32_t) draft.size() - n0;
+        }
+    }
+
+    if (!toks.empty() && text.back() != '\n' && (llama_vocab_get_attr(vocab, toks.back()) & LLAMA_TOKEN_ATTR_NORMAL)) {
+        toks.pop_back();
+    }
+
+    int32_t n_add = std::min<int32_t>((int32_t) toks.size(), n_width - (int32_t) draft.size());
+    if (v.force_max >= 0) {
+        n_add = std::min(n_add, v.force_max);
+    }
+    if (n_add <= 0) {
+        return (int32_t) draft.size() - n0;
+    }
+
+    // a draft verified by rejection (a drafter that gave its candidates, or forced tokens alone on a sampled request)
+    // carries the forced tokens' proposals, point masses; a drafter without candidates (the n-gram ones) is matched
+    const bool with_q = dq.size() == draft.size() && (!dq.empty() || slot.use_spec_rejection());
+
+    slot.spec_force_from = (int32_t) draft.size();
+    for (int32_t i = 0; i < n_add; ++i) {
+        draft.push_back(toks[i]);
+        if (with_q) {
+            dq.push_back({ llama_token_data{ toks[i], 0.0f, 1.0f } });
+        }
+    }
+
+    slot.spec_force_steps += 1;
+    slot.spec_force_n     += n_add;
+
+    return (int32_t) draft.size() - n0;
 }
 
 // returns 0 on success
@@ -2258,6 +2440,15 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        // LLAMA_SPEC_BLOCK_VERIFY, LLAMA_SPEC_FORCE*, LLAMA_SPEC_DRAFT_KEEP: read once here, so that a malformed value
+        // stops the server at its start
+        try {
+            server_spec_verify::init();
+        } catch (const std::exception & e) {
+            SRV_ERR("%s\n", e.what());
+            return false;
         }
 
         if (!spec && params_base.speculative.has_synth()) {
@@ -5469,6 +5660,14 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
 
+            // LLAMA_SPEC_DRAFT_KEEP / LLAMA_SPEC_FORCE (server_spec_verify): the draft cut, the grammar's forced tokens
+            // appended; the width stays within what the target's outputs and recurrent snapshots were sized for
+            if (server_spec_verify::get().any_draft()) {
+                const int32_t n_width = std::min({ common_speculative_n_max(spec.get()),
+                        common_speculative_n_max(&params_base.speculative), slot.get_n_draft_max() });
+                slot.stats.n_draft_tokens += spec_force_extend(slot, n_width);
+            }
+
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -6625,6 +6824,9 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                } else if (use_rejection && server_spec_verify::get().block && !slot.task->params.sampling.backend_sampling) {
+                    // LLAMA_SPEC_BLOCK_VERIFY (server_spec_verify): the drafted block verified jointly
+                    accepted = common_sampler_sample_and_accept_n_block(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
@@ -6668,7 +6870,12 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        if (server_spec_verify::get().block || server_spec_verify::get().keep_draws) {
+                            // the draws this step used stay used, or the next step would draw them again (Q808)
+                            common_sampler_copy_keep_rng(smpl_save.get(), slot.smpl.get());
+                        } else {
+                            common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        }
 
                         return;
                     }
@@ -6707,6 +6914,11 @@ private:
             }
             for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
                 n_accepted_per_pos[i]++;
+            }
+
+            if (slot.spec_force_from >= 0) {
+                slot.spec_force_acc += std::max<int32_t>(0, (int32_t) n_accepted - slot.spec_force_from);
+                slot.spec_force_from = -1;
             }
 
             // add accepted tokens to the prompt
