@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
 #include <stdexcept>
 #include <type_traits>
@@ -881,7 +882,27 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     // They take the lowest cells that are no pool's rep: the first n_pad of those lie below n_pad + n_reps, so marking the
     // reps in that range finds them in linear time.
-    if (n_new_g > n_new) {
+    // (LLAMA_QSA_PAD_LINEAR=0: the reps sorted and searched, as upstream; the same cells)
+    static const bool pad_linear = [] {
+        const char * env = getenv("LLAMA_QSA_PAD_LINEAR");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (n_new_g > n_new && !pad_linear) {
+        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
+        std::sort(reps.begin(), reps.end());
+
+        int64_t pad_cell = 0;
+        for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
+            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+                ++pad_cell;
+            }
+            GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
+            for (uint32_t k = 0; k < kpool; ++k) {
+                nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
+            }
+            nrep[i] = pad_cell;
+        }
+    } else if (n_new_g > n_new) {
         const int64_t n_reps = (int64_t) pool_end.size();
         const int64_t bound  = std::min<int64_t>((int64_t) kv_size*n_stream_kv, (int64_t) (n_new_g - n_new) + n_reps);
         std::vector<uint8_t> is_rep(bound, 0);

@@ -85,6 +85,16 @@ void ggml_cuda_op_moe_tail(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+// GGML_CUDA_SKIP_IDS_ANY=0: only GGML_OP_MOE_TAIL's ids get the skip handling, every other ids tensor is read as it is, as
+// upstream (default 1: ids of any producer but ARGSORT and TOP_K, which name valid experts only, may hold -1)
+static bool ggml_cuda_skip_ids_any() {
+    static const bool any = [] {
+        const char * env = getenv("GGML_CUDA_SKIP_IDS_ANY");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return any;
+}
+
 ggml_cuda_skip_mode ggml_cuda_ids_skip_mode(const ggml_tensor * ids) {
     const ggml_tensor * t = ids;
     while (t->view_src) {
@@ -100,7 +110,7 @@ ggml_cuda_skip_mode ggml_cuda_ids_skip_mode(const ggml_tensor * ids) {
             }
             return ggml_get_op_params_i32(t, 4) != 0 ? GGML_CUDA_SKIP_REPEAT : GGML_CUDA_SKIP_NEG;
         default:
-            return GGML_CUDA_SKIP_NEG;
+            return ggml_cuda_skip_ids_any() ? GGML_CUDA_SKIP_NEG : GGML_CUDA_SKIP_NONE;
     }
 }
 

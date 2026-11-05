@@ -1283,6 +1283,10 @@ struct ggml_backend_sched {
     int prev_graph_size;
 
     int debug_realloc;
+
+    // GGML_SCHED_CTX_PER_GRAPH=0: one context buffer for the largest graph, made at creation, and the allocation
+    // dependencies' views in it, as before the scratch was sized per graph (default 1)
+    bool ctx_per_graph;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1938,7 +1942,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (const auto & it : alloc_deps) {
         n_dep_nodes += (it.second.size() + GGML_MAX_SRC - 1) / GGML_MAX_SRC;
     }
-    if (n_dep_nodes > 0) {
+    if (n_dep_nodes > 0 && sched->ctx_per_graph) {
         struct ggml_init_params params = {
             /* .mem_size =   */ (size_t) n_dep_nodes * ggml_tensor_overhead(),
             /* .mem_buffer = */ nullptr,
@@ -2007,7 +2011,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (it != alloc_deps.end()) {
                 const std::vector<ggml_tensor *> & keep = it->second;
                 for (size_t k = 0; k < keep.size(); k += GGML_MAX_SRC) {
-                    struct ggml_tensor * dep = ggml_view_tensor(sched->dep_ctx, keep[k]);
+                    struct ggml_tensor * dep = ggml_view_tensor(sched->ctx_per_graph ? sched->dep_ctx : sched->ctx, keep[k]);
                     for (size_t s = 0; s < GGML_MAX_SRC && k + s < keep.size(); s++) {
                         dep->src[s] = keep[k + s];
                     }
@@ -2464,6 +2468,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prev_graph_size = 0;
 
     sched->context_graph_overhead = ggml_graph_overhead_custom(graph_size, false);
+
+    const char * GGML_SCHED_CTX_PER_GRAPH = getenv("GGML_SCHED_CTX_PER_GRAPH");
+    sched->ctx_per_graph = GGML_SCHED_CTX_PER_GRAPH == nullptr || atoi(GGML_SCHED_CTX_PER_GRAPH) != 0;
+    if (!sched->ctx_per_graph) {
+        sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + sched->context_graph_overhead;
+        sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+    }
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));

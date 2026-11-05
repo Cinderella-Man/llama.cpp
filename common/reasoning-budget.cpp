@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -180,10 +181,15 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
 
     // set all logits to -inf except the forced token, which may have none of its own (-inf from the screened output
     // head, which computes logits only for its candidates): it is the only choice either way
+    // (LLAMA_REASONING_BUDGET_UNMASK=0 leaves its logit as it is, as upstream)
+    static const bool unmask = [] {
+        const char * env = std::getenv("LLAMA_REASONING_BUDGET_UNMASK");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
     for (size_t i = 0; i < cur_p->size; i++) {
         if (cur_p->data[i].id != forced) {
             cur_p->data[i].logit = -INFINITY;
-        } else if (cur_p->data[i].logit == -INFINITY) {
+        } else if (unmask && cur_p->data[i].logit == -INFINITY) {
             cur_p->data[i].logit = 0.0f;
         }
     }

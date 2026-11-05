@@ -2043,6 +2043,12 @@ private:
     server_prefix_store      prefix_store;
     std::vector<llama_token> ckpt_gen_tokens;
     bool                     ckpt_trim = false;
+    // each part of a sliding-window model's ckpt_trim checkpoints on unless its switch is 0 (then stock's rule):
+    // LLAMA_SERVER_CKPT_RING (the whole ring saved), LLAMA_SERVER_CKPT_RING_PAST (a ring checkpoint past the
+    // divergence restored), LLAMA_SERVER_CKPT_RESUME_NEXT (resume after pos_max, not at it)
+    bool                     ckpt_ring        = true;
+    bool                     ckpt_ring_past   = true;
+    bool                     ckpt_resume_next = true;
 
     // --ctx-checkpoints-vram (C22): a slot's newest ckpt_vram_n checkpoints live in device stores of its sequence, with
     // ids 0 .. ckpt_vram_stores - 1 (one more than ckpt_vram_n while older ones move to the host: the moving one keeps
@@ -2612,6 +2618,16 @@ private:
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
             }
+        }
+
+        {
+            const auto env_on = [](const char * name) {
+                const char * env = getenv(name);
+                return env == nullptr || atoi(env) != 0;
+            };
+            ckpt_ring        = env_on("LLAMA_SERVER_CKPT_RING");
+            ckpt_ring_past   = env_on("LLAMA_SERVER_CKPT_RING_PAST");
+            ckpt_resume_next = env_on("LLAMA_SERVER_CKPT_RESUME_NEXT");
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -3929,7 +3945,7 @@ private:
     // processing the prompt again does, so attention sums over the same cells, and one cut back to an earlier divergence
     // still has a complete window
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const bool ring = ckpt_trim;
+        const bool ring = ckpt_trim && ckpt_ring;
 
         const int id_task = slot.task->id;
 
@@ -6054,7 +6070,7 @@ private:
                                             // cells from pos_next on are removed before the batch (seq_rm below), and
                                             // the window before it is the one the prompt had then. A default one holds
                                             // only the last n_swa positions, whatever pos_min says
-                                            if (cur.pos_max > pos_next && !(ckpt_trim && cur.ring)) {
+                                            if (cur.pos_max > pos_next && !(ckpt_trim && ckpt_ring_past && cur.ring)) {
                                                 return false;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
@@ -6090,7 +6106,7 @@ private:
                                         // the prompt resumes right after it, as the batch after the checkpoint did when
                                         // it was taken (so a GPU rounds that batch the same way); stock resumes at
                                         // pos_max, which a recurrent state needs
-                                        pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max + (ckpt_trim ? 1 : 0)));
+                                        pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max + (ckpt_trim && ckpt_resume_next ? 1 : 0)));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
                                         SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB, on the devices %.3f MiB, %.1f ms)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024, (float) cur.size_dev / 1024 / 1024, (ggml_time_us() - t_ckpt_start) / 1000.0);
 

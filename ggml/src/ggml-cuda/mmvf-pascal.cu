@@ -1,5 +1,6 @@
 #include "mmvf-pascal.cuh"
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -73,13 +74,29 @@ static const int * mmvfp_forced_shape() {
     return shape;
 }
 
+// GGML_CUDA_MMVF_PASCAL_RULE: the launch-shape rule, 2 (default) as below, 1 without the 3-4 token rule (C84, Q611), 0 also
+// with R <= 2 at 3-4 tokens (the first kernel's rule, C54)
+static int mmvfp_rule() {
+    static const int rule = mmvfp_env_int("GGML_CUDA_MMVF_PASCAL_RULE", 2);
+    return rule;
+}
+
+// GGML_CUDA_MMVF_PASCAL_MAX_COLS=n: the kernel takes 1 to n tokens (default 8; 4 leaves 5-8 tokens to llama.cpp's
+// BF16 path, as before C70)
+static int mmvfp_max_cols() {
+    static const int n = std::min(std::max(mmvfp_env_int("GGML_CUDA_MMVF_PASCAL_MAX_COLS", MMVF_PASCAL_MAX_COLS), 1),
+                                  MMVF_PASCAL_MAX_COLS);
+    return n;
+}
+
 static int mmvfp_blocks(const int nrows, const int G, const int R) {
     const int rows_per_block = (MMVF_PASCAL_NT / G) * R;
     return (nrows + rows_per_block - 1) / rows_per_block;
 }
 
 static void mmvfp_pick_shape(const int nchunks, const int nrows, const int ncols_dst, const int nsm, int & G, int & R) {
-    const int rmax = ncols_dst <= 4 ? 4 : 8;
+    const int rule = mmvfp_rule();
+    const int rmax = rule == 0 ? (ncols_dst <= 2 ? 4 : 2) : (ncols_dst <= 4 ? 4 : 8);
     const int * forced = mmvfp_forced_shape();
     if (forced[0] != 0) {
         G = forced[0];
@@ -88,7 +105,7 @@ static void mmvfp_pick_shape(const int nchunks, const int nrows, const int ncols
     }
     const int target = 4 * nsm;
     // 3 and 4 tokens: at most 32 lanes from the width, and a short grid gets more lanes before fewer rows
-    const bool mid = ncols_dst == 3 || ncols_dst == 4;
+    const bool mid = rule >= 2 && (ncols_dst == 3 || ncols_dst == 4);
     G = 8;
     while (G < (mid ? 32 : 128) && nchunks > 16 * G) {
         G *= 4;
@@ -167,7 +184,7 @@ bool ggml_cuda_mmvf_pascal_supports(const ggml_tensor * src0, const ggml_tensor 
     return src0->ne[0] % 8 == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
         src0->nb[0] == ggml_type_size(src0->type) && src0->nb[1] % 16 == 0 && mmvfp_aligned(src0->data, 16) &&
         src0->ne[1] <= INT_MAX && src0->nb[1] / 16 <= INT_MAX &&
-        src1->ne[0] == src0->ne[0] && src1->ne[1] >= 1 && src1->ne[1] <= MMVF_PASCAL_MAX_COLS &&
+        src1->ne[0] == src0->ne[0] && src1->ne[1] >= 1 && src1->ne[1] <= mmvfp_max_cols() &&
         src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && mmvfp_aligned(src1->data, 16) &&
         src1->nb[1] / 16 <= INT_MAX &&

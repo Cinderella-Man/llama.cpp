@@ -20,7 +20,8 @@
 //   G   1: a fused gate/up loads its weights directly instead of staging them through shared memory (default 0)
 //   T   a product without a gate whose row segments aren't whole 16-byte units (the down projection, K = 640: 180-byte
 //       rows): 1 (default) stages each warp's rows as one tile where the tiles fit, else loads them directly; 0 always
-//       loads them directly. Before Q825 such products were declined (the tile check also asked for 16-byte rows).
+//       loads them directly; 2 declines them, as before Q825 (the tile check also asks for 16-byte rows): 2-4 tokens
+//       then go to mul_mat_vec_q_pascal_mc, 5-8 to llama.cpp's kernels.
 //
 // Since Q713 the same for the grid types IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and for IQ1_M (mmvq-pascal-mtok-iq.cuh), the
 // routed experts of Swift-1.5's IQ files: a grid type's result is bit-identical to the one-token Pascal kernel's; IQ1_M has
