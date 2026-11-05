@@ -879,7 +879,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         // the screened output head computed this batch while the grammar could not reject a token; once it can, the
         // later rows need the full head (common_sampling_screen_head_ok)
-        if (llama_get_screen_head(ctx) && common_sampler_grammar_active(gsmpl)) {
+        if (common_screen_head_grammar() && llama_get_screen_head(ctx) && common_sampler_grammar_active(gsmpl)) {
             break;
         }
     }

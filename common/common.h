@@ -163,6 +163,10 @@ bool common_head_bound_requested();
 // LLAMA_SCREEN_HEAD=1 asks for the screened output head (llama_context turns it on at creation)
 bool common_screen_head_requested();
 
+// LLAMA_SCREEN_HEAD_GRAMMAR=1 (off by default) keeps the screened head for a request with a grammar until the grammar can
+// reject a token (common_sampling_screen_head_ok's grammar_active); off, any grammar turns the screen off
+bool common_screen_head_grammar();
+
 // dimensionality reduction methods, used by cvector-generator
 enum dimre_method {
     DIMRE_METHOD_PCA,

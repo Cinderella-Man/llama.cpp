@@ -1465,6 +1465,14 @@ bool common_screen_head_requested() {
     return e && atoi(e) != 0;
 }
 
+bool common_screen_head_grammar() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SCREEN_HEAD_GRAMMAR");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
 bool common_sampling_screen_head_ok(const common_params_sampling & p, uint32_t m, std::string * why, bool grammar_active) {
     const auto no = [&](const char * reason) {
         if (why) {
