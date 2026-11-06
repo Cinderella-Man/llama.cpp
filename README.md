@@ -20,12 +20,15 @@ today's models for a coding agent:
 | Qwen3.8-Flash-Next 125B, 2-bit | 8.20 | **20.40** (2.48×) | — |
 | Flint 39.8B, 8-bit | 14.4 | **45.9** (3.18×) | **47.4**<br>[Flint Pascal Q8 GGUF](https://huggingface.co/CinderellaMan/Flint-Pascal-Q8-GGUF) |
 | Flint 39.8B, 5-bit | 13.7 | **46.4** (3.38×) | **49.4**<br>[Flint Pascal Q5 GGUF](https://huggingface.co/CinderellaMan/Flint-Pascal-Q5-GGUF) |
-| Ornith-1.5-122B, 2-bit | 6.0 | **12.6** (2.1×) | **16.3**<br>[Ornith-1.5-122B Pascal N2P GGUF](https://huggingface.co/CinderellaMan/Ornith-1.5-122B-Pascal-N2P-GGUF) |
+| Ornith-1.5-122B, 2-bit | 6.0 | **12.6** (2.10×) | **16.3**<br>[Ornith-1.5-122B Pascal N2P GGUF](https://huggingface.co/CinderellaMan/Ornith-1.5-122B-Pascal-N2P-GGUF) |
 
 The public files are UkisAI's Swift-1.5 GSQ-RCO Q2_0 and Unsloth's Q8_0, UD-Q5_K_XL and UD-Q2_K_XL. Stock llama.cpp
 runs Flint at 65,536 tokens of context, because at 262,144 its attention mask does not fit in the 4 GB host; Miner Llama
-runs the full 262,144. Flint Pascal Q5 GGUF's 49.4 includes one long session (complex-numbers, 14,024 tokens); on the other
-eleven tasks it generated 53.64 tok/s, as on v2.0 (54.04).
+runs the full 262,144. Stock reached 9 of Flash-Next's 12 tasks in its time budget; on those nine Miner Llama v3
+generated 20.25 tok/s. Flint Pascal Q5 GGUF's 49.4 includes one long session (complex-numbers, 14,024 tokens); on the other
+eleven tasks it generated 53.64 tok/s, as on v2.0 (54.04). Ornith's 16.3 ran on `1f7215948`, the release branch before
+its last fix; on the release build `1551f5fe1` the same preset ran 16.42 on a second rig.
+
 
 Every number, with its command and data, is in the docs repository,
 [llms-on-crypto-mining-rigs](https://github.com/Cinderella-Man/llms-on-crypto-mining-rigs).
