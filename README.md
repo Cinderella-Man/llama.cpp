@@ -15,15 +15,17 @@ measured on a Manli mining rig: nine P106-090 cards with 6 GB each, every card o
 2-core Celeron host with 4 GB of RAM. Its kernels, its multi-card pipeline and its model files make that rig run
 today's models for a coding agent:
 
-| A coding agent on one rig | Stock llama.cpp b12076 | **Miner Llama v3** | Miner Llama v3, my file |
+| A coding agent, tok/s | Stock llama.cpp b12076 | **Miner Llama v3** | **Miner Llama v3, my quant** |
 |---|---:|---:|---:|
-| Qwen3.8-Flash-Next 125B, UkisAI's Q2_0 | 8.20 tok/s | **20.40 tok/s** (2.48×) | — |
-| Flint 39.8B, Unsloth Q8_0 | 14.4 | **45.9** (3.18×) | **47.4**, Flint Pascal Q8 GGUF |
-| Flint 39.8B, Unsloth UD-Q5_K_XL | *running now* | *running now* | *running now*, Flint Pascal Q5 GGUF |
-| Ornith-1.5-122B, Unsloth UD-Q2_K_XL | 6.0 | **12.6** (2.1×) | **16.3**, Ornith-1.5-122B Pascal N2P GGUF |
+| Qwen3.8-Flash-Next 125B, 2-bit | 8.20 | **20.40** (2.48×) | — |
+| Flint 39.8B, 8-bit | 14.4 | **45.9** (3.18×) | **47.4**<br>[Flint Pascal Q8 GGUF](https://huggingface.co/CinderellaMan/Flint-Pascal-Q8-GGUF) |
+| Flint 39.8B, 5-bit | *running now* | *running now* | *running now*<br>[Flint Pascal Q5 GGUF](https://huggingface.co/CinderellaMan/Flint-Pascal-Q5-GGUF) |
+| Ornith-1.5-122B, 2-bit | 6.0 | **12.6** (2.1×) | **16.3**<br>[Ornith-1.5-122B Pascal N2P GGUF](https://huggingface.co/CinderellaMan/Ornith-1.5-122B-Pascal-N2P-GGUF) |
 
-Stock llama.cpp runs Flint at 65,536 tokens of context, because at 262,144 its attention mask does not fit in the 4 GB
-host; Miner Llama runs the full 262,144. Every number, with its command and data, is in the docs repository,
+The public files are UkisAI's Swift-1.5 GSQ-RCO Q2_0 and Unsloth's Q8_0, UD-Q5_K_XL and UD-Q2_K_XL. Stock llama.cpp
+runs Flint at 65,536 tokens of context, because at 262,144 its attention mask does not fit in the 4 GB host; Miner Llama
+runs the full 262,144.
+ Every number, with its command and data, is in the docs repository,
 [llms-on-crypto-mining-rigs](https://github.com/Cinderella-Man/llms-on-crypto-mining-rigs).
 
 ## Get it
