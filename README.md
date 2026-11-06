@@ -18,9 +18,9 @@ today's models for a coding agent:
 | A coding agent on one rig | Stock llama.cpp b12076 | **Miner Llama v3** | Miner Llama v3, my file |
 |---|---:|---:|---:|
 | Qwen3.8-Flash-Next 125B, UkisAI's Q2_0 | 8.20 tok/s | **20.40 tok/s** (2.48×) | — |
-| Flint 39.8B, Unsloth Q8_0 | 14.4 | **45.9** (3.18×) | 47.4, Flint Pascal Q8 GGUF |
+| Flint 39.8B, Unsloth Q8_0 | 14.4 | **45.9** (3.18×) | **47.4**, Flint Pascal Q8 GGUF |
 | Flint 39.8B, Unsloth UD-Q5_K_XL | *running now* | *running now* | *running now*, Flint Pascal Q5 GGUF |
-| Ornith-1.5-122B, Unsloth UD-Q2_K_XL | 6.0 | **12.6** (2.1×) | 16.3, Ornith-1.5-122B Pascal N2P GGUF |
+| Ornith-1.5-122B, Unsloth UD-Q2_K_XL | 6.0 | **12.6** (2.1×) | **16.3**, Ornith-1.5-122B Pascal N2P GGUF |
 
 Stock llama.cpp runs Flint at 65,536 tokens of context, because at 262,144 its attention mask does not fit in the 4 GB
 host; Miner Llama runs the full 262,144. Every number, with its command and data, is in the docs repository,
